@@ -1,0 +1,109 @@
+<script setup>
+import { ref, computed, onMounted } from 'vue'
+import { useWatchlistStore } from '../stores/watchlist'
+import { useToast } from '../stores/toast'
+import api from '../api/client'
+import EChart from '../components/EChart.vue'
+
+const store = useWatchlistStore()
+const { toast } = useToast()
+
+const factorKey = ref('ma_dev')
+const days = ref(5)
+const hist = ref(150)
+const loading = ref(false)
+const result = ref(null)
+const factorOptions = ref([])
+
+async function loadFactorOptions() {
+  try {
+    const catalog = await api.get('/factors/catalog')
+    factorOptions.value = catalog.filter(c => c.kline)
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
+async function runRegression() {
+  if (!store.codes.length) { toast('请先在行情页添加自选股'); return }
+  loading.value = true
+  try {
+    const data = await api.post('/regression', {
+      codes: store.codes, factor: factorKey.value, n: Number(days.value), hist: Number(hist.value)
+    })
+    result.value = data
+  } catch (e) {
+    toast(e.message)
+    result.value = null
+  } finally {
+    loading.value = false
+  }
+}
+
+const chartOption = computed(() => {
+  if (!result.value) return {}
+  return {
+    backgroundColor: 'transparent',
+    grid: { left: 60, right: 30, top: 30, bottom: 50 },
+    tooltip: { trigger: 'item' },
+    legend: { textStyle: { color: '#e6ebf5' }, bottom: 0 },
+    xAxis: {
+      type: 'value', name: result.value.factorLabel, nameTextStyle: { color: '#7c89a8' },
+      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' },
+      splitLine: { lineStyle: { color: '#1c2238' } }
+    },
+    yAxis: {
+      type: 'value', name: `未来${result.value.n}日收益率`, nameTextStyle: { color: '#7c89a8' },
+      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' },
+      splitLine: { lineStyle: { color: '#1c2238' } }
+    },
+    series: [
+      {
+        name: '样本', type: 'scatter', symbolSize: 6,
+        data: result.value.samples.map(s => [s.x, s.y]),
+        itemStyle: { color: 'rgba(79,140,255,.5)' }
+      },
+      {
+        name: `回归线 (RankIC=${result.value.rankIc.toFixed(3)})`, type: 'line',
+        data: result.value.line.map(p => [p.x, p.y]),
+        showSymbol: false, lineStyle: { color: '#ff4d4f', width: 2 }
+      }
+    ]
+  }
+})
+
+onMounted(async () => {
+  await loadFactorOptions()
+  if (!store.codes.length) await store.fetchWatchlist()
+})
+</script>
+
+<template>
+  <div>
+    <div class="panel-toolbar">
+      <div class="field">
+        <label>因子</label>
+        <select v-model="factorKey">
+          <option v-for="f in factorOptions" :key="f.key" :value="f.key">{{ f.label }}</option>
+        </select>
+      </div>
+      <div class="field"><label>预测天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
+      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="300" /></div>
+      <button class="btn-primary" :disabled="loading" @click="runRegression">{{ loading ? '计算中…' : '运行回归' }}</button>
+      <span class="hint">对自选股历史行情做滚动窗口取样：因子值(t) vs 未来N日收益率(t→t+N)，样本合并后做 OLS 线性回归</span>
+    </div>
+
+    <div v-if="!result" class="empty-hint">选择因子和参数后点击「运行回归」</div>
+    <template v-else>
+      <div class="stat-cards">
+        <div class="stat-card"><div class="label">样本量</div><div class="value">{{ result.sampleSize }}</div></div>
+        <div class="stat-card"><div class="label">回归方程</div><div class="value" style="font-size:13px">y = {{ result.a.toFixed(4) }} + {{ result.b.toFixed(4) }}x</div></div>
+        <div class="stat-card"><div class="label">R²</div><div class="value">{{ result.r2.toFixed(4) }}</div></div>
+        <div class="stat-card"><div class="label">IC (Pearson)</div><div class="value" :class="result.ic >= 0 ? 'up' : 'down'">{{ result.ic.toFixed(4) }}</div></div>
+      </div>
+      <div class="card chart-card">
+        <EChart :option="chartOption" height="380px" />
+      </div>
+    </template>
+  </div>
+</template>
