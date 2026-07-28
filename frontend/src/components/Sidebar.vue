@@ -6,6 +6,7 @@ const items = [
   { path: '/quote', label: '行情', icon: 'Q' },
   { path: '/factor', label: '因子', icon: 'F' },
   { path: '/regression', label: '回归', icon: 'R' },
+  { path: '/factor-regression', label: '多因子回归', icon: 'M' },
   { path: '/select', label: '选股', icon: 'S' },
   { path: '/backtest', label: '分层回测', icon: 'B' },
   { path: '/portfolio', label: '模拟盘', icon: 'P' }
