@@ -13,6 +13,7 @@ from ..factors import (
     max_drawdown, calmar_ratio, win_rate, information_coefficient_stats,
     round_trip_cost_rate, compute_user_factor_scores,
 )
+from ..numpy_factors import kline_to_arrays, compute_factor_series, series_at
 from .portfolio import OrderBody, place_order
 
 router = APIRouter(prefix="/api/select", tags=["select"])
@@ -237,6 +238,13 @@ async def run_backtest(body: BacktestBody):
     ref_code = max(series, key=lambda c: len(series[c]))
     ref_dates = [row["date"] for row in series[ref_code]]
 
+    # 向量化预计算：每只股票一次性算出因子全序列 + close 数组，截面循环只查表
+    code_cache = {}
+    for code, kl in series.items():
+        arr = kline_to_arrays(kl)
+        fseries = compute_factor_series(body.factor, arr)
+        code_cache[code] = {"closes": arr["close"], "fseries": fseries, "kline": kl}
+
     cost_rate = round_trip_cost_rate(body.commissionRate, body.stampDuty, body.slippage) if body.applyCost else 0.0
 
     ic_series = []
@@ -254,12 +262,14 @@ async def run_backtest(body: BacktestBody):
     for t in range(25, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
         cross = []
-        for code, kl in series.items():
+        for code in series:
             i = date_maps[code].get(date_t)
-            if i is None or i < 20 or i + n >= len(kl):
+            if i is None or i < 20 or i + n >= len(code_cache[code]["kline"]):
                 continue
-            closes = [row["close"] for row in kl]
-            fv = calc(kl, i)
+            cc = code_cache[code]
+            fseries = cc["fseries"]
+            fv = series_at(fseries, i) if fseries is not None else calc(cc["kline"], i)
+            closes = cc["closes"]
             if fv is None or closes[i] == 0:
                 continue
             fret = closes[i + n] / closes[i] - 1
@@ -431,18 +441,37 @@ async def run_factor_regression(body: FactorRegressionBody):
     ref_code = max(series, key=lambda c: len(series[c]))
     ref_dates = [row["date"] for row in series[ref_code]]
 
+    # 向量化预计算：每只股票每因子一次性算出全序列
+    fr_cache = {}
+    for code, kl in series.items():
+        arr = kline_to_arrays(kl)
+        fr_cache[code] = {
+            "closes": arr["close"],
+            "series": {k: compute_factor_series(k, arr) for k in keys},
+            "kline": kl,
+        }
+
     periods = []
     for t in range(25, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
         xs_rows, ys = [], []
-        for code, kl in series.items():
+        for code in series:
             i = date_maps[code].get(date_t)
-            if i is None or i < 20 or i + n >= len(kl):
+            if i is None or i < 20 or i + n >= len(fr_cache[code]["kline"]):
                 continue
-            fvs = [calcs[k](kl, i) for k in keys]
-            if any(v is None for v in fvs):
+            cc = fr_cache[code]
+            fvs = []
+            ok = True
+            for k in keys:
+                s = cc["series"][k]
+                v = series_at(s, i) if s is not None else calcs[k](cc["kline"], i)
+                if v is None:
+                    ok = False
+                    break
+                fvs.append(v)
+            if not ok:
                 continue
-            closes = [row["close"] for row in kl]
+            closes = cc["closes"]
             if closes[i] == 0:
                 continue
             fret = closes[i + n] / closes[i] - 1

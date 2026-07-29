@@ -10,7 +10,9 @@ const items = [
   { path: '/select', label: '选股', icon: 'S' },
   { path: '/backtest', label: '分层回测', icon: 'B' },
   { path: '/portfolio', label: '模拟盘', icon: 'P' },
-  { path: '/strategies', label: '策略中心', icon: 'T' }
+  { path: '/strategies', label: '策略中心', icon: 'T' },
+  { path: '/ml', label: '机器学习', icon: 'ML' },
+  { path: '/monitor', label: '盯盘调度', icon: 'MO' }
 ]
 </script>
 
