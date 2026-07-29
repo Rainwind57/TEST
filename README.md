@@ -46,7 +46,7 @@ quant-platform/
 ### 1. 启动后端
 
 ```bash
-cd quant-platform/backend
+cd backend
 pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8899
 ```
@@ -56,7 +56,7 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8899
 ### 2. 启动前端
 
 ```bash
-cd quant-platform/frontend
+cd frontend
 npm install
 npm run dev
 ```
