@@ -1,13 +1,14 @@
 """全市场选股：多因子加权打分选股 + 因子分层回测 + 一键落地到自选/模拟盘。"""
 import asyncio
 import datetime
+import math
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import adapters, db
 from ..factors import (
     FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, composite_score,
-    bucket_index, pearson, spearman, mean,
+    bucket_index, pearson, spearman, mean, std, zscore, multi_ols,
 )
 from .portfolio import OrderBody, place_order
 
@@ -248,6 +249,102 @@ async def run_backtest(body: BacktestBody):
         "meanIc": mean_ic, "meanRankIc": mean_rank_ic, "icWinRate": ic_win_rate,
         "icSeries": ic_series, "groupSummary": group_summary, "longShort": long_short_points,
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
+    }
+
+
+class FactorRegressionBody(BaseModel):
+    board: str = "all"
+    poolSize: int = 60
+    factors: list[str] = ["momentum", "ma_dev"]
+    n: int = 5
+    hist: int = 180
+
+
+@router.post("/factor-regression")
+async def run_factor_regression(body: FactorRegressionBody):
+    """多因子横截面回归（Fama-MacBeth 风格）：每个再平衡日用截面因子暴露对未来收益做多元回归，
+    得到各因子的时序收益率，据此评估因子长期是否显著有效（均值/t 统计量/胜率）。"""
+    keys = list(dict.fromkeys(k for k in body.factors if k in FACTORS))
+    if len(keys) < 2:
+        raise HTTPException(400, "请至少选择2个技术类(量价)因子进行多因子回归")
+    n = max(1, body.n)
+    hist = max(60, body.hist)
+
+    try:
+        pool = await adapters.fetch_market_list(body.board, body.poolSize)
+    except Exception as e:
+        raise HTTPException(502, f"候选池获取失败: {e}")
+
+    codes = [row["code"] for row in pool]
+    sem = asyncio.Semaphore(15)
+
+    async def fetch_one(code):
+        async with sem:
+            try:
+                kline = await adapters.fetch_kline(code, hist)
+            except Exception:
+                return code, []
+            return code, kline
+
+    fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
+    series = {code: kl for code, kl in fetched if len(kl) >= 40}
+    min_sample = len(keys) * 3 + 5
+    if len(series) < min_sample:
+        raise HTTPException(422, "有效股票样本不足，请增大候选池规模")
+
+    calcs = {k: FACTORS[k]["calc"] for k in keys}
+    date_maps = {code: {row["date"]: idx for idx, row in enumerate(kl)} for code, kl in series.items()}
+    ref_code = max(series, key=lambda c: len(series[c]))
+    ref_dates = [row["date"] for row in series[ref_code]]
+
+    periods = []
+    for t in range(25, len(ref_dates) - n, max(1, n)):
+        date_t = ref_dates[t]
+        xs_rows, ys = [], []
+        for code, kl in series.items():
+            i = date_maps[code].get(date_t)
+            if i is None or i < 20 or i + n >= len(kl):
+                continue
+            fvs = [calcs[k](kl, i) for k in keys]
+            if any(v is None for v in fvs):
+                continue
+            closes = [row["close"] for row in kl]
+            if closes[i] == 0:
+                continue
+            fret = closes[i + n] / closes[i] - 1
+            xs_rows.append(fvs)
+            ys.append(fret)
+        if len(xs_rows) < min_sample:
+            continue
+
+        z_cols = [zscore([r[c] for r in xs_rows]) for c in range(len(keys))]
+        z_rows = list(zip(*z_cols))
+        fit = multi_ols([list(r) for r in z_rows], ys)
+        periods.append({
+            "date": date_t, "coefs": dict(zip(keys, fit["coefs"])),
+            "intercept": fit["intercept"], "r2": fit["r2"], "sample": len(ys),
+        })
+
+    if not periods:
+        raise HTTPException(422, "有效截面样本不足，无法完成多因子回归")
+
+    summary = []
+    for k in keys:
+        vals = [p["coefs"][k] for p in periods]
+        m = mean(vals)
+        s = std(vals) if len(vals) > 1 else 0.0
+        t_stat = 0.0 if s == 0 else m / (s / math.sqrt(len(vals)))
+        pos_rate = sum(1 for v in vals if v > 0) / len(vals)
+        summary.append({
+            "key": k, "label": FACTORS[k]["label"],
+            "meanReturn": m, "tStat": t_stat, "positiveRate": pos_rate,
+        })
+
+    return {
+        "keys": keys, "n": n, "rebalanceCount": len(periods),
+        "meanR2": mean([p["r2"] for p in periods]),
+        "summary": summary, "periods": periods,
+        "universeSize": len(pool), "effectiveStocks": len(series),
     }
 
 

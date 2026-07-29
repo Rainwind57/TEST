@@ -48,6 +48,135 @@ def ols_regression(xs: list[float], ys: list[float]) -> dict:
     return {"a": a, "b": b, "r2": r2, "n": n}
 
 
+def _weighted_linear_fit(xs: list[float], ys: list[float], w: list[float]) -> tuple:
+    sw = sum(w)
+    wmx = sum(w[i] * xs[i] for i in range(len(xs))) / sw
+    wmy = sum(w[i] * ys[i] for i in range(len(xs))) / sw
+    num = sum(w[i] * (xs[i] - wmx) * (ys[i] - wmy) for i in range(len(xs)))
+    den = sum(w[i] * (xs[i] - wmx) ** 2 for i in range(len(xs)))
+    b = 0.0 if den == 0 else num / den
+    a = wmy - b * wmx
+    return a, b
+
+
+def _linear_r2(xs: list[float], ys: list[float], a: float, b: float) -> float:
+    my = mean(ys)
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    ss_res = sum((ys[i] - (a + b * xs[i])) ** 2 for i in range(len(xs)))
+    return 0.0 if ss_tot == 0 else 1 - ss_res / ss_tot
+
+
+def ridge_regression(xs: list[float], ys: list[float], alpha: float = 1.0) -> dict:
+    """岭回归（L2 正则，截距不惩罚）：闭式解，对异常斜率有收缩效果。"""
+    n = len(xs)
+    mx, my = mean(xs), mean(ys)
+    xc = [x - mx for x in xs]
+    yc = [y - my for y in ys]
+    den = sum(x * x for x in xc) + alpha
+    b = 0.0 if den == 0 else sum(xc[i] * yc[i] for i in range(n)) / den
+    a = my - b * mx
+    return {"a": a, "b": b, "r2": _linear_r2(xs, ys, a, b), "n": n}
+
+
+def huber_regression(xs: list[float], ys: list[float], delta: float = 1.345, iters: int = 25) -> dict:
+    """稳健回归（Huber M-estimator，IRLS 迭代加权最小二乘），降低异常样本对拟合的影响。"""
+    n = len(xs)
+    base = ols_regression(xs, ys)
+    a, b = base["a"], base["b"]
+    for _ in range(iters):
+        resid = [ys[i] - (a + b * xs[i]) for i in range(n)]
+        mad = mean([abs(r) for r in resid])
+        scale = mad / 0.6745 if mad else 1e-9
+        weights = [1.0 if abs(r) / scale <= delta else delta * scale / max(abs(r), 1e-12) for r in resid]
+        new_a, new_b = _weighted_linear_fit(xs, ys, weights)
+        if abs(new_a - a) < 1e-9 and abs(new_b - b) < 1e-9:
+            a, b = new_a, new_b
+            break
+        a, b = new_a, new_b
+    return {"a": a, "b": b, "r2": _linear_r2(xs, ys, a, b), "n": n}
+
+
+def quantile_regression(xs: list[float], ys: list[float], tau: float = 0.5, iters: int = 30) -> dict:
+    """分位数回归（IRLS 近似，tau=0.5 即中位数/LAD 回归），对极端收益样本更不敏感。"""
+    n = len(xs)
+    base = ols_regression(xs, ys)
+    a, b = base["a"], base["b"]
+    eps = 1e-6
+    for _ in range(iters):
+        resid = [ys[i] - (a + b * xs[i]) for i in range(n)]
+        weights = [(tau if r >= 0 else (1 - tau)) / max(abs(r), eps) for r in resid]
+        new_a, new_b = _weighted_linear_fit(xs, ys, weights)
+        if abs(new_a - a) < 1e-9 and abs(new_b - b) < 1e-9:
+            a, b = new_a, new_b
+            break
+        a, b = new_a, new_b
+    return {"a": a, "b": b, "r2": _linear_r2(xs, ys, a, b), "n": n}
+
+
+def _solve_linear_system(a: list[list[float]], b: list[float]) -> list[float]:
+    """高斯消元（列主元）求解 Ax=b，a 为 n x n 矩阵。"""
+    n = len(b)
+    m = [row[:] + [b[i]] for i, row in enumerate(a)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[pivot][col]) < 1e-12:
+            continue
+        m[col], m[pivot] = m[pivot], m[col]
+        pv = m[col][col]
+        m[col] = [v / pv for v in m[col]]
+        for r in range(n):
+            if r != col and m[r][col]:
+                factor = m[r][col]
+                m[r] = [m[r][k] - factor * m[col][k] for k in range(n + 1)]
+    return [m[i][n] for i in range(n)]
+
+
+def multi_ols(rows: list[list[float]], ys: list[float]) -> dict:
+    """多元线性回归（含截距），rows[i] 为第 i 个样本各因子取值。返回 intercept/coefs/r2。"""
+    n = len(ys)
+    p = len(rows[0]) if rows else 0
+    x = [[1.0] + list(r) for r in rows]
+    k = p + 1
+    xtx = [[sum(x[i][c1] * x[i][c2] for i in range(n)) for c2 in range(k)] for c1 in range(k)]
+    xty = [sum(x[i][c1] * ys[i] for i in range(n)) for c1 in range(k)]
+    beta = _solve_linear_system(xtx, xty)
+    my = mean(ys)
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    preds = [sum(beta[c] * x[i][c] for c in range(k)) for i in range(n)]
+    ss_res = sum((ys[i] - preds[i]) ** 2 for i in range(n))
+    r2 = 0.0 if ss_tot == 0 else 1 - ss_res / ss_tot
+    return {"intercept": beta[0], "coefs": beta[1:], "r2": r2, "n": n}
+
+
+def poly_regression(xs: list[float], ys: list[float], degree: int = 2) -> dict:
+    """多项式回归（默认二次），返回按幂次排列的系数 coefs=[c0,c1,c2,...]。"""
+    rows = [[x ** d for d in range(1, degree + 1)] for x in xs]
+    fit = multi_ols(rows, ys)
+    return {"coefs": [fit["intercept"]] + fit["coefs"], "r2": fit["r2"], "n": fit["n"]}
+
+
+def poly_predict(coefs: list[float], x: float) -> float:
+    return sum(c * x ** i for i, c in enumerate(coefs))
+
+
+REGRESSION_METHODS = {
+    "ols": {"label": "普通最小二乘(OLS)", "fn": lambda xs, ys: ols_regression(xs, ys)},
+    "ridge": {"label": "岭回归(Ridge)", "fn": lambda xs, ys: ridge_regression(xs, ys, 1.0)},
+    "huber": {"label": "稳健回归(Huber)", "fn": lambda xs, ys: huber_regression(xs, ys)},
+    "quantile": {"label": "分位数回归(中位数/LAD)", "fn": lambda xs, ys: quantile_regression(xs, ys, 0.5)},
+    "poly2": {"label": "二次多项式回归", "fn": lambda xs, ys: poly_regression(xs, ys, 2)},
+}
+
+
+def fit_regression(method: str, xs: list[float], ys: list[float]) -> dict:
+    """统一出参：{coefs:[c0,c1,...], r2, n}，coefs 按幂次排列（c0 为截距）。"""
+    meta = REGRESSION_METHODS.get(method, REGRESSION_METHODS["ols"])
+    result = meta["fn"](xs, ys)
+    if "coefs" in result:
+        return result
+    return {"coefs": [result["a"], result["b"]], "r2": result["r2"], "n": result["n"]}
+
+
 def ema_series(values: list[float], period: int) -> list:
     """指数移动平均序列，前 period-1 项为 None，第 period 项以简单均值作种子。"""
     if len(values) < period:

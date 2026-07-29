@@ -3,7 +3,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import adapters
-from ..factors import FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, ols_regression, pearson, spearman
+from ..factors import (
+    FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, pearson, spearman,
+    REGRESSION_METHODS, fit_regression, poly_predict,
+)
 
 router = APIRouter(prefix="/api", tags=["factor"])
 
@@ -63,14 +66,22 @@ def factor_catalog():
 class RegressionBody(BaseModel):
     codes: list[str]
     factor: str = "ma_dev"
+    method: str = "ols"
     n: int = 5
     hist: int = 150
+
+
+@router.get("/regression/methods")
+def list_regression_methods():
+    return [{"key": k, "label": v["label"]} for k, v in REGRESSION_METHODS.items()]
 
 
 @router.post("/regression")
 async def run_regression(body: RegressionBody):
     if body.factor not in FACTORS:
         raise HTTPException(400, "未知因子类型")
+    if body.method not in REGRESSION_METHODS:
+        raise HTTPException(400, "未知回归方法")
     if not body.codes:
         raise HTTPException(400, "codes 不能为空")
 
@@ -102,18 +113,20 @@ async def run_regression(body: RegressionBody):
     if len(xs) < 10:
         raise HTTPException(422, "样本不足，请增加自选股数量或历史长度")
 
-    reg = ols_regression(xs, ys)
+    reg = fit_regression(body.method, xs, ys)
     ic = pearson(xs, ys)
     rank_ic = spearman(xs, ys)
     min_x, max_x = min(xs), max(xs)
+    steps = 40
+    span = (max_x - min_x) or 1e-9
     line = [
-        {"x": min_x, "y": reg["a"] + reg["b"] * min_x},
-        {"x": max_x, "y": reg["a"] + reg["b"] * max_x},
+        {"x": min_x + span * k / steps, "y": poly_predict(reg["coefs"], min_x + span * k / steps)}
+        for k in range(steps + 1)
     ]
     samples = [{"x": xs[i], "y": ys[i]} for i in range(len(xs))]
     return {
-        "factorLabel": factor["label"], "n": n,
-        "a": reg["a"], "b": reg["b"], "r2": reg["r2"], "sampleSize": reg["n"],
+        "factorLabel": factor["label"], "methodLabel": REGRESSION_METHODS[body.method]["label"], "n": n,
+        "coefs": reg["coefs"], "r2": reg["r2"], "sampleSize": reg["n"],
         "ic": ic, "rankIc": rank_ic,
         "samples": samples, "line": line,
     }
