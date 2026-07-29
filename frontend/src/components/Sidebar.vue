@@ -12,7 +12,9 @@ const items = [
   { path: '/portfolio', label: '模拟盘', icon: 'P' },
   { path: '/strategies', label: '策略中心', icon: 'T' },
   { path: '/ml', label: '机器学习', icon: 'ML' },
-  { path: '/monitor', label: '盯盘调度', icon: 'MO' }
+  { path: '/monitor', label: '盯盘调度', icon: 'MO' },
+  { path: '/optimize', label: '参数寻优', icon: 'OP' },
+  { path: '/portfolio-opt', label: '组合优化', icon: 'PO' }
 ]
 </script>
 

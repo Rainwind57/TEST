@@ -436,6 +436,34 @@ def zscore(values: list) -> list[float]:
     return [0.0 if v is None else (v - m) / s for v in values]
 
 
+def neutralized_zscore(values: list, exposures: list[list[float]]) -> list[float]:
+    """行业/市值横截面中性化：对 values 关于 exposures 做多元 OLS 取残差，再 z-score。
+
+    exposures[i] 为第 i 个样本的风格暴露向量（如 [log市值, 行业哑变量...]）。
+    残差即剥离风格暴露后的纯因子值。与 zscore 同返回对齐列表，None 视为缺失跳过。
+    """
+    paired = [(v, e) for v, e in zip(values, exposures) if v is not None]
+    if len(paired) < 2:
+        return [0.0 for _ in values]
+    ys = [p[0] for p in paired]
+    xs_rows = [p[1] for p in paired]
+    if not any(any(x != 0 for x in row) for row in xs_rows):
+        return zscore(values)
+    fit = multi_ols(xs_rows, ys)
+    coefs = fit["coefs"]
+    intercept = fit["intercept"]
+    valid_idx = [i for i, v in enumerate(values) if v is not None]
+    residuals = []
+    for k, i in enumerate(valid_idx):
+        pred = intercept + sum(coefs[c] * xs_rows[k][c] for c in range(len(coefs)))
+        residuals.append(ys[k] - pred)
+    z = zscore(residuals)
+    out = [0.0] * len(values)
+    for k, i in enumerate(valid_idx):
+        out[i] = z[k]
+    return out
+
+
 def composite_score(rows: list[dict], specs: list[dict]) -> list[dict]:
     """specs: [{key, weight, direction}]，对 rows 做加权 z-score 打分（自动忽略缺失因子）。"""
     columns = {spec["key"]: zscore([r.get(spec["key"]) for r in rows]) for spec in specs}
