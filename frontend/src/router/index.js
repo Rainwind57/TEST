@@ -6,6 +6,7 @@ import FactorRegressionView from '../views/FactorRegressionView.vue'
 import SelectView from '../views/SelectView.vue'
 import BacktestView from '../views/BacktestView.vue'
 import PortfolioView from '../views/PortfolioView.vue'
+import StrategiesView from '../views/StrategiesView.vue'
 
 const routes = [
   { path: '/', redirect: '/quote' },
@@ -15,7 +16,8 @@ const routes = [
   { path: '/factor-regression', name: 'factor-regression', component: FactorRegressionView, meta: { label: '多因子回归' } },
   { path: '/select', name: 'select', component: SelectView, meta: { label: '选股' } },
   { path: '/backtest', name: 'backtest', component: BacktestView, meta: { label: '分层回测' } },
-  { path: '/portfolio', name: 'portfolio', component: PortfolioView, meta: { label: '模拟盘' } }
+  { path: '/portfolio', name: 'portfolio', component: PortfolioView, meta: { label: '模拟盘' } },
+  { path: '/strategies', name: 'strategies', component: StrategiesView, meta: { label: '策略中心' } }
 ]
 
 export default createRouter({

@@ -9,7 +9,8 @@ const items = [
   { path: '/factor-regression', label: '多因子回归', icon: 'M' },
   { path: '/select', label: '选股', icon: 'S' },
   { path: '/backtest', label: '分层回测', icon: 'B' },
-  { path: '/portfolio', label: '模拟盘', icon: 'P' }
+  { path: '/portfolio', label: '模拟盘', icon: 'P' },
+  { path: '/strategies', label: '策略中心', icon: 'T' }
 ]
 </script>
 

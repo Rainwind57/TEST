@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import api from '../api/client'
+import api, { downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
 import EChart from '../components/EChart.vue'
 
@@ -14,6 +14,12 @@ const BOARD_OPTIONS = [
   { value: 'star', label: '科创板' },
   { value: 'bse', label: '北交所' }
 ]
+const BENCH_OPTIONS = [
+  { value: 'none', label: '无基准' },
+  { value: 'hs300', label: '沪深300' },
+  { value: 'zz500', label: '中证500' },
+  { value: 'sse', label: '上证指数' }
+]
 
 const board = ref('all')
 const poolSize = ref(60)
@@ -21,30 +27,68 @@ const factorKey = ref('momentum')
 const groups = ref(5)
 const days = ref(5)
 const hist = ref(180)
+const benchmark = ref('hs300')
+const applyCost = ref(true)
+const commissionRate = ref(0.00025)
+const stampDuty = ref(0.001)
+const slippage = ref(0.001)
+
 const loading = ref(false)
+const saving = ref(false)
+const exporting = ref(false)
 const result = ref(null)
 const factorOptions = ref([])
+const showSave = ref(false)
+const strategyName = ref('')
 
 async function loadFactorOptions() {
   const data = await api.get('/select/factors')
   factorOptions.value = data.filter(f => f.kline)
 }
 
+const backtestConfig = () => ({
+  board: board.value, poolSize: Number(poolSize.value), factor: factorKey.value,
+  groups: Number(groups.value), n: Number(days.value), hist: Number(hist.value),
+  benchmark: benchmark.value, applyCost: applyCost.value,
+  commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
+  slippage: Number(slippage.value)
+})
+
 async function runBacktest() {
   loading.value = true
   try {
-    const data = await api.post('/select/backtest', {
-      board: board.value, poolSize: Number(poolSize.value), factor: factorKey.value,
-      groups: Number(groups.value), n: Number(days.value), hist: Number(hist.value)
-    })
-    result.value = data
+    result.value = await api.post('/select/backtest', backtestConfig())
   } catch (e) {
-    toast(e.message)
-    result.value = null
-  } finally {
-    loading.value = false
-  }
+    toast(e.message); result.value = null
+  } finally { loading.value = false }
 }
+
+async function saveStrategy() {
+  if (!strategyName.value.trim()) { toast('请输入策略名称'); return }
+  saving.value = true
+  try {
+    await api.post('/strategies', { name: strategyName.value.trim(), kind: 'backtest', config: backtestConfig() })
+    toast('策略已保存'); showSave.value = false; strategyName.value = ''
+  } catch (e) { toast(e.message) }
+  finally { saving.value = false }
+}
+
+async function exportReport(fmt) {
+  if (!result.value) return
+  exporting.value = true
+  try {
+    const payload = {
+      format: fmt, factorLabel: result.value.factorLabel, config: result.value.config,
+      metrics: result.value.metrics, benchmark: result.value.benchmark,
+      groupSummary: result.value.groupSummary, longShort: result.value.longShort,
+      icSeries: result.value.icSeries
+    }
+    await downloadFile('/reports/backtest', payload, `backtest.${fmt === 'html' ? 'html' : 'xlsx'}`)
+  } catch (e) { toast(e.message) }
+  finally { exporting.value = false }
+}
+
+const m = computed(() => result.value?.metrics || {})
 
 const groupBarOption = computed(() => {
   if (!result.value) return {}
@@ -53,19 +97,9 @@ const groupBarOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 30, top: 30, bottom: 40 },
     tooltip: { trigger: 'axis' },
-    xAxis: {
-      type: 'category', data: data.map(d => `G${d.group}`),
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' }
-    },
-    yAxis: {
-      type: 'value', name: `平均未来${result.value.n}日收益率`, nameTextStyle: { color: '#7c89a8' },
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', formatter: v => (v * 100).toFixed(1) + '%' },
-      splitLine: { lineStyle: { color: '#1c2238' } }
-    },
-    series: [{
-      type: 'bar', data: data.map(d => d.avgReturn),
-      itemStyle: { color: (p) => (p.value >= 0 ? '#ff4d4f' : '#21c08b') }
-    }]
+    xAxis: { type: 'category', data: data.map(d => `G${d.group}`), axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' } },
+    yAxis: { type: 'value', name: `平均未来${result.value.n}日收益`, nameTextStyle: { color: '#7c89a8' }, axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', formatter: v => (v * 100).toFixed(1) + '%' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    series: [{ type: 'bar', data: data.map(d => d.avgReturn), itemStyle: { color: p => (p.value >= 0 ? '#ff4d4f' : '#21c08b') } }]
   }
 })
 
@@ -77,14 +111,8 @@ const icLineOption = computed(() => {
     grid: { left: 60, right: 30, top: 40, bottom: 60 },
     tooltip: { trigger: 'axis' },
     legend: { textStyle: { color: '#e6ebf5' }, top: 0 },
-    xAxis: {
-      type: 'category', data: s.map(d => d.date),
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 }
-    },
-    yAxis: {
-      type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' },
-      splitLine: { lineStyle: { color: '#1c2238' } }
-    },
+    xAxis: { type: 'category', data: s.map(d => d.date), axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 } },
+    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' }, splitLine: { lineStyle: { color: '#1c2238' } } },
     series: [
       { name: 'IC', type: 'line', data: s.map(d => d.ic), showSymbol: false, lineStyle: { color: '#4f8cff', width: 2 } },
       { name: 'RankIC', type: 'line', data: s.map(d => d.rankIc), showSymbol: false, lineStyle: { color: '#6c5ce7', width: 2 } }
@@ -95,25 +123,23 @@ const icLineOption = computed(() => {
 const longShortOption = computed(() => {
   if (!result.value) return {}
   const s = result.value.longShort
+  const series = [{ name: '多空累计', type: 'line', data: s.map(d => d.cum), showSymbol: false, lineStyle: { color: '#ff4d4f', width: 2 }, areaStyle: { color: 'rgba(255,77,79,.12)' } }]
+  if (result.value.benchmark) {
+    series.push({ name: '最高组累计', type: 'line', data: s.map(d => d.topCum), showSymbol: false, lineStyle: { color: '#21c08b', width: 2 } })
+  }
   return {
     backgroundColor: 'transparent',
-    grid: { left: 60, right: 30, top: 30, bottom: 60 },
+    grid: { left: 60, right: 30, top: 40, bottom: 60 },
     tooltip: { trigger: 'axis' },
-    xAxis: {
-      type: 'category', data: s.map(d => d.date),
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 }
-    },
-    yAxis: {
-      type: 'value', axisLine: { lineStyle: { color: '#2a3354' } },
-      axisLabel: { color: '#7c89a8', formatter: v => (v * 100).toFixed(0) + '%' },
-      splitLine: { lineStyle: { color: '#1c2238' } }
-    },
-    series: [{
-      name: '多空累计收益', type: 'line', data: s.map(d => d.cum), showSymbol: false,
-      lineStyle: { color: '#ff4d4f', width: 2 }, areaStyle: { color: 'rgba(255,77,79,.12)' }
-    }]
+    legend: { textStyle: { color: '#e6ebf5' }, top: 0 },
+    xAxis: { type: 'category', data: s.map(d => d.date), axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 } },
+    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', formatter: v => (v * 100).toFixed(0) + '%' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    series
   }
 })
+
+const pct = v => v == null ? '-' : (v * 100).toFixed(2) + '%'
+const num = (v, d = 4) => v == null ? '-' : Number(v).toFixed(d)
 
 onMounted(loadFactorOptions)
 </script>
@@ -122,21 +148,32 @@ onMounted(loadFactorOptions)
   <div>
     <div class="panel-toolbar">
       <div class="field"><label>板块</label>
-        <select v-model="board">
-          <option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option>
-        </select>
+        <select v-model="board"><option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option></select>
       </div>
       <div class="field"><label>候选池规模</label><input v-model="poolSize" type="number" min="20" max="300" /></div>
       <div class="field"><label>因子</label>
-        <select v-model="factorKey">
-          <option v-for="f in factorOptions" :key="f.key" :value="f.key">{{ f.label }}</option>
-        </select>
+        <select v-model="factorKey"><option v-for="f in factorOptions" :key="f.key" :value="f.key">{{ f.label }}</option></select>
       </div>
       <div class="field"><label>分组数</label><input v-model="groups" type="number" min="2" max="10" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
       <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="360" /></div>
+      <div class="field"><label>基准</label>
+        <select v-model="benchmark"><option v-for="b in BENCH_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option></select>
+      </div>
       <button class="btn-primary" :disabled="loading" @click="runBacktest">{{ loading ? '回测中…' : '运行分层回测' }}</button>
-      <span class="hint">对候选池股票做滚动截面分组：每 N 个交易日按因子值将全部股票分成若干组，统计各组未来 N 日平均收益、逐期 IC/RankIC 与多空组合累计收益</span>
+    </div>
+    <div class="panel-toolbar" style="margin-top:8px">
+      <div class="field"><label><input type="checkbox" v-model="applyCost" /> 启用交易成本</label></div>
+      <div class="field"><label>佣金(万)</label><input v-model="commissionRate" type="number" step="0.00001" :disabled="!applyCost" /></div>
+      <div class="field"><label>印花税(千)</label><input v-model="stampDuty" type="number" step="0.0001" :disabled="!applyCost" /></div>
+      <div class="field"><label>滑点</label><input v-model="slippage" type="number" step="0.0001" :disabled="!applyCost" /></div>
+      <button class="btn-ghost" @click="showSave = !showSave" :disabled="!result">保存为策略</button>
+      <button class="btn-ghost" @click="exportReport('html')" :disabled="!result || exporting">导出HTML</button>
+      <button class="btn-ghost" @click="exportReport('excel')" :disabled="!result || exporting">导出Excel</button>
+    </div>
+    <div v-if="showSave" class="panel-toolbar" style="margin-top:8px">
+      <div class="field"><label>策略名称</label><input v-model="strategyName" placeholder="如：动量分层_v1" /></div>
+      <button class="btn-primary" :disabled="saving" @click="saveStrategy">{{ saving ? '保存中…' : '确认保存' }}</button>
     </div>
 
     <div v-if="!result" class="empty-hint">设置参数后点击「运行分层回测」</div>
@@ -144,22 +181,26 @@ onMounted(loadFactorOptions)
       <div class="stat-cards">
         <div class="stat-card"><div class="label">有效股票数</div><div class="value">{{ result.effectiveStocks }}</div></div>
         <div class="stat-card"><div class="label">调仓期数</div><div class="value">{{ result.rebalanceCount }}</div></div>
-        <div class="stat-card"><div class="label">平均 IC</div><div class="value" :class="result.meanIc >= 0 ? 'up' : 'down'">{{ result.meanIc.toFixed(4) }}</div></div>
+        <div class="stat-card"><div class="label">平均 IC</div><div class="value" :class="result.meanIc >= 0 ? 'up' : 'down'">{{ num(result.meanIc) }}</div></div>
         <div class="stat-card"><div class="label">IC 胜率</div><div class="value">{{ (result.icWinRate * 100).toFixed(1) }}%</div></div>
+        <div class="stat-card"><div class="label">年化收益</div><div class="value up">{{ pct(m.annualizedReturn) }}</div></div>
+        <div class="stat-card"><div class="label">Sharpe</div><div class="value">{{ num(m.sharpe) }}</div></div>
+        <div class="stat-card"><div class="label">最大回撤</div><div class="value down">{{ pct(m.maxDrawdown) }}</div></div>
+        <div class="stat-card"><div class="label">胜率</div><div class="value">{{ pct(m.winRate) }}</div></div>
       </div>
 
-      <div class="card chart-card">
-        <div class="card-head"><h3>分层收益（组1=因子值最低，组N=因子值最高）</h3></div>
-        <EChart :option="groupBarOption" height="320px" />
+      <div v-if="result.benchmark" class="stat-cards">
+        <div class="stat-card"><div class="label">基准累计</div><div class="value">{{ pct(result.benchmark.cumulativeReturn) }}</div></div>
+        <div class="stat-card"><div class="label">基准Sharpe</div><div class="value">{{ num(result.benchmark.sharpe) }}</div></div>
+        <div class="stat-card"><div class="label">Alpha</div><div class="value">{{ num(result.benchmark.alpha) }}</div></div>
+        <div class="stat-card"><div class="label">Beta</div><div class="value">{{ num(result.benchmark.beta) }}</div></div>
+        <div class="stat-card"><div class="label">Calmar</div><div class="value">{{ num(m.calmar) }}</div></div>
+        <div class="stat-card"><div class="label">Sortino</div><div class="value">{{ num(m.sortino) }}</div></div>
       </div>
-      <div class="card chart-card">
-        <div class="card-head"><h3>IC / RankIC 时序列</h3></div>
-        <EChart :option="icLineOption" height="320px" />
-      </div>
-      <div class="card chart-card">
-        <div class="card-head"><h3>多空组合（最高组-最低组）累计收益曲线</h3></div>
-        <EChart :option="longShortOption" height="320px" />
-      </div>
+
+      <div class="card chart-card"><div class="card-head"><h3>分层收益（组1=因子值最低，组N=因子值最高）</h3></div><EChart :option="groupBarOption" height="320px" /></div>
+      <div class="card chart-card"><div class="card-head"><h3>IC / RankIC 时序列</h3></div><EChart :option="icLineOption" height="320px" /></div>
+      <div class="card chart-card"><div class="card-head"><h3>多空组合累计收益曲线</h3></div><EChart :option="longShortOption" height="320px" /></div>
     </template>
   </div>
 </template>

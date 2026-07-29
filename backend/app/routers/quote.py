@@ -25,9 +25,9 @@ async def get_quote(codes: str, source: str = "tencent"):
 
 
 @router.get("/kline")
-async def get_kline(code: str, days: int = 150):
+async def get_kline(code: str, days: int = 150, forceRefresh: bool = False):
     try:
-        data = await adapters.fetch_kline(code, days)
+        data = await adapters.fetch_kline(code, days, force_refresh=forceRefresh)
     except Exception as e:
         raise HTTPException(502, f"历史数据请求失败: {e}")
     return {"code": code, "data": data}

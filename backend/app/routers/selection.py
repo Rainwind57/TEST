@@ -9,6 +9,9 @@ from .. import adapters, db
 from ..factors import (
     FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, composite_score,
     bucket_index, pearson, spearman, mean, std, zscore, multi_ols,
+    annualized_return, annualized_volatility, sharpe_ratio, sortino_ratio,
+    max_drawdown, calmar_ratio, win_rate, information_coefficient_stats,
+    round_trip_cost_rate, compute_user_factor_scores,
 )
 from .portfolio import OrderBody, place_order
 
@@ -17,6 +20,13 @@ router = APIRouter(prefix="/api/select", tags=["select"])
 BOARD_LABELS = {
     "all": "全部A股", "sh_main": "沪市主板", "sz_main": "深市主板",
     "gem": "创业板", "star": "科创板", "bse": "北交所",
+}
+
+BENCHMARKS = {
+    "none": None,
+    "hs300": "sh000300",
+    "zz500": "sh000905",
+    "sse": "sh000001",
 }
 
 
@@ -91,9 +101,22 @@ async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int =
 async def run_select(body: SelectBody):
     if not body.factors:
         raise HTTPException(400, "请至少选择一个因子")
-    unknown = [s.key for s in body.factors if s.key not in FACTORS and s.key not in SNAPSHOT_FACTORS]
+    builtin_keys = set(FACTORS) | set(SNAPSHOT_FACTORS)
+    uf_specs = [s for s in body.factors if s.key.startswith("uf:")]
+    unknown = [s.key for s in body.factors if s.key not in builtin_keys and not s.key.startswith("uf:")]
     if unknown:
         raise HTTPException(400, f"未知因子: {unknown}")
+
+    uf_defs = {}
+    for s in uf_specs:
+        try:
+            uf_id = int(s.key.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise HTTPException(400, f"无效的自定义因子标识: {s.key}")
+        uf = db.get_user_factor(uf_id)
+        if not uf:
+            raise HTTPException(400, f"自定义因子不存在: {s.key}")
+        uf_defs[s.key] = uf["definition"]
 
     try:
         pool = await adapters.fetch_market_list(body.board, body.poolSize)
@@ -138,6 +161,11 @@ async def run_select(body: SelectBody):
             entry[key] = tech_values.get(row["code"], {}).get(key)
         scored_rows.append(entry)
 
+    for uf_key, definition in uf_defs.items():
+        scores = compute_user_factor_scores(scored_rows, definition)
+        for idx, row in enumerate(scored_rows):
+            row[uf_key] = scores[idx]
+
     specs = [{"key": s.key, "weight": s.weight, "direction": s.direction} for s in body.factors]
     scored = composite_score(scored_rows, specs)
     scored.sort(key=lambda r: r["score"], reverse=True)
@@ -157,6 +185,11 @@ class BacktestBody(BaseModel):
     groups: int = 5
     n: int = 5
     hist: int = 180
+    commissionRate: float = 0.00025   # 佣金费率（万 2.5，单边）
+    stampDuty: float = 0.001          # 印花税（千 1，卖出单边）
+    slippage: float = 0.001           # 滑点/冲击成本（单边）
+    benchmark: str = "none"           # none | hs300 | zz500 | sse
+    applyCost: bool = True
 
 
 @router.post("/backtest")
@@ -166,6 +199,10 @@ async def run_backtest(body: BacktestBody):
     groups = max(2, min(10, body.groups))
     n = max(1, body.n)
     hist = max(60, body.hist)
+
+    bench_code = BENCHMARKS.get(body.benchmark)
+    if body.benchmark != "none" and bench_code is None:
+        raise HTTPException(400, f"未知基准: {body.benchmark}")
 
     try:
         pool = await adapters.fetch_market_list(body.board, body.poolSize)
@@ -188,15 +225,31 @@ async def run_backtest(body: BacktestBody):
     if len(series) < groups * 3:
         raise HTTPException(422, "有效股票样本不足，请增大候选池规模")
 
+    bench_series = None
+    if bench_code:
+        try:
+            bench_series = await adapters.fetch_kline(bench_code, hist + n + 25)
+        except Exception:
+            bench_series = None
+
     calc = FACTORS[body.factor]["calc"]
     date_maps = {code: {row["date"]: idx for idx, row in enumerate(kl)} for code, kl in series.items()}
     ref_code = max(series, key=lambda c: len(series[c]))
     ref_dates = [row["date"] for row in series[ref_code]]
 
+    cost_rate = round_trip_cost_rate(body.commissionRate, body.stampDuty, body.slippage) if body.applyCost else 0.0
+
     ic_series = []
     bucket_returns = [[] for _ in range(groups)]
     long_short_points = []
+    top_group_returns = []
+    bench_returns = []
     cum = 1.0
+    cum_top = 1.0
+
+    bench_date_idx = {}
+    if bench_series:
+        bench_date_idx = {row["date"]: idx for idx, row in enumerate(bench_series)}
 
     for t in range(25, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
@@ -230,8 +283,21 @@ async def run_backtest(body: BacktestBody):
         if day_buckets[0] and day_buckets[-1]:
             top_ret = mean(day_buckets[-1])
             bottom_ret = mean(day_buckets[0])
-            cum *= (1 + top_ret - bottom_ret)
-            long_short_points.append({"date": date_t, "longShort": top_ret - bottom_ret, "cum": cum - 1})
+            ls_ret = top_ret - bottom_ret
+            net_ls = ls_ret - cost_rate
+            net_top = top_ret - cost_rate
+            cum *= (1.0 + net_ls)
+            cum_top *= (1.0 + net_top)
+            long_short_points.append({
+                "date": date_t, "longShort": net_ls, "cum": cum - 1.0,
+                "topCum": cum_top - 1.0, "gross": ls_ret,
+            })
+            top_group_returns.append(net_top)
+            if bench_series and bench_date_idx:
+                bi = bench_date_idx.get(date_t)
+                if bi is not None and bi + n < len(bench_series):
+                    bc = [row["close"] for row in bench_series]
+                    bench_returns.append(bc[bi + n] / bc[bi] - 1)
 
     if not ic_series:
         raise HTTPException(422, "有效截面样本不足，无法完成分层回测")
@@ -240,16 +306,84 @@ async def run_backtest(body: BacktestBody):
         {"group": idx + 1, "avgReturn": mean(rets) if rets else 0.0, "sample": len(rets)}
         for idx, rets in enumerate(bucket_returns)
     ]
-    mean_ic = mean([p["ic"] for p in ic_series])
+
+    ls_returns = [p["longShort"] for p in long_short_points]
+    ls_equity = [1.0]
+    for r in ls_returns:
+        ls_equity.append(ls_equity[-1] * (1.0 + r))
+
+    metrics = {
+        "cumulativeReturn": cum - 1.0,
+        "annualizedReturn": annualized_return(ls_returns),
+        "annualizedVolatility": annualized_volatility(ls_returns),
+        "sharpe": sharpe_ratio(ls_returns),
+        "sortino": sortino_ratio(ls_returns),
+        "maxDrawdown": max_drawdown(ls_equity),
+        "calmar": calmar_ratio(ls_returns),
+        "winRate": win_rate(ls_returns),
+        "topGroupCumReturn": cum_top - 1.0,
+        "topGroupAnnualized": annualized_return(top_group_returns),
+        "rebalanceCount": len(ic_series),
+        "costRate": cost_rate,
+        "applyCost": body.applyCost,
+    }
+
+    bench_metrics = None
+    if bench_returns:
+        bench_cum = 1.0
+        for r in bench_returns:
+            bench_cum *= (1.0 + r)
+        if len(bench_returns) == len(ls_returns):
+            bench_alpha_beta = _alpha_beta(bench_returns, ls_returns)
+        else:
+            bench_alpha_beta = {"alpha": 0.0, "beta": 0.0}
+        bench_metrics = {
+            "code": bench_code,
+            "cumulativeReturn": bench_cum - 1.0,
+            "annualizedReturn": annualized_return(bench_returns),
+            "annualizedVolatility": annualized_volatility(bench_returns),
+            "sharpe": sharpe_ratio(bench_returns),
+            "maxDrawdown": max_drawdown(_equity_curve(bench_returns)),
+            **bench_alpha_beta,
+        }
+
+    ic_stats = information_coefficient_stats([p["ic"] for p in ic_series])
     mean_rank_ic = mean([p["rankIc"] for p in ic_series])
-    ic_win_rate = sum(1 for p in ic_series if p["ic"] > 0) / len(ic_series)
 
     return {
         "factorLabel": FACTORS[body.factor]["label"], "groups": groups, "n": n,
-        "meanIc": mean_ic, "meanRankIc": mean_rank_ic, "icWinRate": ic_win_rate,
+        "meanIc": ic_stats["meanIc"], "meanRankIc": mean_rank_ic,
+        "icWinRate": ic_stats["icWinRate"], "icIr": ic_stats["icIr"],
         "icSeries": ic_series, "groupSummary": group_summary, "longShort": long_short_points,
+        "metrics": metrics, "benchmark": bench_metrics,
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
+        "config": body.model_dump(),
     }
+
+
+def _equity_curve(returns: list[float]) -> list[float]:
+    eq = [1.0]
+    for r in returns:
+        eq.append(eq[-1] * (1.0 + r))
+    return eq
+
+
+def _alpha_beta(bench: list[float], strat: list[float]) -> dict:
+    n = len(bench)
+    if n < 2:
+        return {"alpha": 0.0, "beta": 0.0}
+    fit = ols_regression_local(bench, strat)
+    return {"alpha": fit["a"], "beta": fit["b"]}
+
+
+def ols_regression_local(xs: list[float], ys: list[float]) -> dict:
+    n = len(xs)
+    mx, my = mean(xs), mean(ys)
+    num = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+    den = sum((x - mx) ** 2 for x in xs)
+    b = 0.0 if den == 0 else num / den
+    a = my - b * mx
+    return {"a": a, "b": b}
 
 
 class FactorRegressionBody(BaseModel):

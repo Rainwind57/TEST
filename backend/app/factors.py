@@ -467,3 +467,125 @@ def bucket_index(value: float, sorted_values: list[float], groups: int) -> int:
     pos = sum(1 for v in sorted_values if v <= value)
     idx = int(pos * groups / n)
     return min(idx, groups - 1)
+
+
+# ---------------- 绩效指标 ----------------
+
+TRADING_DAYS = 252
+
+
+def annualized_return(period_returns: list[float], periods_per_year: int = TRADING_DAYS) -> float:
+    if not period_returns:
+        return 0.0
+    cum = 1.0
+    for r in period_returns:
+        cum *= (1.0 + r)
+    years = len(period_returns) / periods_per_year
+    if years <= 0:
+        return 0.0
+    return cum ** (1.0 / years) - 1.0
+
+
+def annualized_volatility(period_returns: list[float], periods_per_year: int = TRADING_DAYS) -> float:
+    if len(period_returns) < 2:
+        return 0.0
+    return std(period_returns) * math.sqrt(periods_per_year)
+
+
+def sharpe_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_per_year: int = TRADING_DAYS) -> float:
+    if not period_returns:
+        return 0.0
+    rf_period = rf_annual / periods_per_year
+    excess = [r - rf_period for r in period_returns]
+    s = std(excess)
+    if s == 0:
+        return 0.0
+    return mean(excess) / s * math.sqrt(periods_per_year)
+
+
+def sortino_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_per_year: int = TRADING_DAYS) -> float:
+    if not period_returns:
+        return 0.0
+    rf_period = rf_annual / periods_per_year
+    excess = [r - rf_period for r in period_returns]
+    downside = [e for e in excess if e < 0]
+    if not downside:
+        return 0.0
+    dd_std = math.sqrt(mean([e * e for e in downside]))
+    if dd_std == 0:
+        return 0.0
+    return mean(excess) / dd_std * math.sqrt(periods_per_year)
+
+
+def max_drawdown(equity_curve: list[float]) -> float:
+    """返回最大回撤（负值）。equity_curve 为累计净值序列（起点 1.0）。"""
+    if not equity_curve:
+        return 0.0
+    peak = equity_curve[0]
+    mdd = 0.0
+    for v in equity_curve:
+        if v > peak:
+            peak = v
+        if peak > 0:
+            dd = (v - peak) / peak
+            if dd < mdd:
+                mdd = dd
+    return mdd
+
+
+def calmar_ratio(period_returns: list[float], periods_per_year: int = TRADING_DAYS) -> float:
+    ann = annualized_return(period_returns, periods_per_year)
+    eq = [1.0]
+    for r in period_returns:
+        eq.append(eq[-1] * (1.0 + r))
+    mdd = max_drawdown(eq)
+    if mdd == 0:
+        return 0.0
+    return ann / abs(mdd)
+
+
+def win_rate(period_returns: list[float]) -> float:
+    if not period_returns:
+        return 0.0
+    return sum(1 for r in period_returns if r > 0) / len(period_returns)
+
+
+def information_coefficient_stats(ic_series: list[float]) -> dict:
+    if not ic_series:
+        return {"meanIc": 0.0, "icIr": 0.0, "icWinRate": 0.0}
+    m = mean(ic_series)
+    s = std(ic_series)
+    ir = 0.0 if s == 0 else m / s * math.sqrt(len(ic_series))
+    return {"meanIc": m, "icIr": ir, "icWinRate": sum(1 for v in ic_series if v > 0) / len(ic_series)}
+
+
+# ---------------- 交易成本模型 ----------------
+
+def round_trip_cost_rate(commission_rate: float, stamp_duty: float, slippage: float) -> float:
+    """单次调仓的往返成本率（买卖双边）：佣金双边 + 印花税卖单 + 滑点双边。"""
+    return 2.0 * commission_rate + stamp_duty + 2.0 * slippage
+
+
+# ---------------- 用户自定义因子（组合式）解析 ----------------
+
+def compute_user_factor_scores(rows: list[dict], definition: dict) -> list[float]:
+    """组合式自定义因子：对 definition.factors（[{key,weight,direction}]）做加权 z-score，
+    返回与 rows 对齐的得分列表。"""
+    specs = definition.get("factors") or []
+    if not specs:
+        return [0.0 for _ in rows]
+    columns = {spec["key"]: zscore([r.get(spec["key"]) for r in rows]) for spec in specs}
+    scores = []
+    for idx, row in enumerate(rows):
+        total, wsum = 0.0, 0.0
+        for spec in specs:
+            key = spec["key"]
+            weight = spec.get("weight", 1.0)
+            direction = spec.get("direction", 1)
+            raw = row.get(key)
+            if raw is None:
+                continue
+            total += columns[key][idx] * direction * weight
+            wsum += abs(weight)
+        scores.append(total / wsum if wsum > 0 else 0.0)
+    return scores
