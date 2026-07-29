@@ -1,13 +1,18 @@
 """策略 / 自定义因子 / 回测存档 持久化路由。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import db
+from ..auth import get_user_id_from_auth
 from . import selection as sel
 
 router = APIRouter(prefix="/api", tags=["strategies"])
 
 VALID_KINDS = ("select", "backtest", "regression")
+
+
+def _uid(request: Request) -> int:
+    return get_user_id_from_auth(request.headers.get("Authorization")) or 0
 
 
 # ---------------- saved_strategies ----------------
@@ -19,17 +24,17 @@ class StrategyBody(BaseModel):
 
 
 @router.get("/strategies")
-def list_strategies():
-    return db.list_strategies()
+def list_strategies(request: Request):
+    return db.list_strategies(_uid(request))
 
 
 @router.post("/strategies")
-def save_strategy(body: StrategyBody):
+def save_strategy(body: StrategyBody, request: Request):
     if body.kind not in VALID_KINDS:
         raise HTTPException(400, f"kind 必须为 {VALID_KINDS}")
     if not body.name.strip():
         raise HTTPException(400, "name 不能为空")
-    return db.create_strategy(body.name.strip(), body.kind, body.config)
+    return db.create_strategy(body.name.strip(), body.kind, body.config, _uid(request))
 
 
 @router.delete("/strategies/{sid}")
@@ -65,12 +70,12 @@ class UserFactorBody(BaseModel):
 
 
 @router.get("/user-factors")
-def list_user_factors():
-    return db.list_user_factors()
+def list_user_factors(request: Request):
+    return db.list_user_factors(_uid(request))
 
 
 @router.post("/user-factors")
-def save_user_factor(body: UserFactorBody):
+def save_user_factor(body: UserFactorBody, request: Request):
     if body.kind != "composite":
         raise HTTPException(400, "目前仅支持 composite 类型自定义因子")
     if not body.name.strip():
@@ -78,7 +83,7 @@ def save_user_factor(body: UserFactorBody):
     factors = (body.definition or {}).get("factors") or []
     if not factors:
         raise HTTPException(400, "definition.factors 不能为空")
-    return db.create_user_factor(body.name.strip(), body.kind, body.definition)
+    return db.create_user_factor(body.name.strip(), body.kind, body.definition, _uid(request))
 
 
 @router.delete("/user-factors/{fid}")
@@ -98,13 +103,13 @@ class BacktestRunBody(BaseModel):
 
 
 @router.get("/backtest-runs")
-def list_runs(limit: int = 50):
-    return db.list_backtest_runs(max(1, min(limit, 200)))
+def list_runs(request: Request, limit: int = 50):
+    return db.list_backtest_runs(max(1, min(limit, 200)), _uid(request))
 
 
 @router.post("/backtest-runs")
-def save_run(body: BacktestRunBody):
-    return db.create_backtest_run(body.strategyId, body.config, body.metrics, body.reportPath)
+def save_run(body: BacktestRunBody, request: Request):
+    return db.create_backtest_run(body.strategyId, body.config, body.metrics, body.reportPath, _uid(request))
 
 
 @router.delete("/backtest-runs/{rid}")

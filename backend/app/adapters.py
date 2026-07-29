@@ -290,3 +290,177 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     merged = db.get_cached_kline(code) if kline else kline
     _kline_cache[cache_key] = (time.time(), merged)
     return merged
+
+
+# ---------------- 资金流向（东方财富） ----------------
+
+_money_flow_cache: dict[str, tuple[float, dict]] = {}
+MONEY_FLOW_CACHE_TTL = 300  # 秒
+
+
+def _to_secid_full(code: str) -> str:
+    """完整 secid：沪市 1.、深市 0.。"""
+    market = "1" if code.startswith("sh") else "0"
+    return f"{market}.{code[2:]}"
+
+
+async def fetch_money_flow(code: str) -> dict:
+    """单股资金流向（东方财富）：主力/超大单/大单/中单/小单 净额与净占比。"""
+    cache_key = code
+    cached = _money_flow_cache.get(cache_key)
+    if cached and time.time() - cached[0] < MONEY_FLOW_CACHE_TTL:
+        return cached[1]
+
+    secid = _to_secid_full(code)
+    url = (f"https://push2.eastmoney.com/api/qt/stock/get"
+           f"?secid={secid}&fields=f62,f184,f66,f69,f72,f75,f78,f81,f84,f87")
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+    data = (resp.json() or {}).get("data", {})
+    if not data:
+        return {}
+    f = lambda k: float(data.get(k, 0) or 0)
+    result = {
+        "mainNet": f("f62"), "mainNetPct": f("f184") / 100,
+        "superLargeNet": f("f66"), "superLargePct": f("f69") / 100,
+        "largeNet": f("f72"), "largePct": f("f75") / 100,
+        "mediumNet": f("f78"), "mediumPct": f("f81") / 100,
+        "smallNet": f("f84"), "smallPct": f("f87") / 100,
+    }
+    _money_flow_cache[cache_key] = (time.time(), result)
+    return result
+
+
+async def fetch_money_flow_trend(code: str, days: int = 10) -> list[dict]:
+    """单股 N 日资金流向趋势（东方财富历史接口）。"""
+    market = "1" if code.startswith("sh") else "0"
+    pure_code = code[2:]
+    url = (f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+           f"?secid={market}.{pure_code}&lmt={days}&fields1=f1,f2,f3,f7"
+           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65")
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+    klines = (resp.json() or {}).get("data", {}).get("klines", [])
+    out = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        try:
+            out.append({
+                "date": parts[0],
+                "mainNet": float(parts[1]),
+                "smallNet": float(parts[2]),
+                "mediumNet": float(parts[3]),
+                "largeNet": float(parts[4]),
+                "superLargeNet": float(parts[5]),
+            })
+        except (IndexError, ValueError):
+            continue
+    return out
+
+
+# ---------------- 北向资金（东方财富） ----------------
+
+_north_flow_cache: dict[str, tuple[float, list]] = {}
+NORTH_FLOW_CACHE_TTL = 300
+
+
+async def fetch_north_flow_trend(days: int = 30) -> list[dict]:
+    """北向资金 N 日净流入趋势（沪股通+深股通合计）。"""
+    cache_key = f"north:{days}"
+    cached = _north_flow_cache.get(cache_key)
+    if cached and time.time() - cached[0] < NORTH_FLOW_CACHE_TTL:
+        return cached[1]
+
+    url = (f"https://push2his.eastmoney.com/api/qt/kamt.kline/get"
+           f"?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56"
+           f"&klt=101&lmt={days}")
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+    klines = (resp.json() or {}).get("data", {}).get("s2n", [])
+    out = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            out.append({
+                "date": parts[0],
+                "shNet": float(parts[1]),  # 沪股通净买入（万元）
+                "szNet": float(parts[2]),  # 深股通净买入
+                "totalNet": float(parts[1]) + float(parts[2]),
+            })
+        except (IndexError, ValueError):
+            continue
+    _north_flow_cache[cache_key] = (time.time(), out)
+    return out
+
+
+# ---------------- 财务指标（东方财富） ----------------
+
+async def fetch_finance_summary(code: str) -> dict:
+    """主要财务指标摘要（东方财富个股财务接口）：ROE/毛利率/净利率/资产负债率等。"""
+    market = "1" if code.startswith("sh") else "0"
+    pure = code[2:]
+    url = (f"https://datacenter.eastmoney.com/securities/api/data/get"
+           f"?type=RPT_F10_FINANCE_MAINFINADATA&sty=APP_F10_MAINFINADATA"
+           f"&filter=(SECUCODE%3D%22{pure}.{market.upper()}%22)"
+           f"&p=1&ps=4&sr=-1&st=REPORT_DATE")
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+    rows = (resp.json() or {}).get("result", {}).get("data", [])
+    if not rows:
+        return {}
+    r = rows[0]
+    f = lambda k: r.get(k)
+    return {
+        "reportDate": f("REPORT_DATE"),
+        "roe": f("WEIGHTAVG_ROE"),
+        "grossMargin": f("GROSS_PROFIT_RATIO"),
+        "netMargin": f("NET_PROFIT_RATIO"),
+        "debtRatio": f("DEBT_ASSET_RATIO"),
+        "revenueYoY": f("TOTAL_OPERATE_INCOME_YOY"),
+        "profitYoY": f("PARENT_NETPROFIT_YOY"),
+        "eps": f("BASIC_EPS"),
+        "bps": f("BPS"),
+    }
+
+
+# ---------------- 分钟级 K 线（腾讯） ----------------
+
+_minute_cache: dict[str, tuple[float, list]] = {}
+MINUTE_CACHE_TTL = 120  # 秒
+
+
+async def fetch_minute_kline(code: str, period: str = "5", count: int = 240) -> list[dict]:
+    """分钟级 K 线（腾讯）。
+
+    period: "1"=1分钟, "5"=5分钟, "15"=15分钟, "30"=30分钟, "60"=60分钟。
+    count: K 线数量。默认 240（≈ 一个交易日的 1 分钟数）。
+    返回 [{datetime, open, close, high, low, volume}]，按时间升序。
+    """
+    cache_key = f"{code}:{period}:{count}"
+    cached = _minute_cache.get(cache_key)
+    if cached and time.time() - cached[0] < MINUTE_CACHE_TTL:
+        return cached[1]
+
+    url = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline/get"
+           f"?param={code},m{period},{count}")
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+    data = (resp.json() or {}).get("data", {}).get(code, {})
+    arr = data.get(f"m{period}") or []
+    out = []
+    for row in arr:
+        try:
+            out.append({
+                "datetime": row[0],
+                "open": float(row[1]), "close": float(row[2]),
+                "high": float(row[3]), "low": float(row[4]),
+                "volume": float(row[5]),
+            })
+        except (IndexError, ValueError):
+            continue
+    _minute_cache[cache_key] = (time.time(), out)
+    return out

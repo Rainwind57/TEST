@@ -75,6 +75,18 @@ def init_db():
         report_path TEXT,
         created_at TEXT NOT NULL
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        salt TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""")
+
+    # 多用户：为研究资产表加 user_id 列（ALTER 兼容旧库）
+    _ensure_column(cur, "saved_strategies", "user_id", "INTEGER DEFAULT 0")
+    _ensure_column(cur, "user_factors", "user_id", "INTEGER DEFAULT 0")
+    _ensure_column(cur, "backtest_runs", "user_id", "INTEGER DEFAULT 0")
 
     cur.execute("SELECT COUNT(*) AS c FROM watchlist")
     if cur.fetchone()["c"] == 0:
@@ -132,19 +144,21 @@ def upsert_kline(code: str, rows: list[dict]):
 
 # ---------------- 策略 / 自定义因子 / 回测存档 CRUD ----------------
 
-def list_strategies() -> list[dict]:
+def list_strategies(user_id: int = 0) -> list[dict]:
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM saved_strategies ORDER BY id DESC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM saved_strategies WHERE user_id = ? ORDER BY id DESC", (user_id,)
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def create_strategy(name: str, kind: str, config: dict) -> dict:
+def create_strategy(name: str, kind: str, config: dict, user_id: int = 0) -> dict:
     conn = get_conn()
     now = datetime.datetime.now().isoformat()
     cur = conn.execute(
-        "INSERT INTO saved_strategies (name, kind, config, created_at) VALUES (?, ?, ?, ?)",
-        (name, kind, _json_dumps(config), now)
+        "INSERT INTO saved_strategies (name, kind, config, created_at, user_id) VALUES (?, ?, ?, ?, ?)",
+        (name, kind, _json_dumps(config), now, user_id)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM saved_strategies WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -167,19 +181,21 @@ def get_strategy(strategy_id: int):
     return _parse_strategy(row) if row else None
 
 
-def list_user_factors() -> list[dict]:
+def list_user_factors(user_id: int = 0) -> list[dict]:
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM user_factors ORDER BY id DESC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM user_factors WHERE user_id = ? ORDER BY id DESC", (user_id,)
+    ).fetchall()
     conn.close()
     return [_parse_user_factor(r) for r in rows]
 
 
-def create_user_factor(name: str, kind: str, definition: dict) -> dict:
+def create_user_factor(name: str, kind: str, definition: dict, user_id: int = 0) -> dict:
     conn = get_conn()
     now = datetime.datetime.now().isoformat()
     cur = conn.execute(
-        "INSERT INTO user_factors (name, kind, definition, created_at) VALUES (?, ?, ?, ?)",
-        (name, kind, _json_dumps(definition), now)
+        "INSERT INTO user_factors (name, kind, definition, created_at, user_id) VALUES (?, ?, ?, ?, ?)",
+        (name, kind, _json_dumps(definition), now, user_id)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM user_factors WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -202,22 +218,23 @@ def get_user_factor(factor_id: int):
     return _parse_user_factor(row) if row else None
 
 
-def list_backtest_runs(limit: int = 50) -> list[dict]:
+def list_backtest_runs(limit: int = 50, user_id: int = 0) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT * FROM backtest_runs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit)
     ).fetchall()
     conn.close()
     return [_parse_backtest_run(r) for r in rows]
 
 
-def create_backtest_run(strategy_id, config: dict, metrics: dict, report_path=None) -> dict:
+def create_backtest_run(strategy_id, config: dict, metrics: dict, report_path=None, user_id: int = 0) -> dict:
     conn = get_conn()
     now = datetime.datetime.now().isoformat()
     cur = conn.execute(
-        "INSERT INTO backtest_runs (strategy_id, config, metrics, report_path, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (strategy_id, _json_dumps(config), _json_dumps(metrics), report_path, now)
+        "INSERT INTO backtest_runs (strategy_id, config, metrics, report_path, created_at, user_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (strategy_id, _json_dumps(config), _json_dumps(metrics), report_path, now, user_id)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM backtest_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -236,6 +253,13 @@ def delete_backtest_run(run_id: int) -> bool:
 def _json_dumps(obj) -> str:
     import json
     return json.dumps(obj, ensure_ascii=False)
+
+
+def _ensure_column(cur, table: str, column: str, definition: str):
+    """为已存在的表添加列（SQLite 无 IF NOT EXISTS for ADD COLUMN），忽略重复列错误。"""
+    cols = {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _parse_strategy(row):

@@ -11,9 +11,13 @@ import MLView from '../views/MLView.vue'
 import MonitorView from '../views/MonitorView.vue'
 import OptimizeView from '../views/OptimizeView.vue'
 import PortfolioOptView from '../views/PortfolioOptView.vue'
+import IntradayView from '../views/IntradayView.vue'
+import RiskView from '../views/RiskView.vue'
+import LoginView from '../views/LoginView.vue'
 
 const routes = [
   { path: '/', redirect: '/quote' },
+  { path: '/login', name: 'login', component: LoginView, meta: { label: '登录' } },
   { path: '/quote', name: 'quote', component: QuoteView, meta: { label: '行情' } },
   { path: '/factor', name: 'factor', component: FactorView, meta: { label: '因子' } },
   { path: '/regression', name: 'regression', component: RegressionView, meta: { label: '回归' } },
@@ -25,7 +29,9 @@ const routes = [
   { path: '/ml', name: 'ml', component: MLView, meta: { label: '机器学习' } },
   { path: '/monitor', name: 'monitor', component: MonitorView, meta: { label: '盯盘调度' } },
   { path: '/optimize', name: 'optimize', component: OptimizeView, meta: { label: '参数寻优' } },
-  { path: '/portfolio-opt', name: 'portfolio-opt', component: PortfolioOptView, meta: { label: '组合优化' } }
+  { path: '/portfolio-opt', name: 'portfolio-opt', component: PortfolioOptView, meta: { label: '组合优化' } },
+  { path: '/intraday', name: 'intraday', component: IntradayView, meta: { label: '分钟回测' } },
+  { path: '/risk', name: 'risk', component: RiskView, meta: { label: '风险归因' } }
 ]
 
 export default createRouter({

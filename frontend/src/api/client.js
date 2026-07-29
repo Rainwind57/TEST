@@ -1,10 +1,20 @@
 import axios from 'axios'
 
 const baseURL = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8899/api'
+export { baseURL }
 
 const api = axios.create({
   baseURL,
   timeout: 60000
+})
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('quant_token')
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
 })
 
 api.interceptors.response.use(
@@ -16,9 +26,11 @@ api.interceptors.response.use(
 )
 
 export async function downloadFile(url, payload, filename) {
+  const token = localStorage.getItem('quant_token')
   const res = await axios.post(baseURL + url, payload, {
     responseType: 'blob',
-    timeout: 60000
+    timeout: 60000,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
   const disposition = res.headers['content-disposition'] || ''
   const match = disposition.match(/filename=([^;]+)/)

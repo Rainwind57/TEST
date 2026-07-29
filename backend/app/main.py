@@ -4,9 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
 from .routers import (quote, factor, portfolio, selection, strategies, reports,
-                      jobs, ml, monitor, optimize, portfolio_opt)
+                      jobs, ml, monitor, optimize, portfolio_opt, data, risk,
+                      intraday, auth)
 
-app = FastAPI(title="简易量化研究平台 API", version="3.0.0")
+app = FastAPI(title="简易量化研究平台 API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +34,10 @@ app.include_router(ml.router)
 app.include_router(monitor.router)
 app.include_router(optimize.router)
 app.include_router(portfolio_opt.router)
+app.include_router(data.router)
+app.include_router(risk.router)
+app.include_router(intraday.router)
+app.include_router(auth.router)
 
 
 @app.get("/api/health")

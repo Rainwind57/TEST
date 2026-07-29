@@ -1,7 +1,9 @@
 <script setup>
 import { RouterLink, useRoute } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()
+const auth = useAuthStore()
 const items = [
   { path: '/quote', label: '行情', icon: 'Q' },
   { path: '/factor', label: '因子', icon: 'F' },
@@ -14,7 +16,9 @@ const items = [
   { path: '/ml', label: '机器学习', icon: 'ML' },
   { path: '/monitor', label: '盯盘调度', icon: 'MO' },
   { path: '/optimize', label: '参数寻优', icon: 'OP' },
-  { path: '/portfolio-opt', label: '组合优化', icon: 'PO' }
+  { path: '/portfolio-opt', label: '组合优化', icon: 'PO' },
+  { path: '/intraday', label: '分钟回测', icon: 'IN' },
+  { path: '/risk', label: '风险归因', icon: 'RK' }
 ]
 </script>
 
@@ -41,6 +45,11 @@ const items = [
     </nav>
     <div class="sidebar-footer">
       <div class="dot-row"><span class="dot"></span><span>数据源：腾讯 / 新浪 / 东财</span></div>
+      <div v-if="auth.isLoggedIn" class="user-box">
+        <span class="user-name">{{ auth.user?.username }}</span>
+        <button class="logout-btn" @click="auth.logout()">登出</button>
+      </div>
+      <RouterLink v-else to="/login" class="login-link">登录 / 注册</RouterLink>
     </div>
   </aside>
 </template>
@@ -97,4 +106,8 @@ nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
 .sidebar-footer { padding: 12px 6px 0; border-top: 1px solid var(--border); }
 .dot-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-mute); }
 .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--down); }
+.user-box { margin-top: 10px; display: flex; align-items: center; justify-content: space-between; background: var(--card-2); border-radius: 8px; padding: 6px 10px; }
+.user-name { font-size: 12px; font-weight: 600; color: var(--text); }
+.logout-btn { background: transparent; border: none; color: #ff6b6b; cursor: pointer; font-size: 12px; }
+.login-link { display: block; margin-top: 10px; text-align: center; padding: 8px; background: var(--accent); color: white; border-radius: 8px; font-size: 13px; font-weight: 600; }
 </style>
