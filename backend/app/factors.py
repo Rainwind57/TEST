@@ -401,11 +401,19 @@ SNAPSHOT_FACTORS = {
     "bp": {"label": "账面市值比(1/PB)", "group": "fundamental", "direction": 1, "format": "pct"},
     "mkt_cap": {"label": "总市值(亿)", "group": "fundamental", "direction": -1, "format": "num"},
     "circ_mkt_cap": {"label": "流通市值(亿)", "group": "fundamental", "direction": -1, "format": "num"},
+    "roe": {"label": "ROE(%)", "group": "fundamental", "direction": 1, "format": "num"},
+    "net_margin": {"label": "净利率(%)", "group": "fundamental", "direction": 1, "format": "num"},
+    "revenue_yoy": {"label": "营收同比(%)", "group": "fundamental", "direction": 1, "format": "num"},
+    "profit_yoy": {"label": "净利同比(%)", "group": "fundamental", "direction": 1, "format": "num"},
+    "main_net_pct": {"label": "主力净流入占比", "group": "moneyflow", "direction": 1, "format": "pct"},
 }
 
 _SNAPSHOT_FIELD_MAP = {
     "pct_chg": "pctChg", "turnover": "turnover", "mkt_cap": "mktCap", "circ_mkt_cap": "circMktCap",
     "pe": "pe", "pb": "pb",
+    # 资金流/财务快照因子（由 selection.run_select 勾选时批量拉取填充 row，非行情快照自带）
+    "roe": "roe", "net_margin": "net_margin", "revenue_yoy": "revenue_yoy",
+    "profit_yoy": "profit_yoy", "main_net_pct": "main_net_pct",
 }
 
 
@@ -502,7 +510,7 @@ def bucket_index(value: float, sorted_values: list[float], groups: int) -> int:
 TRADING_DAYS = 252
 
 
-def annualized_return(period_returns: list[float], periods_per_year: int = TRADING_DAYS) -> float:
+def annualized_return(period_returns: list[float], periods_per_year: float = TRADING_DAYS) -> float:
     if not period_returns:
         return 0.0
     cum = 1.0
@@ -514,13 +522,13 @@ def annualized_return(period_returns: list[float], periods_per_year: int = TRADI
     return cum ** (1.0 / years) - 1.0
 
 
-def annualized_volatility(period_returns: list[float], periods_per_year: int = TRADING_DAYS) -> float:
+def annualized_volatility(period_returns: list[float], periods_per_year: float = TRADING_DAYS) -> float:
     if len(period_returns) < 2:
         return 0.0
     return std(period_returns) * math.sqrt(periods_per_year)
 
 
-def sharpe_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_per_year: int = TRADING_DAYS) -> float:
+def sharpe_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_per_year: float = TRADING_DAYS) -> float:
     if not period_returns:
         return 0.0
     rf_period = rf_annual / periods_per_year
@@ -531,7 +539,7 @@ def sharpe_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_pe
     return mean(excess) / s * math.sqrt(periods_per_year)
 
 
-def sortino_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_per_year: int = TRADING_DAYS) -> float:
+def sortino_ratio(period_returns: list[float], rf_annual: float = 0.0, periods_per_year: float = TRADING_DAYS) -> float:
     if not period_returns:
         return 0.0
     rf_period = rf_annual / periods_per_year
@@ -561,7 +569,7 @@ def max_drawdown(equity_curve: list[float]) -> float:
     return mdd
 
 
-def calmar_ratio(period_returns: list[float], periods_per_year: int = TRADING_DAYS) -> float:
+def calmar_ratio(period_returns: list[float], periods_per_year: float = TRADING_DAYS) -> float:
     ann = annualized_return(period_returns, periods_per_year)
     eq = [1.0]
     for r in period_returns:
@@ -578,12 +586,14 @@ def win_rate(period_returns: list[float]) -> float:
     return sum(1 for r in period_returns if r > 0) / len(period_returns)
 
 
-def information_coefficient_stats(ic_series: list[float]) -> dict:
+def information_coefficient_stats(ic_series: list[float], periods_per_year: float = TRADING_DAYS) -> dict:
+    """IC 统计。ICIR = meanIC/stdIC × √(年化采样数)；
+    periods_per_year 应传 252/n（n=调仓间隔），旧版误用 √len(总期数) 导致口径错误。"""
     if not ic_series:
         return {"meanIc": 0.0, "icIr": 0.0, "icWinRate": 0.0}
     m = mean(ic_series)
     s = std(ic_series)
-    ir = 0.0 if s == 0 else m / s * math.sqrt(len(ic_series))
+    ir = 0.0 if s == 0 else m / s * math.sqrt(periods_per_year)
     return {"meanIc": m, "icIr": ir, "icWinRate": sum(1 for v in ic_series if v > 0) / len(ic_series)}
 
 

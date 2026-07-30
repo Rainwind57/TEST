@@ -34,6 +34,23 @@ async function run() {
   finally { loading.value = false }
 }
 
+async function saveStrategy() {
+  const name = prompt('策略名称', `日内_${code.value}_${period.value}m`)
+  if (!name) return
+  try {
+    await api.post('/strategies', {
+      name, kind: 'intraday',
+      config: {
+        code: code.value, period: period.value, count: Number(count.value),
+        signalLookback: Number(signalLookback.value), entryThreshold: Number(entryThreshold.value),
+        takeProfit: Number(takeProfit.value), stopLoss: Number(stopLoss.value),
+        sharesPerTrade: Number(sharesPerTrade.value), maxTrades: Number(maxTrades.value),
+      },
+    })
+    toast('策略已保存，可在策略中心一键运行')
+  } catch (e) { toast(e.message) }
+}
+
 const fmt = v => v == null ? '-' : Number(v).toFixed(4)
 const fmtPct = v => v == null ? '-' : (Number(v) * 100).toFixed(2) + '%'
 
@@ -78,6 +95,7 @@ const pnlOption = computed(() => {
         <div class="field"><label>最大交易数</label><input v-model="maxTrades" type="number" /></div>
       </div>
       <button class="btn-primary" style="margin-top:10px" :disabled="loading" @click="run">{{ loading ? '回测中…' : '开始回测' }}</button>
+      <button class="btn-ghost" style="margin-top:10px;margin-left:8px" @click="saveStrategy">保存为策略</button>
     </div>
 
     <div v-if="result" class="card">

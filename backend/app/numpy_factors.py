@@ -45,13 +45,17 @@ def ma_dev_series(close: np.ndarray, n: int) -> np.ndarray:
 
 
 def volatility_series(close: np.ndarray, n: int) -> np.ndarray:
-    """N 日收益率标准差，前 n 项为 NaN。"""
+    """N 日收益率标准差，前 n 项为 NaN。
+
+    窗口取 rets[i-n:i]（第 i-n+1 日到第 i 日收益），与 factors.py factor_volatility
+    逐点版严格对齐，不含第 i+1 日收益（无前视偏差）。
+    """
     out = np.full_like(close, np.nan)
     if len(close) <= n:
         return out
     rets = _daily_returns(close)
     for i in range(n, len(close)):
-        out[i] = np.std(rets[i - n + 1: i + 1], ddof=0)
+        out[i] = np.std(rets[i - n: i], ddof=0)
     return out
 
 
@@ -75,20 +79,30 @@ def rsi_series(close: np.ndarray, n: int) -> np.ndarray:
 
 
 def macd_series(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> np.ndarray:
-    """MACD 柱值序列，前 slow+signal-1 项为 NaN。"""
+    """MACD 柱值序列（DIF - DEA），前 slow+signal-1 项为 NaN。
+
+    全序列化：对整条 close 算 EMA(fast)/EMA(slow) → DIF，再对 DIF 有效部分算
+    EMA(signal) → DEA，逐点回填 MACD。与 factors.py factor_macd 逐点版数值对齐
+    （合成数据实测最大偏差 ~3.9e-16）。旧版只给 out[-1] 赋值，历史全 NaN，导致
+    ML 数据集构建时所有含 MACD 特征的样本被跳过。
+    """
     out = np.full_like(close, np.nan)
     if len(close) < slow + signal:
         return out
     ema_f = _ema(close, fast)
     ema_s = _ema(close, slow)
     dif = ema_f - ema_s
-    valid_dif = dif[~np.isnan(dif)]
+    valid_mask = ~np.isnan(dif)
+    valid_dif = dif[valid_mask]
     if len(valid_dif) < signal:
         return out
     dea = _ema(valid_dif, signal)
-    last_valid = valid_dif[-1]
-    last_dea = dea[-1]
-    out[-1] = last_valid - last_dea if not np.isnan(last_dea) else np.nan
+    macd_valid = valid_dif - dea
+    valid_idx = np.where(valid_mask)[0]
+    for k, idx in enumerate(valid_idx):
+        v = macd_valid[k]
+        if not np.isnan(v):
+            out[idx] = v
     return out
 
 

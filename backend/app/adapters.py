@@ -3,12 +3,38 @@ import asyncio
 import json
 import re
 import time
+import datetime
 import httpx
+from collections import OrderedDict
 
 from . import db
 
-_kline_cache: dict[str, tuple[float, list]] = {}
+_kline_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()
 KLINE_CACHE_TTL = 300  # 秒
+KLINE_CACHE_MAX = 500  # LRU 上限，防内存无限增长
+
+
+def _kline_cache_set(key: str, value: tuple[float, list]) -> None:
+    """写入缓存并按 LRU 淘汰最旧条目。"""
+    _kline_cache[key] = value
+    _kline_cache.move_to_end(key)
+    while len(_kline_cache) > KLINE_CACHE_MAX:
+        _kline_cache.popitem(last=False)
+
+
+async def _http_get(url: str, timeout: int = 10, headers: dict | None = None,
+                    retries: int = 2, base_delay: float = 0.5) -> httpx.Response:
+    """带指数退避重试的 HTTP GET（腾讯/东财接口偶发限流，旧版无重试静默丢样本）。"""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers=headers or {}) as client:
+                return await client.get(url)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                await asyncio.sleep(base_delay * (2 ** attempt))
+    raise last_exc
 
 
 def _to_secid(code: str) -> str:
@@ -18,8 +44,7 @@ def _to_secid(code: str) -> str:
 async def fetch_tencent_quotes(codes: list[str]) -> dict:
     """腾讯实时行情：稳定，带 CORS，字段丰富（含 PE/PB/市值/换手率）。"""
     url = f"https://qt.gtimg.cn/q={','.join(codes)}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
+    resp = await _http_get(url, 10)
     text = resp.content.decode("gbk", errors="ignore")
     out = {}
     for line in text.split("\n"):
@@ -267,16 +292,17 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     if not force_refresh:
         cached = _kline_cache.get(cache_key)
         if cached and time.time() - cached[0] < KLINE_CACHE_TTL:
+            _kline_cache.move_to_end(cache_key)  # LRU 命中提升
             return cached[1]
 
         disk_rows = db.get_cached_kline(code)
-        if len(disk_rows) >= days:
-            _kline_cache[cache_key] = (time.time(), disk_rows)
-            return disk_rows
+        if len(disk_rows) >= days and not _kline_stale(disk_rows):
+            result = disk_rows[-days:]  # 裁剪到请求长度（旧版静默放大返回全量）
+            _kline_cache_set(cache_key, (time.time(), result))
+            return result
 
     url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
+    resp = await _http_get(url, 10)
     data = resp.json()
     stock_data = (data or {}).get("data", {}).get(code, {})
     arr = stock_data.get("qfqday") or stock_data.get("day") or []
@@ -288,8 +314,21 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
 
     db.upsert_kline(code, kline)
     merged = db.get_cached_kline(code) if kline else kline
-    _kline_cache[cache_key] = (time.time(), merged)
-    return merged
+    result = merged[-days:]
+    _kline_cache_set(cache_key, (time.time(), result))
+    return result
+
+
+def _kline_stale(rows: list[dict], max_age_days: int = 3) -> bool:
+    """K 线末日日期新鲜度校验：末日距今超过 max_age_days 日历日视为陈旧需回源。"""
+    if not rows:
+        return True
+    last_date = rows[-1].get("date", "")
+    try:
+        last_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return True
+    return (datetime.datetime.now() - last_dt).days > max_age_days
 
 
 # ---------------- 资金流向（东方财富） ----------------

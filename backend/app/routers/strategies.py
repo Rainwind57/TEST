@@ -2,13 +2,14 @@
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import db
+from .. import db, intraday
 from ..auth import get_user_id_from_auth
 from . import selection as sel
+from .intraday import IntradayBody
 
 router = APIRouter(prefix="/api", tags=["strategies"])
 
-VALID_KINDS = ("select", "backtest", "regression")
+VALID_KINDS = ("select", "backtest", "regression", "intraday")
 
 
 def _uid(request: Request) -> int:
@@ -38,17 +39,19 @@ def save_strategy(body: StrategyBody, request: Request):
 
 
 @router.delete("/strategies/{sid}")
-def remove_strategy(sid: int):
-    if not db.delete_strategy(sid):
-        raise HTTPException(404, "策略不存在")
+def remove_strategy(sid: int, request: Request):
+    if not db.delete_strategy(sid, _uid(request)):
+        raise HTTPException(404, "策略不存在或无权操作")
     return {"ok": True}
 
 
 @router.post("/strategies/{sid}/run")
-async def run_strategy(sid: int):
+async def run_strategy(sid: int, request: Request):
     s = db.get_strategy(sid)
     if not s:
         raise HTTPException(404, "策略不存在")
+    if s.get("user_id") != _uid(request):
+        raise HTTPException(403, "无权运行该策略")
     cfg = s.get("config") or {}
     kind = s["kind"]
     try:
@@ -56,6 +59,19 @@ async def run_strategy(sid: int):
             return await sel.run_backtest(sel.BacktestBody(**cfg))
         if kind == "select":
             return await sel.run_select(sel.SelectBody(**cfg))
+        if kind == "regression":
+            return await sel.run_factor_regression(sel.FactorRegressionBody(**cfg))
+        if kind == "intraday":
+            ib = IntradayBody(**cfg)
+            icfg = intraday.IntradayConfig(
+                code=ib.code, period=ib.period, count=ib.count,
+                signal_lookback=ib.signalLookback, entry_threshold=ib.entryThreshold,
+                take_profit=ib.takeProfit, stop_loss=ib.stopLoss,
+                shares_per_trade=ib.sharesPerTrade, max_trades=ib.maxTrades,
+                commissionRate=ib.commissionRate, stampDuty=ib.stampDuty,
+                slippage=ib.slippage, applyCost=ib.applyCost,
+            )
+            return await intraday.run_intraday_backtest(icfg)
     except TypeError as e:
         raise HTTPException(400, f"策略配置字段不匹配: {e}")
     raise HTTPException(400, f"暂不支持一键运行 kind={kind}")
@@ -87,9 +103,9 @@ def save_user_factor(body: UserFactorBody, request: Request):
 
 
 @router.delete("/user-factors/{fid}")
-def remove_user_factor(fid: int):
-    if not db.delete_user_factor(fid):
-        raise HTTPException(404, "自定义因子不存在")
+def remove_user_factor(fid: int, request: Request):
+    if not db.delete_user_factor(fid, _uid(request)):
+        raise HTTPException(404, "自定义因子不存在或无权操作")
     return {"ok": True}
 
 
@@ -113,7 +129,7 @@ def save_run(body: BacktestRunBody, request: Request):
 
 
 @router.delete("/backtest-runs/{rid}")
-def remove_run(rid: int):
-    if not db.delete_backtest_run(rid):
-        raise HTTPException(404, "回测记录不存在")
+def remove_run(rid: int, request: Request):
+    if not db.delete_backtest_run(rid, _uid(request)):
+        raise HTTPException(404, "回测记录不存在或无权操作")
     return {"ok": True}

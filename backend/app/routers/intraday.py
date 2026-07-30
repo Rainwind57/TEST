@@ -17,6 +17,10 @@ class IntradayBody(BaseModel):
     stopLoss: float = -0.01
     sharesPerTrade: int = 100
     maxTrades: int = 10
+    commissionRate: float = 0.00025
+    stampDuty: float = 0.001
+    slippage: float = 0.001
+    applyCost: bool = True
 
 
 @router.post("/backtest")
@@ -26,6 +30,8 @@ async def backtest(body: IntradayBody):
         signal_lookback=body.signalLookback, entry_threshold=body.entryThreshold,
         take_profit=body.takeProfit, stop_loss=body.stopLoss,
         shares_per_trade=body.sharesPerTrade, max_trades=body.maxTrades,
+        commissionRate=body.commissionRate, stampDuty=body.stampDuty,
+        slippage=body.slippage, applyCost=body.applyCost,
     )
     try:
         return await intraday.run_intraday_backtest(cfg)

@@ -1,12 +1,13 @@
 <script setup>
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useToast } from '../stores/toast'
 
 const { toast } = useToast()
 const auth = useAuthStore()
 const router = useRouter()
+const route = useRoute()
 
 const mode = ref('login')
 const username = ref('')
@@ -23,7 +24,7 @@ async function submit() {
       await auth.register(username.value, password.value)
     }
     toast(`欢迎，${auth.user.username}`)
-    router.push('/quote')
+    router.push(route.query.redirect || '/quote')
   } catch (e) { toast(e.message) }
   finally { loading.value = false }
 }

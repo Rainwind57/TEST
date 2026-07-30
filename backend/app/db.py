@@ -12,6 +12,10 @@ DEFAULT_CODES = ["sh000001", "sh600519", "sz000001", "sz300750", "sh601318"]
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # WAL 模式：读不阻塞写、写不阻塞读，显著提升并发；synchronous=NORMAL 在 WAL 下安全且更快
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -166,9 +170,14 @@ def create_strategy(name: str, kind: str, config: dict, user_id: int = 0) -> dic
     return _parse_strategy(row)
 
 
-def delete_strategy(strategy_id: int) -> bool:
+def delete_strategy(strategy_id: int, user_id: int | None = None) -> bool:
     conn = get_conn()
-    cur = conn.execute("DELETE FROM saved_strategies WHERE id = ?", (strategy_id,))
+    if user_id is None:
+        cur = conn.execute("DELETE FROM saved_strategies WHERE id = ?", (strategy_id,))
+    else:
+        cur = conn.execute(
+            "DELETE FROM saved_strategies WHERE id = ? AND user_id = ?",
+            (strategy_id, user_id))
     conn.commit()
     conn.close()
     return cur.rowcount > 0
@@ -203,9 +212,14 @@ def create_user_factor(name: str, kind: str, definition: dict, user_id: int = 0)
     return _parse_user_factor(row)
 
 
-def delete_user_factor(factor_id: int) -> bool:
+def delete_user_factor(factor_id: int, user_id: int | None = None) -> bool:
     conn = get_conn()
-    cur = conn.execute("DELETE FROM user_factors WHERE id = ?", (factor_id,))
+    if user_id is None:
+        cur = conn.execute("DELETE FROM user_factors WHERE id = ?", (factor_id,))
+    else:
+        cur = conn.execute(
+            "DELETE FROM user_factors WHERE id = ? AND user_id = ?",
+            (factor_id, user_id))
     conn.commit()
     conn.close()
     return cur.rowcount > 0
@@ -242,9 +256,14 @@ def create_backtest_run(strategy_id, config: dict, metrics: dict, report_path=No
     return _parse_backtest_run(row)
 
 
-def delete_backtest_run(run_id: int) -> bool:
+def delete_backtest_run(run_id: int, user_id: int | None = None) -> bool:
     conn = get_conn()
-    cur = conn.execute("DELETE FROM backtest_runs WHERE id = ?", (run_id,))
+    if user_id is None:
+        cur = conn.execute("DELETE FROM backtest_runs WHERE id = ?", (run_id,))
+    else:
+        cur = conn.execute(
+            "DELETE FROM backtest_runs WHERE id = ? AND user_id = ?",
+            (run_id, user_id))
     conn.commit()
     conn.close()
     return cur.rowcount > 0

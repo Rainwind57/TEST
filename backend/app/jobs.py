@@ -10,6 +10,21 @@ import uuid
 _jobs: dict[str, dict] = {}
 _tasks: dict[str, asyncio.Task] = {}
 
+MAX_JOBS = 200  # 内存 job 表上限，防无限增长
+
+
+def _prune_jobs() -> None:
+    """超过上限时按创建时间删除最旧的已终结 job（done/error/cancelled）。"""
+    if len(_jobs) <= MAX_JOBS:
+        return
+    finished = sorted(
+        (j for j in _jobs.values() if j["status"] in ("done", "error", "cancelled")),
+        key=lambda j: j["created_at"],
+    )
+    for j in finished[:len(_jobs) - MAX_JOBS]:
+        _jobs.pop(j["id"], None)
+        _tasks.pop(j["id"], None)
+
 
 def create_job(kind: str, config: dict) -> str:
     jid = uuid.uuid4().hex[:12]
@@ -41,6 +56,8 @@ def update_job(jid: str, **fields):
     j = _jobs.get(jid)
     if j:
         j.update(fields)
+        if j.get("status") in ("done", "error", "cancelled"):
+            _prune_jobs()
 
 
 def _runner(jid: str, coro):
@@ -57,6 +74,7 @@ def _runner(jid: str, coro):
 
 
 def submit(jid: str, coro):
+    _prune_jobs()
     _tasks[jid] = asyncio.create_task(_runner(jid, coro)())
 
 

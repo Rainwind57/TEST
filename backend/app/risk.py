@@ -13,55 +13,89 @@ from .numpy_factors import kline_to_arrays, compute_factor_series, series_at
 STYLE_FACTORS = ["momentum", "volatility", "turnover", "ep", "bp"]
 
 
-def build_style_matrix(stock_data: list[dict]) -> tuple[np.ndarray, list[str], list[str]]:
-    """构建风格因子暴露矩阵。
+def build_style_panel(stock_data: list[dict], n: int = 1) -> tuple[np.ndarray, list[str], np.ndarray, list[str]]:
+    """Fama-MacBeth 时序面板：对每个历史截面回归得因子收益 beta_t。
 
-    stock_data: [{code, kline, quote}] 每只股票的 K 线 + 快照行情。
-    返回 (X, codes, factor_names)，X 为 z-score 后的暴露矩阵。
+    返回 (betas, factor_names, last_X, last_codes)：
+    - betas: (n_periods, n_factors) 因子收益时序，用于估计因子收益协方差
+    - last_X / last_codes: 最新截面暴露矩阵，用于组合归因
+    turnover/ep/bp 无历史时序，用最新快照近似（已知简化）。
     """
-    rows = []
-    codes = []
+    series = []
     for s in stock_data:
         kline = s.get("kline", [])
         quote = s.get("quote", {})
-        if len(kline) < 25:
+        if len(kline) < 30:
             continue
         arr = kline_to_arrays(kline)
-        i = len(kline) - 1
-        mom = series_at(compute_factor_series("momentum", arr), i)
-        vol = series_at(compute_factor_series("volatility", arr), i)
+        mom = compute_factor_series("momentum", arr)
+        vol = compute_factor_series("volatility", arr)
         turnover = quote.get("turnover")
         pe = quote.get("pe")
         pb = quote.get("pb")
-        ep = (1.0 / pe) if pe else None
-        bp = (1.0 / pb) if pb else None
-        if any(v is None for v in [mom, vol, turnover, ep, bp]):
+        if any(v is None for v in [mom, vol, turnover, pe, pb]) or pe == 0 or pb == 0:
             continue
-        rows.append([mom, vol, turnover, ep, bp])
-        codes.append(s["code"])
+        series.append({"code": s["code"], "closes": arr["close"], "mom": mom, "vol": vol,
+                       "turnover": turnover, "ep": 1.0 / pe, "bp": 1.0 / pb})
+    if len(series) < 3:
+        return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
 
-    if len(rows) < 3:
-        return np.zeros((0, 0)), [], STYLE_FACTORS
+    ref = max(series, key=lambda s: len(s["closes"]))
+    ref_len = len(ref["closes"])
+    betas = []
+    last_X = np.zeros((0, len(STYLE_FACTORS)))
+    last_codes: list[str] = []
+    X_t = last_X
+    codes_t: list[str] = []
+    for t in range(25, ref_len - n):
+        rows, rets, codes_t = [], [], []
+        for s in series:
+            if t >= len(s["closes"]) or t + n >= len(s["closes"]):
+                continue
+            m = series_at(s["mom"], t)
+            v = series_at(s["vol"], t)
+            if m is None or v is None or s["closes"][t] == 0:
+                continue
+            rows.append([m, v, s["turnover"], s["ep"], s["bp"]])
+            rets.append(s["closes"][t + n] / s["closes"][t] - 1.0)
+            codes_t.append(s["code"])
+        if len(rows) < 10:
+            continue
+        X_t = _zscore_cols(np.array(rows, dtype=np.float64))
+        betas.append(cross_section_regression(X_t, np.array(rets, dtype=np.float64)))
+        last_X, last_codes = X_t, codes_t
 
-    X = np.array(rows, dtype=np.float64)
-    Xz = np.zeros_like(X)
+    if not betas or last_X.size == 0:
+        return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
+    return np.array(betas, dtype=np.float64), STYLE_FACTORS, last_X, last_codes
+
+
+def _zscore_cols(X: np.ndarray) -> np.ndarray:
+    """按列 z-score（截面标准化），常量列保留 0。"""
+    out = np.zeros_like(X)
     for c in range(X.shape[1]):
         col = X[:, c]
         valid = col[~np.isnan(col)]
         if len(valid) < 2:
             continue
         m, s = valid.mean(), valid.std()
-        if s == 0:
-            continue
-        Xz[:, c] = (col - m) / s
-    return Xz, codes, STYLE_FACTORS
+        if s != 0:
+            out[:, c] = (col - m) / s
+    return out
 
 
-def factor_covariance(X: np.ndarray) -> np.ndarray:
-    """风格因子协方差矩阵。"""
-    if X.size == 0:
+def factor_covariance(factor_returns_panel: np.ndarray) -> np.ndarray:
+    """因子收益时序协方差矩阵（Fama-MacBeth beta 时序估计）。
+
+    输入应为 (n_periods, n_factors) 的因子收益时序。旧版误用截面暴露矩阵 np.cov(X)
+    冒充因子收益协方差——对象完全错误（截面暴露共变 ≠ 因子收益时序共变）。
+    """
+    if factor_returns_panel.size == 0:
         return np.zeros((0, 0))
-    return np.cov(X, rowvar=False)
+    if factor_returns_panel.ndim < 2 or factor_returns_panel.shape[0] < 2:
+        k = factor_returns_panel.shape[-1] if factor_returns_panel.ndim >= 1 else 0
+        return np.zeros((k, k))
+    return np.cov(factor_returns_panel, rowvar=False)
 
 
 def attribute_returns(weights: np.ndarray, X: np.ndarray, factor_returns: np.ndarray,

@@ -58,6 +58,7 @@ onMounted(async () => {
   await portfolio.fetch()
   if (watchlist.codes.length) orderCode.value = watchlist.codes[0]
   timer = setInterval(async () => {
+    if (document.hidden) return
     await watchlist.refreshQuotes()
     await portfolio.fetch()
   }, 6000)

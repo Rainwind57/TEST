@@ -31,6 +31,17 @@ BENCHMARKS = {
 }
 
 
+def _price_limit_ratio(code: str, is_st: bool) -> float:
+    """A 股涨跌停幅度：创业板(sz30)/科创板(sh68)±20%、北交所(bj)±30%、ST±5%、主板±10%。"""
+    if is_st:
+        return 0.05
+    if code.startswith("sz30") or code.startswith("sh68"):
+        return 0.20
+    if code.startswith("bj"):
+        return 0.30
+    return 0.10
+
+
 @router.get("/boards")
 def list_boards():
     return [{"value": k, "label": v} for k, v in BOARD_LABELS.items()]
@@ -153,6 +164,35 @@ async def run_select(body: SelectBody):
     if tech_keys:
         tech_values = await _fetch_technical_values([c["code"] for c in candidates], tech_keys)
 
+    # 资金流/财务快照因子：行情快照不含，勾选时逐股批量拉取（并发 10）
+    EXTRA_FINANCE = {"roe", "net_margin", "revenue_yoy", "profit_yoy"}
+    EXTRA_MONEYFLOW = {"main_net_pct"}
+    need_finance = bool(set(snap_keys) & EXTRA_FINANCE)
+    need_mf = bool(set(snap_keys) & EXTRA_MONEYFLOW)
+    if need_finance or need_mf:
+        sem2 = asyncio.Semaphore(10)
+
+        async def fetch_extra(row):
+            code = row["code"]
+            async with sem2:
+                if need_finance:
+                    try:
+                        fin = await adapters.fetch_finance_summary(code)
+                    except Exception:
+                        fin = {}
+                    row["roe"] = fin.get("roe")
+                    row["net_margin"] = fin.get("netMargin")
+                    row["revenue_yoy"] = fin.get("revenueYoY")
+                    row["profit_yoy"] = fin.get("profitYoY")
+                if need_mf:
+                    try:
+                        mf = await adapters.fetch_money_flow(code)
+                    except Exception:
+                        mf = {}
+                    row["main_net_pct"] = mf.get("mainNetPct")
+
+        await asyncio.gather(*(fetch_extra(c) for c in candidates))
+
     scored_rows = []
     for row in candidates:
         entry = dict(row)
@@ -191,6 +231,8 @@ class BacktestBody(BaseModel):
     slippage: float = 0.001           # 滑点/冲击成本（单边）
     benchmark: str = "none"           # none | hs300 | zz500 | sse
     applyCost: bool = True
+    startDate: str | None = None      # 调仓日下界（YYYY-MM-DD，含），用于 IS/OOS 不重叠切分
+    endDate: str | None = None        # 调仓日上界（YYYY-MM-DD，含）
 
 
 @router.post("/backtest")
@@ -211,6 +253,8 @@ async def run_backtest(body: BacktestBody):
         raise HTTPException(502, f"候选池获取失败: {e}")
 
     codes = [row["code"] for row in pool]
+    is_st = {r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
+             for r in pool}
     sem = asyncio.Semaphore(15)
 
     async def fetch_one(code):
@@ -251,7 +295,7 @@ async def run_backtest(body: BacktestBody):
     bucket_returns = [[] for _ in range(groups)]
     long_short_points = []
     top_group_returns = []
-    bench_returns = []
+    bench_by_date = {}
     cum = 1.0
     cum_top = 1.0
 
@@ -261,6 +305,10 @@ async def run_backtest(body: BacktestBody):
 
     for t in range(25, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
+        if body.startDate and date_t < body.startDate:
+            continue
+        if body.endDate and date_t > body.endDate:
+            continue
         cross = []
         for code in series:
             i = date_maps[code].get(date_t)
@@ -271,6 +319,12 @@ async def run_backtest(body: BacktestBody):
             fv = series_at(fseries, i) if fseries is not None else calc(cc["kline"], i)
             closes = cc["closes"]
             if fv is None or closes[i] == 0:
+                continue
+            # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（A 股不可强制成交）
+            limit = _price_limit_ratio(code, is_st.get(code, False))
+            if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
+                continue
+            if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
                 continue
             fret = closes[i + n] / closes[i] - 1
             cross.append((code, fv, fret))
@@ -294,7 +348,8 @@ async def run_backtest(body: BacktestBody):
             top_ret = mean(day_buckets[-1])
             bottom_ret = mean(day_buckets[0])
             ls_ret = top_ret - bottom_ret
-            net_ls = ls_ret - cost_rate
+            # 多空组合 = 做多 top + 做空 bottom，双腿各一份往返成本（旧版仅扣一份）
+            net_ls = ls_ret - 2.0 * cost_rate
             net_top = top_ret - cost_rate
             cum *= (1.0 + net_ls)
             cum_top *= (1.0 + net_top)
@@ -307,7 +362,7 @@ async def run_backtest(body: BacktestBody):
                 bi = bench_date_idx.get(date_t)
                 if bi is not None and bi + n < len(bench_series):
                     bc = [row["close"] for row in bench_series]
-                    bench_returns.append(bc[bi + n] / bc[bi] - 1)
+                    bench_by_date[date_t] = bc[bi + n] / bc[bi] - 1
 
     if not ic_series:
         raise HTTPException(422, "有效截面样本不足，无法完成分层回测")
@@ -322,42 +377,48 @@ async def run_backtest(body: BacktestBody):
     for r in ls_returns:
         ls_equity.append(ls_equity[-1] * (1.0 + r))
 
+    # 调仓间隔 n 日 → 年化采样数 = 252/n（旧版误用 252，年化收益高估 n 倍、Sharpe 高估 √n 倍）
+    ppy = 252.0 / max(1, n)
+
     metrics = {
         "cumulativeReturn": cum - 1.0,
-        "annualizedReturn": annualized_return(ls_returns),
-        "annualizedVolatility": annualized_volatility(ls_returns),
-        "sharpe": sharpe_ratio(ls_returns),
-        "sortino": sortino_ratio(ls_returns),
+        "annualizedReturn": annualized_return(ls_returns, ppy),
+        "annualizedVolatility": annualized_volatility(ls_returns, ppy),
+        "sharpe": sharpe_ratio(ls_returns, periods_per_year=ppy),
+        "sortino": sortino_ratio(ls_returns, periods_per_year=ppy),
         "maxDrawdown": max_drawdown(ls_equity),
-        "calmar": calmar_ratio(ls_returns),
+        "calmar": calmar_ratio(ls_returns, ppy),
         "winRate": win_rate(ls_returns),
         "topGroupCumReturn": cum_top - 1.0,
-        "topGroupAnnualized": annualized_return(top_group_returns),
+        "topGroupAnnualized": annualized_return(top_group_returns, ppy),
         "rebalanceCount": len(ic_series),
         "costRate": cost_rate,
         "applyCost": body.applyCost,
     }
 
     bench_metrics = None
-    if bench_returns:
+    if bench_by_date:
+        # 按日期交集对齐策略与基准收益（旧版长度不等即置 alpha/beta=0，掩盖真实 beta）
+        aligned = [(p["longShort"], bench_by_date[p["date"]])
+                   for p in long_short_points if p["date"] in bench_by_date]
+        aligned_ls = [a for a, _ in aligned]
+        aligned_bench = [b for _, b in aligned]
         bench_cum = 1.0
-        for r in bench_returns:
+        for r in aligned_bench:
             bench_cum *= (1.0 + r)
-        if len(bench_returns) == len(ls_returns):
-            bench_alpha_beta = _alpha_beta(bench_returns, ls_returns)
-        else:
-            bench_alpha_beta = {"alpha": 0.0, "beta": 0.0}
+        bench_alpha_beta = (_alpha_beta(aligned_bench, aligned_ls)
+                            if len(aligned_bench) > 1 else {"alpha": 0.0, "beta": 0.0})
         bench_metrics = {
             "code": bench_code,
             "cumulativeReturn": bench_cum - 1.0,
-            "annualizedReturn": annualized_return(bench_returns),
-            "annualizedVolatility": annualized_volatility(bench_returns),
-            "sharpe": sharpe_ratio(bench_returns),
-            "maxDrawdown": max_drawdown(_equity_curve(bench_returns)),
+            "annualizedReturn": annualized_return(aligned_bench, ppy),
+            "annualizedVolatility": annualized_volatility(aligned_bench, ppy),
+            "sharpe": sharpe_ratio(aligned_bench, periods_per_year=ppy),
+            "maxDrawdown": max_drawdown(_equity_curve(aligned_bench)),
             **bench_alpha_beta,
         }
 
-    ic_stats = information_coefficient_stats([p["ic"] for p in ic_series])
+    ic_stats = information_coefficient_stats([p["ic"] for p in ic_series], ppy)
     mean_rank_ic = mean([p["rankIc"] for p in ic_series])
 
     return {
@@ -368,6 +429,7 @@ async def run_backtest(body: BacktestBody):
         "metrics": metrics, "benchmark": bench_metrics,
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
         "config": body.model_dump(),
+        "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
     }
 
 

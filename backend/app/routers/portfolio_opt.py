@@ -1,17 +1,26 @@
-"""组合优化路由：均值-方差/最大 Sharpe/风险平价，带个股权重上限约束。"""
+"""组合优化路由：均值-方差/最大 Sharpe/风险平价，带个股权重上限约束。
+
+修复：
+- OptBody 加 codes 字段（旧版只有 mu/cov 向量，权重无法对应股票、无法落地模拟盘）
+- mu/cov NaN/Inf 校验（旧版无校验，NaN 导致 cvxpy 抛 500）
+- 新增 /apply：按优化权重一键建仓模拟盘（旧版权重结果只能画饼图，被丢弃）
+"""
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+import asyncio
 import numpy as np
 
-from .. import portfolio_opt as po
+from .. import portfolio_opt as po, db, adapters
+from .portfolio import OrderBody, place_order
 
 router = APIRouter(prefix="/api/portfolio-opt", tags=["portfolio-opt"])
 
 
 class OptBody(BaseModel):
-    mu: list[float]               # 预期收益向量
-    cov: list[list[float]]        # 协方差矩阵
-    method: str = "mean_variance" # mean_variance | max_sharpe | risk_parity | equal
+    codes: list[str] = []         # 对应股票代码（与 mu 同长，用于落地模拟盘）
+    mu: list[float]
+    cov: list[list[float]]
+    method: str = "mean_variance"  # mean_variance | max_sharpe | risk_parity | equal
     maxWeight: float = 0.1
     longOnly: bool = True
     rf: float = 0.0
@@ -24,6 +33,10 @@ def optimize(body: OptBody):
     cov = np.array(body.cov, dtype=np.float64)
     if mu.ndim != 1 or cov.ndim != 2 or mu.shape[0] != cov.shape[0] != cov.shape[1]:
         raise HTTPException(400, "mu 与 cov 维度不匹配")
+    if np.isnan(mu).any() or np.isnan(cov).any() or np.isinf(mu).any() or np.isinf(cov).any():
+        raise HTTPException(400, "mu/cov 含 NaN 或 Inf，请检查输入")
+    if body.codes and len(body.codes) != len(mu):
+        raise HTTPException(400, "codes 长度需与 mu 一致")
 
     method = body.method
     if method == "mean_variance":
@@ -38,4 +51,93 @@ def optimize(body: OptBody):
         raise HTTPException(400, f"未知方法: {method}")
 
     stats = po.portfolio_stats(w, mu, cov, body.rf)
-    return {"weights": w.tolist(), "stats": stats, "method": method}
+    return {"codes": body.codes, "weights": w.tolist(), "stats": stats, "method": method}
+
+
+class ApplyBody(BaseModel):
+    codes: list[str]
+    weights: list[float]
+    totalAssets: float | None = None  # 可选；默认用模拟盘总资产
+
+
+@router.post("/apply")
+async def apply_to_portfolio(body: ApplyBody):
+    """按优化建仓模拟盘（按总资产×权重整手买入）。"""
+    if len(body.codes) != len(body.weights):
+        raise HTTPException(400, "codes 与 weights 长度不一致")
+    w = np.array(body.weights, dtype=np.float64)
+    if len(w) == 0 or w.sum() <= 0:
+        raise HTTPException(400, "权重和需为正")
+    w = w / w.sum()
+
+    conn = db.get_conn()
+    cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+    positions = conn.execute("SELECT code, qty FROM positions").fetchall()
+    conn.close()
+
+    quotes = await adapters.fetch_tencent_quotes(body.codes)
+    market_value = sum(
+        quotes.get(p["code"], {}).get("price", 0) * p["qty"] for p in positions
+    )
+    total = body.totalAssets if body.totalAssets else (cash + market_value)
+
+    applied = []
+    for code, wi in zip(body.codes, w):
+        price = quotes.get(code, {}).get("price", 0)
+        if price <= 0:
+            applied.append({"code": code, "weight": float(wi), "error": "无行情"})
+            continue
+        qty = int(total * float(wi) / price / 100) * 100  # 整手
+        if qty <= 0:
+            applied.append({"code": code, "weight": float(wi), "error": "金额不足 1 手"})
+            continue
+        try:
+            await place_order(OrderBody(code=code, side="buy", qty=qty))
+            applied.append({"code": code, "qty": qty, "weight": float(wi)})
+        except Exception as e:
+            applied.append({"code": code, "weight": float(wi), "error": str(e)})
+    return {"applied": applied, "totalAssets": total}
+
+
+class EstimateBody(BaseModel):
+    codes: list[str]
+    hist: int = 120          # 历史长度（交易日）
+
+
+@router.post("/estimate")
+async def estimate_mu_cov(body: EstimateBody):
+    """从历史 K 线自动估计 mu（年化预期收益）+ cov（年化协方差），
+    取消用户手工粘贴矩阵。mu=日收益均值×252，cov=日收益协方差×252。"""
+    if len(body.codes) < 2:
+        raise HTTPException(400, "至少需要 2 只股票")
+    sem = asyncio.Semaphore(15)
+
+    async def fetch_one(code):
+        async with sem:
+            try:
+                kline = await adapters.fetch_kline(code, body.hist + 5)
+            except Exception:
+                return code, []
+            return code, kline
+
+    fetched = await asyncio.gather(*(fetch_one(c) for c in body.codes))
+    series = {c: kl for c, kl in fetched if len(kl) >= 30}
+    if len(series) < 2:
+        raise HTTPException(422, "有效股票历史不足，请增大 hist 或更换代码")
+
+    codes_valid = [c for c in body.codes if c in series]
+    min_len = min(len(series[c]) for c in codes_valid)
+    closes = {c: [k["close"] for k in series[c][:min_len]] for c in codes_valid}
+
+    ret_matrix = []
+    for i in range(1, min_len):
+        if any(closes[c][i - 1] == 0 for c in codes_valid):
+            continue
+        ret_matrix.append([closes[c][i] / closes[c][i - 1] - 1 for c in codes_valid])
+    if len(ret_matrix) < 20:
+        raise HTTPException(422, "有效收益样本不足")
+
+    R = np.array(ret_matrix, dtype=np.float64)
+    mu = R.mean(axis=0) * 252
+    cov = np.cov(R, rowvar=False) * 252
+    return {"codes": codes_valid, "mu": mu.tolist(), "cov": cov.tolist()}

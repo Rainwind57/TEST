@@ -34,7 +34,21 @@ const routes = [
   { path: '/risk', name: 'risk', component: RiskView, meta: { label: '风险归因' } }
 ]
 
-export default createRouter({
+const router = createRouter({
   history: createWebHistory(),
   routes
 })
+
+// 路由守卫：未登录访问受保护页 → 跳登录（带 redirect 回跳）；登录页放行
+router.beforeEach((to, from, next) => {
+  const token = localStorage.getItem('quant_token')
+  if (to.name === 'login') {
+    return next()
+  }
+  if (!token) {
+    return next({ name: 'login', query: { redirect: to.fullPath } })
+  }
+  next()
+})
+
+export default router

@@ -2,9 +2,11 @@
 import { ref, computed, onMounted } from 'vue'
 import api, { downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
+import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
 
 const { toast } = useToast()
+const research = useResearchStore()
 
 const BOARD_OPTIONS = [
   { value: 'all', label: '全部A股' },
@@ -141,7 +143,21 @@ const longShortOption = computed(() => {
 const pct = v => v == null ? '-' : (v * 100).toFixed(2) + '%'
 const num = (v, d = 4) => v == null ? '-' : Number(v).toFixed(d)
 
-onMounted(loadFactorOptions)
+onMounted(async () => {
+  await loadFactorOptions()
+  // 消费寻优页回填的最优参数（researchStore 跨页共享）
+  const p = research.consumeOptimalParams()
+  if (p) {
+    if (p.board) board.value = p.board
+    if (p.factor) factorKey.value = p.factor
+    if (p.poolSize) poolSize.value = p.poolSize
+    if (p.groups) groups.value = p.groups
+    if (p.n) days.value = p.n
+    if (p.hist) hist.value = p.hist
+    if (p.benchmark) benchmark.value = p.benchmark
+    toast('已预填寻优最优参数，可直接回测')
+  }
+})
 </script>
 
 <template>

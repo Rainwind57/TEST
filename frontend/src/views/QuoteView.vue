@@ -72,7 +72,7 @@ watch(() => store.source, () => store.refreshQuotes())
 onMounted(async () => {
   await store.fetchWatchlist()
   await refresh()
-  timer = setInterval(() => store.refreshQuotes(), 6000)
+  timer = setInterval(() => { if (!document.hidden) store.refreshQuotes() }, 6000)
 })
 onUnmounted(() => clearInterval(timer))
 </script>

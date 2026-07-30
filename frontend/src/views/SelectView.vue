@@ -16,7 +16,7 @@ const BOARD_OPTIONS = [
   { value: 'star', label: '科创板' },
   { value: 'bse', label: '北交所' }
 ]
-const GROUP_LABELS = { quant: '量价类因子', fundamental: '估值类因子', technical: '技术类因子（基于K线，计算较慢）' }
+const GROUP_LABELS = { quant: '量价类因子', fundamental: '估值/财务类因子', technical: '技术类因子（基于K线，计算较慢）', moneyflow: '资金流因子', custom: '自定义组合因子' }
 
 const board = ref('all')
 const poolSize = ref(200)
@@ -55,9 +55,16 @@ const factorColumns = computed(() =>
 
 async function loadCatalog() {
   const data = await api.get('/select/factors')
-  catalog.value = data
+  // 加载当前用户自定义组合因子（key=uf:{id}，后端 run_select 已支持）
+  let ufList = []
+  try { ufList = await api.get('/user-factors') } catch (e) { /* 未登录或无 uf */ }
+  const ufItems = (ufList || []).map(u => ({
+    key: `uf:${u.id}`, label: u.name, group: 'custom',
+    direction: 1, format: 'number', kline: false,
+  }))
+  catalog.value = [...data, ...ufItems]
   const defaults = ['momentum60', 'pe', 'turnover', 'momentum']
-  for (const f of data) {
+  for (const f of catalog.value) {
     factorState[f.key] = { checked: defaults.includes(f.key), weight: 1, direction: f.direction }
   }
 }

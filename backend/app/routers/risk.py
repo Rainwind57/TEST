@@ -29,9 +29,9 @@ async def attribution():
             kline = []
         stock_data.append({"code": p["code"], "quote": q, "kline": kline})
 
-    X, codes_valid, factor_names = risk.build_style_matrix(stock_data)
-    if X.size == 0:
-        raise HTTPException(422, "有效持仓样本不足，无法构建风格矩阵")
+    betas, factor_names, X, codes_valid = risk.build_style_panel(stock_data)
+    if X.size == 0 or betas.size == 0:
+        raise HTTPException(422, "有效持仓样本不足，无法构建风格面板（需≥3只且历史≥30日）")
 
     prices = np.array([quotes.get(c, {}).get("price", 0) for c in codes_valid])
     qty = np.array([next(p["qty"] for p in positions if p["code"] == c) for c in codes_valid])
@@ -45,13 +45,17 @@ async def attribution():
         for c in codes_valid
     ])
 
-    factor_returns = risk.cross_section_regression(X, stock_returns)
-    sigma_f = risk.factor_covariance(X)
+    # Fama-MacBeth：因子收益取各截面回归 beta 的时序均值，协方差用 beta 时序估计
+    # （旧版用截面暴露 np.cov(X) 冒充因子收益协方差，对象错误）
+    factor_returns = betas.mean(axis=0)
+    sigma_f = risk.factor_covariance(betas)
     residuals = stock_returns - X @ factor_returns
     sigma_e = np.var(residuals, ddof=max(1, len(residuals) - X.shape[1] - 1)) * np.ones(len(codes_valid))
 
     attr = risk.attribute_returns(weights, X, factor_returns, stock_returns)
     rdecomp = risk.risk_decomposition(weights, X, sigma_f, sigma_e)
+    sample_warning = (None if len(codes_valid) >= 30
+                      else f"持仓仅 {len(codes_valid)} 只（<30），风格回归自由度不足，结果仅供参考")
 
     return {
         "holdings": [{"code": c, "weight": float(w)} for c, w in zip(codes_valid, weights)],
@@ -62,4 +66,5 @@ async def attribution():
         "factorReturn": attr["totalFactor"],
         "residual": attr["residual"],
         "risk": rdecomp,
+        "sampleWarning": sample_warning,
     }

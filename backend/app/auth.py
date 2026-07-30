@@ -10,10 +10,22 @@ import hashlib
 import secrets
 import datetime
 import time
+import warnings
 
 from . import db
 
-JWT_SECRET = os.environ.get("QUANT_JWT_SECRET") or secrets.token_hex(16)
+# JWT 密钥：优先环境变量 QUANT_JWT_SECRET；未设时用固定默认值（保证重启后 token 仍有效，
+# 旧版每次启动随机生成会导致所有已签发 token 失效）。生产部署必须设置环境变量。
+_JWT_ENV = os.environ.get("QUANT_JWT_SECRET")
+if _JWT_ENV:
+    JWT_SECRET = _JWT_ENV
+else:
+    JWT_SECRET = "dev-only-insecure-secret-please-set-QUANT_JWT_SECRET"
+    warnings.warn(
+        "QUANT_JWT_SECRET 未设置，使用不安全的开发默认值；生产环境请设置该环境变量",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 JWT_TTL = 7 * 24 * 3600  # 7 天
 
 

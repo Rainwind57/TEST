@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import api from '../api/client'
+import api, { longTask } from '../api/client'
 import { useToast } from '../stores/toast'
 import EChart from '../components/EChart.vue'
 
@@ -13,20 +13,48 @@ const hist = ref(240)
 const modelType = ref('gbdt')
 const nSplits = ref(5)
 const gap = ref(5)
+const useSnapshot = ref(false)
 
 const loading = ref(false)
 const training = ref(false)
+const trainMsg = ref('')
 const result = ref(null)
 const models = ref([])
+
+const scoring = ref('')
+const scoreResult = ref(null)
+const btLoading = ref('')
+const btResult = ref(null)
+
+function evalConfig() {
+  return {
+    board: board.value, poolSize: Number(poolSize.value), n: Number(n.value),
+    hist: Number(hist.value), modelType: modelType.value,
+    nSplits: Number(nSplits.value), gap: Number(gap.value),
+    useSnapshot: useSnapshot.value,
+  }
+}
+
+// jobs 轮询：页面隐藏暂停 + 间隔退避（1.5s→4s 上限）
+async function pollJob(jobId, onProgress) {
+  let delay = 1500
+  while (true) {
+    if (document.hidden) { await new Promise(r => setTimeout(r, 1000)); continue }
+    const j = await api.get(`/jobs/${jobId}`)
+    onProgress && onProgress(j.progress, j.message)
+    if (j.status === 'done') return j.result
+    if (j.status === 'error') throw new Error(j.error || '任务失败')
+    if (j.status === 'cancelled') throw new Error('任务已取消')
+    await new Promise(r => setTimeout(r, delay))
+    delay = Math.min(delay * 1.3, 4000)
+  }
+}
 
 async function runEvaluate() {
   loading.value = true
   try {
-    result.value = await api.post('/ml/evaluate', {
-      board: board.value, poolSize: Number(poolSize.value), n: Number(n.value),
-      hist: Number(hist.value), modelType: modelType.value,
-      nSplits: Number(nSplits.value), gap: Number(gap.value),
-    })
+    const { jobId } = await api.post('/jobs', { kind: 'ml-evaluate', config: evalConfig() })
+    result.value = await pollJob(jobId)
     toast(`评估完成，OOS IC=${(result.value.oosIc || 0).toFixed(3)}`)
   } catch (e) { toast(e.message) }
   finally { loading.value = false }
@@ -34,17 +62,15 @@ async function runEvaluate() {
 
 async function runTrain() {
   training.value = true
+  trainMsg.value = '提交训练任务…'
   try {
-    const res = await api.post('/ml/train', {
-      board: board.value, poolSize: Number(poolSize.value), n: Number(n.value),
-      hist: Number(hist.value), modelType: modelType.value,
-      nSplits: Number(nSplits.value), gap: Number(gap.value),
-    })
+    const { jobId } = await api.post('/jobs', { kind: 'ml-train', config: evalConfig() })
+    const res = await pollJob(jobId, (p, m) => trainMsg.value = m || `进度 ${p || 0}%`)
     result.value = res.evaluation
-    models.value = await api.get('/ml/models')
+    await loadModels()
     toast(`训练完成，模型 ${res.model.id} 已落盘`)
   } catch (e) { toast(e.message) }
-  finally { training.value = false }
+  finally { training.value = false; trainMsg.value = '' }
 }
 
 async function loadModels() {
@@ -56,6 +82,34 @@ async function deleteModel(id) {
   if (!confirm('删除该模型文件？')) return
   try { await api.delete(`/ml/models/${id}`); models.value = models.value.filter(m => m.id !== id) }
   catch (e) { toast(e.message) }
+}
+
+// 用模型对候选池最新截面打分（ML→选股闭环）
+async function runScore(m) {
+  scoring.value = m.id
+  scoreResult.value = null
+  try {
+    scoreResult.value = await longTask('/ml/score', {
+      modelId: m.id, board: board.value, poolSize: Number(poolSize.value),
+    })
+    toast(`打分完成，共 ${scoreResult.value.length} 只`)
+  } catch (e) { toast(e.message) }
+  finally { scoring.value = '' }
+}
+
+// 用模型预测分做分层回测（ML→回测闭环，走 jobs 异步）
+async function runMLBacktest(m) {
+  btLoading.value = m.id
+  btResult.value = null
+  try {
+    const { jobId } = await api.post('/jobs', { kind: 'ml-backtest', config: {
+      modelId: m.id, board: board.value, poolSize: Number(poolSize.value),
+      n: Number(n.value), hist: Number(hist.value),
+    }})
+    btResult.value = await pollJob(jobId)
+    toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
+  } catch (e) { toast(e.message) }
+  finally { btLoading.value = '' }
 }
 
 const fmt = v => v == null ? '-' : Number(v).toFixed(3)
@@ -70,6 +124,22 @@ const impOption = computed(() => {
     xAxis: { type: 'value' },
     yAxis: { type: 'category', data: data.map(d => d.name) },
     series: [{ type: 'bar', data: data.map(d => d.value), itemStyle: { color: '#4f8cff' } }]
+  }
+})
+
+const lsOption = computed(() => {
+  if (!btResult.value?.longShort?.length) return {}
+  const pts = btResult.value.longShort
+  return {
+    grid: { left: 50, right: 20, top: 20, bottom: 30 },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: pts.map(p => p.date) },
+    yAxis: { type: 'value', axisLabel: { formatter: v => (v * 100).toFixed(1) + '%' } },
+    series: [{
+      name: '多空累计', type: 'line', smooth: true,
+      data: pts.map(p => Number((p.cum * 100).toFixed(3))),
+      itemStyle: { color: '#4f8cff' }, areaStyle: { color: 'rgba(79,140,255,.12)' },
+    }],
   }
 })
 
@@ -99,6 +169,8 @@ onMounted(loadModels)
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-ghost" :disabled="loading" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
         <button class="btn-primary" :disabled="training" @click="runTrain">{{ training ? '训练中…' : '训练并落盘' }}</button>
+        <label style="margin-left:12px;font-size:13px;color:var(--text-mute)"><input type="checkbox" v-model="useSnapshot" /> 含 PE/PB/换手快照特征（前视，探索用）</label>
+        <span v-if="trainMsg" class="hint" style="margin-left:8px">{{ trainMsg }}</span>
       </div>
     </div>
 
@@ -135,10 +207,39 @@ onMounted(loadModels)
         <tbody>
           <tr v-for="m in models" :key="m.id">
             <td>{{ m.id }}</td><td class="muted">{{ m.file }}</td>
-            <td><button class="btn-ghost sm danger" @click="deleteModel(m.id)">删除</button></td>
+            <td>
+              <button class="btn-ghost sm" :disabled="scoring===m.id" @click="runScore(m)">{{ scoring===m.id ? '打分中…' : '打分选股' }}</button>
+              <button class="btn-ghost sm" :disabled="btLoading===m.id" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
+              <button class="btn-ghost sm danger" @click="deleteModel(m.id)">删除</button>
+            </td>
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div v-if="scoreResult" class="card">
+      <div class="card-head"><h3>模型截面打分</h3><span class="hint">最新截面预测分排序（Top 30）</span></div>
+      <table class="data-table">
+        <thead><tr><th>排名</th><th>代码</th><th>名称</th><th>预测分</th></tr></thead>
+        <tbody>
+          <tr v-for="(r,i) in scoreResult.slice(0,30)" :key="r.code">
+            <td>{{ i + 1 }}</td><td>{{ r.code }}</td><td>{{ r.name }}</td>
+            <td class="up">{{ fmt(r.score) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div v-if="btResult" class="card">
+      <div class="card-head"><h3>ML 信号分层回测</h3><span class="hint">调仓 {{ btResult.rebalanceCount }} 次 · 有效股票 {{ btResult.effectiveStocks }}</span></div>
+      <div class="kpi-row">
+        <div class="kpi"><div class="n">{{ fmtPct(btResult.metrics.cumulativeReturn) }}</div><div class="l">累计收益</div></div>
+        <div class="kpi"><div class="n">{{ fmtPct(btResult.metrics.annualizedReturn) }}</div><div class="l">年化</div></div>
+        <div class="kpi"><div class="n">{{ fmt(btResult.metrics.sharpe) }}</div><div class="l">Sharpe</div></div>
+        <div class="kpi"><div class="n">{{ fmtPct(btResult.metrics.maxDrawdown) }}</div><div class="l">最大回撤</div></div>
+        <div class="kpi"><div class="n">{{ fmt(btResult.meanIc) }}</div><div class="l">IC</div></div>
+      </div>
+      <EChart :option="lsOption" style="height:340px" />
     </div>
   </div>
 </template>

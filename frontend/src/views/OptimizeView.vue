@@ -1,10 +1,14 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '../api/client'
 import { useToast } from '../stores/toast'
+import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
 
 const { toast } = useToast()
+const router = useRouter()
+const research = useResearchStore()
 
 const board = ref('all')
 const poolSize = ref(60)
@@ -52,6 +56,18 @@ async function saveStrategy() {
     })
     toast('已回写为策略')
   } catch (e) { toast(e.message) }
+}
+
+function applyToBacktest() {
+  if (!result.value) return
+  research.setOptimalParams({
+    board: board.value, factor: factor.value,
+    poolSize: result.value.bestParams.poolSize,
+    groups: result.value.bestParams.groups,
+    n: result.value.bestParams.n,
+    hist: Number(hist.value), benchmark: benchmark.value,
+  })
+  router.push('/backtest')
 }
 
 const trialOption = computed(() => {
@@ -105,6 +121,7 @@ onMounted(loadFactors)
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-primary" :disabled="loading" @click="run">{{ loading ? '寻优中…' : '开始寻优' }}</button>
         <button class="btn-ghost" v-if="result" @click="saveStrategy">回写为策略</button>
+        <button class="btn-ghost" v-if="result" @click="applyToBacktest">应用到回测</button>
       </div>
     </div>
 

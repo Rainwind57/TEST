@@ -1,9 +1,10 @@
 """模拟盘路由：下单、持仓查询、净值曲线、重置。"""
 import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import adapters, db
+from ..auth import get_user_id_from_auth
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
@@ -90,6 +91,7 @@ async def place_order(body: OrderBody):
     amount = price * body.qty
     conn = db.get_conn()
     cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")  # 获取写锁，防并发下单双花（旧版读改写非原子）
     cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
     pos = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
 
@@ -139,6 +141,8 @@ def _record_equity(value: float):
 
 
 @router.post("/reset")
-async def reset_portfolio():
+async def reset_portfolio(request: Request):
+    if not get_user_id_from_auth(request.headers.get("Authorization")):
+        raise HTTPException(401, "请先登录后再重置模拟盘")
     db.reset_portfolio()
     return await _build_portfolio_view()
