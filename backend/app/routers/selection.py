@@ -1,11 +1,15 @@
 """全市场选股：多因子加权打分选股 + 因子分层回测 + 一键落地到自选/模拟盘。"""
 import asyncio
 import datetime
+import logging
 import math
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
-from .. import adapters, db
+logger = logging.getLogger(__name__)
+
+from .. import adapters, db, ml
+from .auth import require_user_id
 from ..factors import (
     FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, composite_score,
     bucket_index, pearson, spearman, mean, std, zscore, multi_ols,
@@ -97,7 +101,8 @@ async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int =
         async with sem:
             try:
                 kline = await adapters.fetch_kline(code, hist)
-            except Exception:
+            except Exception as e:
+                logger.warning("选股因子计算拉取K线失败 code=%s: %s", code, e)
                 return code, {}
             if len(kline) < 25:
                 return code, {}
@@ -165,8 +170,9 @@ async def run_select(body: SelectBody):
         tech_values = await _fetch_technical_values([c["code"] for c in candidates], tech_keys)
 
     # 资金流/财务快照因子：行情快照不含，勾选时逐股批量拉取（并发 10）
-    EXTRA_FINANCE = {"roe", "net_margin", "revenue_yoy", "profit_yoy"}
-    EXTRA_MONEYFLOW = {"main_net_pct"}
+    EXTRA_FINANCE = {"roe", "net_margin", "revenue_yoy", "profit_yoy",
+                     "gross_margin", "debt_ratio", "eps", "bps", "roa"}
+    EXTRA_MONEYFLOW = {"main_net_pct", "north_holding_pct"}
     need_finance = bool(set(snap_keys) & EXTRA_FINANCE)
     need_mf = bool(set(snap_keys) & EXTRA_MONEYFLOW)
     if need_finance or need_mf:
@@ -184,12 +190,24 @@ async def run_select(body: SelectBody):
                     row["net_margin"] = fin.get("netMargin")
                     row["revenue_yoy"] = fin.get("revenueYoY")
                     row["profit_yoy"] = fin.get("profitYoY")
+                    row["gross_margin"] = fin.get("grossMargin")
+                    row["debt_ratio"] = fin.get("debtRatio")
+                    row["eps"] = fin.get("eps")
+                    row["bps"] = fin.get("bps")
+                    row["roa"] = fin.get("roa")
                 if need_mf:
                     try:
                         mf = await adapters.fetch_money_flow(code)
                     except Exception:
                         mf = {}
                     row["main_net_pct"] = mf.get("mainNetPct")
+                    # 个股北向持股比例（新增数据源，旧版只有市场级趋势无个股因子）
+                    if "north_holding_pct" in snap_keys:
+                        try:
+                            nh = await adapters.fetch_north_holding(code)
+                        except Exception:
+                            nh = {}
+                        row["north_holding_pct"] = nh.get("holdRatio")
 
         await asyncio.gather(*(fetch_extra(c) for c in candidates))
 
@@ -223,6 +241,7 @@ class BacktestBody(BaseModel):
     board: str = "all"
     poolSize: int = 60
     factor: str = "momentum"
+    modelId: str | None = None      # ML 模型 ID：指定时走 ML 信号分层回测（与技术因子二选一）
     groups: int = 5
     n: int = 5
     hist: int = 180
@@ -237,6 +256,22 @@ class BacktestBody(BaseModel):
 
 @router.post("/backtest")
 async def run_backtest(body: BacktestBody):
+    # 模型策略：指定 modelId 时走 ML 信号分层回测，响应结构与技术因子回测一致，
+    # 前端图表零成本复用（打通“主回测页导入模型”，旧版 modelId 无门可入）。
+    if body.modelId:
+        try:
+            res = await ml.backtest_model(
+                body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
+                body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
+            )
+            res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
+            return res
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"ML 回测失败: {e}")
     if body.factor not in FACTORS:
         raise HTTPException(400, "分层回测目前仅支持技术类(量价)因子")
     groups = max(2, min(10, body.groups))
@@ -261,7 +296,8 @@ async def run_backtest(body: BacktestBody):
         async with sem:
             try:
                 kline = await adapters.fetch_kline(code, hist)
-            except Exception:
+            except Exception as e:
+                logger.warning("回测拉取K线失败 code=%s: %s", code, e)
                 return code, []
             return code, kline
 
@@ -287,7 +323,7 @@ async def run_backtest(body: BacktestBody):
     for code, kl in series.items():
         arr = kline_to_arrays(kl)
         fseries = compute_factor_series(body.factor, arr)
-        code_cache[code] = {"closes": arr["close"], "fseries": fseries, "kline": kl}
+        code_cache[code] = {"closes": arr["close"], "volumes": arr["volume"], "fseries": fseries, "kline": kl}
 
     cost_rate = round_trip_cost_rate(body.commissionRate, body.stampDuty, body.slippage) if body.applyCost else 0.0
 
@@ -303,7 +339,10 @@ async def run_backtest(body: BacktestBody):
     if bench_series:
         bench_date_idx = {row["date"]: idx for idx, row in enumerate(bench_series)}
 
-    for t in range(25, len(ref_dates) - n, max(1, n)):
+    # 回测起点 60：与 ML 训练截面 i=60 对齐（旧版 t=25 致 momentum60/dist_52w_high 等
+    # 长窗口因子在早期被整股丢弃，前后期有效特征集不一致）
+    _WARMUP = 60
+    for t in range(_WARMUP, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
         if body.startDate and date_t < body.startDate:
             continue
@@ -325,6 +364,11 @@ async def run_backtest(body: BacktestBody):
             if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
                 continue
             if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
+                continue
+            # 停牌处理：持仓期 [i, i+n] 内有停牌日（成交量=0）则跳过该股该期，
+            # 旧版跨停牌用缺口价算收益致收益失真（停牌期间价格冻结，收益恒 0 或跳空失真）
+            vols = cc["volumes"]
+            if any(vols[j] == 0 for j in range(i, i + n + 1)):
                 continue
             fret = closes[i + n] / closes[i] - 1
             cross.append((code, fv, fret))
@@ -488,7 +532,8 @@ async def run_factor_regression(body: FactorRegressionBody):
         async with sem:
             try:
                 kline = await adapters.fetch_kline(code, hist)
-            except Exception:
+            except Exception as e:
+                logger.warning("回测拉取K线失败 code=%s: %s", code, e)
                 return code, []
             return code, kline
 
@@ -509,12 +554,13 @@ async def run_factor_regression(body: FactorRegressionBody):
         arr = kline_to_arrays(kl)
         fr_cache[code] = {
             "closes": arr["close"],
+            "volumes": arr["volume"],
             "series": {k: compute_factor_series(k, arr) for k in keys},
             "kline": kl,
         }
 
     periods = []
-    for t in range(25, len(ref_dates) - n, max(1, n)):
+    for t in range(60, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
         xs_rows, ys = [], []
         for code in series:
@@ -535,6 +581,10 @@ async def run_factor_regression(body: FactorRegressionBody):
                 continue
             closes = cc["closes"]
             if closes[i] == 0:
+                continue
+            # 停牌处理：持仓期内有停牌日则跳过，避免缺口价算收益失真
+            vols = cc["volumes"]
+            if any(vols[j] == 0 for j in range(i, i + n + 1)):
                 continue
             fret = closes[i + n] / closes[i] - 1
             xs_rows.append(fvs)
@@ -580,7 +630,7 @@ class ApplyBody(BaseModel):
 
 
 @router.post("/apply")
-async def apply_selection(body: ApplyBody):
+async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
     if not body.codes:
         raise HTTPException(400, "codes 不能为空")
 
@@ -616,7 +666,7 @@ async def apply_selection(body: ApplyBody):
                 results.append({"code": code, "ok": False, "reason": "资金不足一手"})
                 continue
             try:
-                await place_order(OrderBody(code=code, side="buy", qty=qty))
+                await place_order(OrderBody(code=code, side="buy", qty=qty), uid)
                 results.append({"code": code, "ok": True, "qty": qty})
             except HTTPException as e:
                 results.append({"code": code, "ok": False, "reason": e.detail})

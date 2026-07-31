@@ -2,6 +2,8 @@
 import { RouterLink, useRoute } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 
+defineProps({ open: { type: Boolean, default: false } })
+const emit = defineEmits(['close'])
 const route = useRoute()
 const auth = useAuthStore()
 const items = [
@@ -23,7 +25,7 @@ const items = [
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ 'sidebar-open': open }">
     <div class="brand">
       <div class="logo">Q</div>
       <div>
@@ -38,6 +40,7 @@ const items = [
         :to="item.path"
         class="nav-item"
         :class="{ active: route.path === item.path }"
+        @click="emit('close')"
       >
         <span class="nav-icon">{{ item.icon }}</span>
         <span>{{ item.label }}</span>
@@ -49,7 +52,7 @@ const items = [
         <span class="user-name">{{ auth.user?.username }}</span>
         <button class="logout-btn" @click="auth.logout()">登出</button>
       </div>
-      <RouterLink v-else to="/login" class="login-link">登录 / 注册</RouterLink>
+      <RouterLink v-else to="/login" class="login-link" @click="emit('close')">登录 / 注册</RouterLink>
     </div>
   </aside>
 </template>
@@ -65,6 +68,7 @@ const items = [
   display: flex;
   flex-direction: column;
   padding: 22px 16px;
+  z-index: 60;
 }
 .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; padding: 0 6px; }
 .logo {
@@ -79,7 +83,7 @@ const items = [
 .title { font-size: 14px; font-weight: 700; }
 .sub { font-size: 11px; color: var(--text-mute); margin-top: 2px; }
 
-nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+nav { display: flex; flex-direction: column; gap: 4px; flex: 1; overflow-y: auto; }
 .nav-item {
   display: flex; align-items: center; gap: 12px;
   padding: 11px 14px;
@@ -110,4 +114,9 @@ nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
 .user-name { font-size: 12px; font-weight: 600; color: var(--text); }
 .logout-btn { background: transparent; border: none; color: #ff6b6b; cursor: pointer; font-size: 12px; }
 .login-link { display: block; margin-top: 10px; text-align: center; padding: 8px; background: var(--accent); color: white; border-radius: 8px; font-size: 13px; font-weight: 600; }
+
+@media (max-width: 900px) {
+  .sidebar { transform: translateX(-100%); transition: transform .25s ease; box-shadow: 4px 0 24px rgba(0,0,0,.3); }
+  .sidebar-open { transform: translateX(0); }
+}
 </style>

@@ -46,3 +46,12 @@ def me(request: Request):
 def current_user_id(request: Request) -> int:
     """依赖注入：从请求头提取 user_id，未登录返回 0（匿名，兼容单机模式）。"""
     return auth.get_user_id_from_auth(request.headers.get("Authorization")) or 0
+
+
+def require_user_id(request: Request) -> int:
+    """依赖注入：强制登录，未登录抛 401。用于敏感写操作（下单/删模型/策略保存等），
+    防止 API 层被直接 curl 调用（旧版除 reset/me 外全部开放）。"""
+    uid = auth.get_user_id_from_auth(request.headers.get("Authorization"))
+    if not uid:
+        raise HTTPException(401, "该操作需要登录")
+    return uid

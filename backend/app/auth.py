@@ -14,15 +14,17 @@ import warnings
 
 from . import db
 
-# JWT 密钥：优先环境变量 QUANT_JWT_SECRET；未设时用固定默认值（保证重启后 token 仍有效，
-# 旧版每次启动随机生成会导致所有已签发 token 失效）。生产部署必须设置环境变量。
+# JWT 密钥：必须设置环境变量 QUANT_JWT_SECRET。未设时每次启动随机生成，
+# 杜绝旧版“固定字符串可被读源码伪造 token”的隐患（代价是重启后已签发 token 失效，
+# 对安全可接受）。生产部署务必设置 QUANT_JWT_SECRET。
 _JWT_ENV = os.environ.get("QUANT_JWT_SECRET")
 if _JWT_ENV:
     JWT_SECRET = _JWT_ENV
 else:
-    JWT_SECRET = "dev-only-insecure-secret-please-set-QUANT_JWT_SECRET"
+    JWT_SECRET = secrets.token_hex(32)
     warnings.warn(
-        "QUANT_JWT_SECRET 未设置，使用不安全的开发默认值；生产环境请设置该环境变量",
+        "QUANT_JWT_SECRET 未设置，本次启动使用随机密钥（重启后所有 token 失效）；"
+        "生产环境必须设置该环境变量。",
         RuntimeWarning,
         stacklevel=2,
     )

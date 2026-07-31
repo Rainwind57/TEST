@@ -14,6 +14,7 @@ const orderCode = ref('')
 const orderSide = ref('buy')
 const orderQty = ref(100)
 let timer = null
+let polling = false   // 在途锁：弱网下上次轮询未完成则跳过，避免请求堆积
 
 const orderPrice = computed(() => watchlist.quotes[orderCode.value]?.price || 0)
 const orderEstimate = computed(() => orderPrice.value ? orderPrice.value * orderQty.value : null)
@@ -58,9 +59,12 @@ onMounted(async () => {
   await portfolio.fetch()
   if (watchlist.codes.length) orderCode.value = watchlist.codes[0]
   timer = setInterval(async () => {
-    if (document.hidden) return
-    await watchlist.refreshQuotes()
-    await portfolio.fetch()
+    if (document.hidden || polling) return   // 在途锁
+    polling = true
+    try {
+      await watchlist.refreshQuotes()
+      await portfolio.fetch()
+    } finally { polling = false }
   }, 6000)
 })
 onUnmounted(() => clearInterval(timer))

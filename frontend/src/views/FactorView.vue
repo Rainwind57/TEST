@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { useWatchlistStore } from '../stores/watchlist'
 import { useToast } from '../stores/toast'
 import api from '../api/client'
@@ -7,6 +8,7 @@ import { fmtPct, fmtNum, stripPrefix } from '../utils/format'
 
 const store = useWatchlistStore()
 const { toast } = useToast()
+const router = useRouter()
 const rows = ref([])
 const loading = ref(false)
 const catalog = ref([])
@@ -66,6 +68,7 @@ onMounted(async () => {
   <div>
     <div class="panel-toolbar">
       <button class="btn-primary" :disabled="loading" @click="runFactorTable">{{ loading ? '计算中…' : '计算自选股因子' }}</button>
+      <button class="btn-ghost" @click="router.push('/backtest')">去回测</button>
       <span class="hint">技术因子基于腾讯历史K线（近260个交易日，前复权）计算；量能/基本面因子来自新浪实时行情快照，共 {{ catalog.length }} 个因子</span>
     </div>
 

@@ -11,6 +11,7 @@ const { toast } = useToast()
 const codeInput = ref('')
 const klineData = ref([])
 let timer = null
+let refreshing = false   // 在途锁：弱网下上次刷新未完成则跳过，避免请求堆积重叠
 
 const SOURCE_META = {
   tencent: '腾讯行情（推荐） · qt.gtimg.cn',
@@ -62,8 +63,12 @@ const klineOption = computed(() => {
 })
 
 async function refresh() {
-  await store.refreshQuotes()
-  await loadKline()
+  if (refreshing) return   // 在途锁：上次未完成则跳过
+  refreshing = true
+  try {
+    await store.refreshQuotes()
+    await loadKline()
+  } finally { refreshing = false }
 }
 
 watch(() => store.activeCode, loadKline)

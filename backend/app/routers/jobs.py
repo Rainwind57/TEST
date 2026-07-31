@@ -89,13 +89,16 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
     if kind == "ml-evaluate":
         async def _run():
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist, use_snapshot=cfg.useSnapshot)
-            return ml.evaluate_dataset(dataset, cfg.modelType, cfg.nSplits, cfg.gap)
+            # evaluate_dataset 为 CPU 密集同步函数，放线程池避免阻塞事件循环（旧版直接调致全站卡死）
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
         jobs.submit(jid, _run())
     elif kind == "ml-train":
         async def _run():
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist, use_snapshot=cfg.useSnapshot)
-            ev = ml.evaluate_dataset(dataset, cfg.modelType, cfg.nSplits, cfg.gap)
-            meta = ml.train_final_model(dataset, cfg.modelType)
+            loop = asyncio.get_running_loop()
+            ev = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
+            meta = await loop.run_in_executor(None, ml.train_final_model, dataset, cfg.modelType)
             return {"model": meta, "evaluation": ev}
         jobs.submit(jid, _run())
     else:  # ml-backtest

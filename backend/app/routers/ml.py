@@ -1,8 +1,10 @@
 """机器学习路由：构建数据集 → 时序 CV 评估 → 训练并落盘模型。"""
-from fastapi import APIRouter, HTTPException
+import asyncio
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import ml, jobs
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/ml", tags=["ml"])
 
@@ -28,11 +30,11 @@ async def evaluate(body: EvalBody):
     except Exception as e:
         raise HTTPException(502, f"数据集构建失败: {e}")
     try:
-        result = ml.evaluate_dataset(dataset, body.modelType, body.nSplits, body.gap)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, body.modelType, body.nSplits, body.gap)
     except ValueError as e:
         raise HTTPException(422, str(e))
     return result
-
 
 @router.post("/train")
 async def train(body: EvalBody):
@@ -43,8 +45,13 @@ async def train(body: EvalBody):
         raise HTTPException(422, str(e))
     except Exception as e:
         raise HTTPException(502, f"数据集构建失败: {e}")
-    eval_result = ml.evaluate_dataset(dataset, body.modelType, body.nSplits, body.gap)
-    meta = ml.train_final_model(dataset, body.modelType)
+    # CPU 密集同步函数放线程池，避免阻塞事件循环（旧版训练期间全站请求卡死）
+    loop = asyncio.get_running_loop()
+    try:
+        eval_result = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, body.modelType, body.nSplits, body.gap)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    meta = await loop.run_in_executor(None, ml.train_final_model, dataset, body.modelType)
     return {"model": meta, "evaluation": eval_result}
 
 
@@ -54,7 +61,7 @@ def list_models():
 
 
 @router.delete("/models/{mid}")
-def delete_model(mid: str):
+def delete_model(mid: str, uid: int = Depends(require_user_id)):
     if not ml.delete_model(mid):
         raise HTTPException(404, "模型不存在")
     return {"ok": True}

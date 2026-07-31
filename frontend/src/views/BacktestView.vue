@@ -1,9 +1,10 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import api, { downloadFile } from '../api/client'
+import api, { longTask, downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
 import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
+import Skeleton from '../components/Skeleton.vue'
 
 const { toast } = useToast()
 const research = useResearchStore()
@@ -26,6 +27,8 @@ const BENCH_OPTIONS = [
 const board = ref('all')
 const poolSize = ref(60)
 const factorKey = ref('momentum')
+const strategySource = ref('factor')   // factor=技术因子 | model=ML模型
+const modelId = ref('')
 const groups = ref(5)
 const days = ref(5)
 const hist = ref(180)
@@ -40,6 +43,7 @@ const saving = ref(false)
 const exporting = ref(false)
 const result = ref(null)
 const factorOptions = ref([])
+const modelOptions = ref([])
 const showSave = ref(false)
 const strategyName = ref('')
 
@@ -48,18 +52,41 @@ async function loadFactorOptions() {
   factorOptions.value = data.filter(f => f.kline)
 }
 
-const backtestConfig = () => ({
-  board: board.value, poolSize: Number(poolSize.value), factor: factorKey.value,
-  groups: Number(groups.value), n: Number(days.value), hist: Number(hist.value),
-  benchmark: benchmark.value, applyCost: applyCost.value,
-  commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
-  slippage: Number(slippage.value)
-})
+async function loadModels() {
+  try { modelOptions.value = await api.get('/ml/models') }
+  catch (e) { /* 静默：模型列表拉取失败不阻塞页面 */ }
+}
+
+const backtestConfig = () => {
+  const cfg = {
+    board: board.value, poolSize: Number(poolSize.value),
+    groups: Number(groups.value), n: Number(days.value), hist: Number(hist.value),
+    benchmark: benchmark.value, applyCost: applyCost.value,
+    commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
+    slippage: Number(slippage.value),
+  }
+  if (strategySource.value === 'model') {
+    cfg.modelId = modelId.value
+  } else {
+    cfg.factor = factorKey.value
+  }
+  return cfg
+}
 
 async function runBacktest() {
+  if (strategySource.value === 'model' && !modelId.value) {
+    toast('请先选择 ML 模型'); return
+  }
+  // 表单校验：清空输入框时 Number('')=0 会发出脏请求（poolSize=0/groups=0/n=0）
+  const ps = Number(poolSize.value), gp = Number(groups.value), dn = Number(days.value), hs = Number(hist.value)
+  if (!ps || ps < 20) { toast('候选池规模需 ≥ 20'); return }
+  if (!gp || gp < 2) { toast('分组数需 ≥ 2'); return }
+  if (!dn || dn < 1) { toast('持有天数需 ≥ 1'); return }
+  if (!hs || hs < 60) { toast('历史长度需 ≥ 60'); return }
   loading.value = true
   try {
-    result.value = await api.post('/select/backtest', backtestConfig())
+    // 长任务走 5 分钟超时，避免旧版 60s 默认超时误杀大股池/弱网回测
+    result.value = await longTask('/select/backtest', backtestConfig())
   } catch (e) {
     toast(e.message); result.value = null
   } finally { loading.value = false }
@@ -144,17 +171,30 @@ const pct = v => v == null ? '-' : (v * 100).toFixed(2) + '%'
 const num = (v, d = 4) => v == null ? '-' : Number(v).toFixed(d)
 
 onMounted(async () => {
-  await loadFactorOptions()
+  await Promise.all([loadFactorOptions(), loadModels()])
+  // 消费 ML 页写入的当前模型：有则自动切到模型来源并选中（打通 ML→主回测闭环）
+  const cm = research.currentModel
+  if (cm?.id && modelOptions.value.some(m => m.id === cm.id)) {
+    strategySource.value = 'model'
+    modelId.value = cm.id
+    toast('已预填当前 ML 模型，可直接回测')
+  }
   // 消费寻优页回填的最优参数（researchStore 跨页共享）
   const p = research.consumeOptimalParams()
   if (p) {
     if (p.board) board.value = p.board
-    if (p.factor) factorKey.value = p.factor
     if (p.poolSize) poolSize.value = p.poolSize
     if (p.groups) groups.value = p.groups
     if (p.n) days.value = p.n
     if (p.hist) hist.value = p.hist
     if (p.benchmark) benchmark.value = p.benchmark
+    if (p.modelId) {
+      strategySource.value = 'model'
+      modelId.value = p.modelId
+    } else if (p.factor) {
+      strategySource.value = 'factor'
+      factorKey.value = p.factor
+    }
     toast('已预填寻优最优参数，可直接回测')
   }
 })
@@ -167,8 +207,20 @@ onMounted(async () => {
         <select v-model="board"><option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option></select>
       </div>
       <div class="field"><label>候选池规模</label><input v-model="poolSize" type="number" min="20" max="300" /></div>
-      <div class="field"><label>因子</label>
+      <div class="field"><label>策略来源</label>
+        <select v-model="strategySource">
+          <option value="factor">技术因子</option>
+          <option value="model">ML模型</option>
+        </select>
+      </div>
+      <div v-if="strategySource==='factor'" class="field"><label>因子</label>
         <select v-model="factorKey"><option v-for="f in factorOptions" :key="f.key" :value="f.key">{{ f.label }}</option></select>
+      </div>
+      <div v-else class="field"><label>模型</label>
+        <select v-model="modelId">
+          <option value="">请选择模型</option>
+          <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ m.id }}</option>
+        </select>
       </div>
       <div class="field"><label>分组数</label><input v-model="groups" type="number" min="2" max="10" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
@@ -192,7 +244,8 @@ onMounted(async () => {
       <button class="btn-primary" :disabled="saving" @click="saveStrategy">{{ saving ? '保存中…' : '确认保存' }}</button>
     </div>
 
-    <div v-if="!result" class="empty-hint">设置参数后点击「运行分层回测」</div>
+    <div v-if="loading" class="stat-cards"><Skeleton type="cards" :count="8" /></div>
+    <div v-else-if="!result" class="empty-hint">设置参数后点击「运行分层回测」</div>
     <template v-else>
       <div class="stat-cards">
         <div class="stat-card"><div class="label">有效股票数</div><div class="value">{{ result.effectiveStocks }}</div></div>

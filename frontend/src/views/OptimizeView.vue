@@ -13,6 +13,8 @@ const research = useResearchStore()
 const board = ref('all')
 const poolSize = ref(60)
 const factor = ref('momentum')
+const strategySource = ref('factor')   // factor=技术因子 | model=ML模型
+const modelId = ref('')
 const groups = ref(5)
 const n = ref(5)
 const hist = ref(180)
@@ -22,20 +24,38 @@ const benchmark = ref('none')
 const loading = ref(false)
 const result = ref(null)
 const factorOptions = ref([])
+const modelOptions = ref([])
 
 async function loadFactors() {
   try { factorOptions.value = (await api.get('/select/factors')).filter(f => f.kline) }
   catch (e) { toast(e.message) }
 }
 
+async function loadModels() {
+  try { modelOptions.value = await api.get('/ml/models') }
+  catch (e) { /* 静默 */ }
+}
+
+function baseCfg() {
+  const cfg = {
+    board: board.value, poolSize: Number(poolSize.value),
+    groups: Number(groups.value), n: Number(n.value), hist: Number(hist.value),
+    benchmark: benchmark.value,
+    commissionRate: 0.00025, stampDuty: 0.001, slippage: 0.001, applyCost: true,
+  }
+  if (strategySource.value === 'model') {
+    cfg.modelId = modelId.value
+  } else {
+    cfg.factor = factor.value
+  }
+  return cfg
+}
+
 async function run() {
+  if (strategySource.value === 'model' && !modelId.value) { toast('请先选择 ML 模型'); return }
   loading.value = true
   try {
-    const cfg = {
-      board: board.value, poolSize: Number(poolSize.value), factor: factor.value,
-      groups: Number(groups.value), n: Number(n.value), hist: Number(hist.value),
-      benchmark: benchmark.value, nTrials: Number(nTrials.value),
-    }
+    const cfg = { ...baseCfg(), nTrials: Number(nTrials.value) }
     result.value = await api.post('/optimize/backtest', cfg)
     toast(`寻优完成，${result.value.nTrials} 次试验`)
   } catch (e) { toast(e.message) }
@@ -44,14 +64,12 @@ async function run() {
 
 async function saveStrategy() {
   if (!result.value) return
-  const name = prompt('策略名称', `${factor.value}_opt_${nTrials.value}trials`)
+  const name = prompt('策略名称', `${strategySource.value === 'model' ? modelId.value : factor.value}_opt_${nTrials.value}trials`)
   if (!name) return
   try {
     await api.post('/optimize/save-strategy', {
       name,
-      baseConfig: { board: board.value, factor: factor.value, hist: Number(hist.value),
-        benchmark: benchmark.value, commissionRate: 0.00025, stampDuty: 0.001,
-        slippage: 0.001, applyCost: true },
+      baseConfig: baseCfg(),
       bestParams: result.value.bestParams,
     })
     toast('已回写为策略')
@@ -60,13 +78,14 @@ async function saveStrategy() {
 
 function applyToBacktest() {
   if (!result.value) return
-  research.setOptimalParams({
-    board: board.value, factor: factor.value,
+  const p = {
+    ...baseCfg(),
     poolSize: result.value.bestParams.poolSize,
     groups: result.value.bestParams.groups,
     n: result.value.bestParams.n,
-    hist: Number(hist.value), benchmark: benchmark.value,
-  })
+    hist: Number(hist.value),
+  }
+  research.setOptimalParams(p)
   router.push('/backtest')
 }
 
@@ -86,7 +105,15 @@ const trialOption = computed(() => {
 const fmt = v => v == null ? '-' : Number(v).toFixed(3)
 const fmtPct = v => v == null ? '-' : (Number(v) * 100).toFixed(2) + '%'
 
-onMounted(loadFactors)
+onMounted(async () => {
+  await Promise.all([loadFactors(), loadModels()])
+  // 消费 ML 页写入的当前模型：有则自动切到模型寻优
+  const cm = research.currentModel
+  if (cm?.id && modelOptions.value.some(m => m.id === cm.id)) {
+    strategySource.value = 'model'
+    modelId.value = cm.id
+  }
+})
 </script>
 
 <template>
@@ -103,9 +130,21 @@ onMounted(loadFactors)
             <option value="star">科创板</option>
           </select>
         </div>
-        <div class="field"><label>因子</label>
+        <div class="field"><label>策略来源</label>
+          <select v-model="strategySource">
+            <option value="factor">技术因子</option>
+            <option value="model">ML模型</option>
+          </select>
+        </div>
+        <div v-if="strategySource==='factor'" class="field"><label>因子</label>
           <select v-model="factor">
             <option v-for="f in factorOptions" :key="f.key" :value="f.key">{{ f.label }}</option>
+          </select>
+        </div>
+        <div v-else class="field"><label>模型</label>
+          <select v-model="modelId">
+            <option value="">请选择模型</option>
+            <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ m.id }}</option>
           </select>
         </div>
         <div class="field"><label>历史长度</label><input v-model="hist" type="number" /></div>

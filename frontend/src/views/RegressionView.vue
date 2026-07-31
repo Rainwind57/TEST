@@ -1,12 +1,16 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { useWatchlistStore } from '../stores/watchlist'
 import { useToast } from '../stores/toast'
+import { useResearchStore } from '../stores/research'
 import api from '../api/client'
 import EChart from '../components/EChart.vue'
 
 const store = useWatchlistStore()
 const { toast } = useToast()
+const router = useRouter()
+const research = useResearchStore()
 
 const factorKey = ref('ma_dev')
 const methodKey = ref('ols')
@@ -90,6 +94,12 @@ const chartOption = computed(() => {
   }
 })
 
+// 把当前因子带到主回测页做分层回测（打通回归→回测，旧版算完即死路）
+function gotoBacktest() {
+  research.setOptimalParams({ factor: factorKey.value, n: Number(days.value), hist: Number(hist.value) })
+  router.push('/backtest')
+}
+
 onMounted(async () => {
   await loadOptions()
   if (!store.codes.length) await store.fetchWatchlist()
@@ -114,6 +124,7 @@ onMounted(async () => {
       <div class="field"><label>预测天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
       <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="300" /></div>
       <button class="btn-primary" :disabled="loading" @click="runRegression">{{ loading ? '计算中…' : '运行回归' }}</button>
+      <button class="btn-ghost" v-if="result" @click="gotoBacktest">用该因子回测</button>
       <span class="hint">对自选股历史行情做滚动窗口取样：因子值(t) vs 未来N日收益率(t→t+N)，样本合并后按所选方法拟合</span>
     </div>
 

@@ -1,10 +1,14 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
-import api, { longTask } from '../api/client'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
+import api, { longTask, downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
+import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
 
 const { toast } = useToast()
+const research = useResearchStore()
+const router = useRouter()
 
 const board = ref('all')
 const poolSize = ref(80)
@@ -35,10 +39,11 @@ function evalConfig() {
   }
 }
 
-// jobs 轮询：页面隐藏暂停 + 间隔退避（1.5s→4s 上限）
+// jobs 轮询：页面隐藏暂停 + 间隔退避（1.5s→4s 上限）；离开页面停止，避免后台空转
+let pollActive = true
 async function pollJob(jobId, onProgress) {
   let delay = 1500
-  while (true) {
+  while (pollActive) {
     if (document.hidden) { await new Promise(r => setTimeout(r, 1000)); continue }
     const j = await api.get(`/jobs/${jobId}`)
     onProgress && onProgress(j.progress, j.message)
@@ -48,6 +53,7 @@ async function pollJob(jobId, onProgress) {
     await new Promise(r => setTimeout(r, delay))
     delay = Math.min(delay * 1.3, 4000)
   }
+  throw new Error('任务已随页面离开而中止')
 }
 
 async function runEvaluate() {
@@ -68,6 +74,8 @@ async function runTrain() {
     const res = await pollJob(jobId, (p, m) => trainMsg.value = m || `进度 ${p || 0}%`)
     result.value = res.evaluation
     await loadModels()
+    // 写入跨页共享 store，主回测页 onMounted 消费并自动选中该模型（打通 ML→主回测闭环）
+    research.setCurrentModel(res.model)
     toast(`训练完成，模型 ${res.model.id} 已落盘`)
   } catch (e) { toast(e.message) }
   finally { training.value = false; trainMsg.value = '' }
@@ -82,6 +90,12 @@ async function deleteModel(id) {
   if (!confirm('删除该模型文件？')) return
   try { await api.delete(`/ml/models/${id}`); models.value = models.value.filter(m => m.id !== id) }
   catch (e) { toast(e.message) }
+}
+
+// 把模型带到主回测页：写入共享 store 后跳转，BacktestView onMounted 自动选中
+function gotoBacktest(m) {
+  research.setCurrentModel(m)
+  router.push('/backtest')
 }
 
 // 用模型对候选池最新截面打分（ML→选股闭环）
@@ -110,6 +124,20 @@ async function runMLBacktest(m) {
     toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
   } catch (e) { toast(e.message) }
   finally { btLoading.value = '' }
+}
+
+// ML 回测结果导出（复用主回测页的 /reports/backtest，旧版 ML 回测无导出能力）
+async function exportMLBacktest(fmt) {
+  if (!btResult.value) return
+  try {
+    const payload = {
+      format: fmt, factorLabel: btResult.value.factorLabel,
+      config: btResult.value.config || {}, metrics: btResult.value.metrics,
+      benchmark: btResult.value.benchmark, groupSummary: btResult.value.groupSummary,
+      longShort: btResult.value.longShort, icSeries: btResult.value.icSeries,
+    }
+    await downloadFile('/reports/backtest', payload, `ml_backtest.${fmt === 'html' ? 'html' : 'xlsx'}`)
+  } catch (e) { toast(e.message) }
 }
 
 const fmt = v => v == null ? '-' : Number(v).toFixed(3)
@@ -144,6 +172,7 @@ const lsOption = computed(() => {
 })
 
 onMounted(loadModels)
+onUnmounted(() => { pollActive = false })
 </script>
 
 <template>
@@ -169,7 +198,7 @@ onMounted(loadModels)
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-ghost" :disabled="loading" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
         <button class="btn-primary" :disabled="training" @click="runTrain">{{ training ? '训练中…' : '训练并落盘' }}</button>
-        <label style="margin-left:12px;font-size:13px;color:var(--text-mute)"><input type="checkbox" v-model="useSnapshot" /> 含 PE/PB/换手快照特征（前视，探索用）</label>
+        <label style="margin-left:12px;font-size:13px;color:var(--text-mute)"><input type="checkbox" v-model="useSnapshot" /> 含全部快照因子（PE/PB/ROE/北向等，前视，探索用）</label>
         <span v-if="trainMsg" class="hint" style="margin-left:8px">{{ trainMsg }}</span>
       </div>
     </div>
@@ -210,6 +239,7 @@ onMounted(loadModels)
             <td>
               <button class="btn-ghost sm" :disabled="scoring===m.id" @click="runScore(m)">{{ scoring===m.id ? '打分中…' : '打分选股' }}</button>
               <button class="btn-ghost sm" :disabled="btLoading===m.id" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
+              <button class="btn-ghost sm" @click="gotoBacktest(m)">去主回测</button>
               <button class="btn-ghost sm danger" @click="deleteModel(m.id)">删除</button>
             </td>
           </tr>
@@ -231,7 +261,11 @@ onMounted(loadModels)
     </div>
 
     <div v-if="btResult" class="card">
-      <div class="card-head"><h3>ML 信号分层回测</h3><span class="hint">调仓 {{ btResult.rebalanceCount }} 次 · 有效股票 {{ btResult.effectiveStocks }}</span></div>
+      <div class="card-head"><h3>ML 信号分层回测</h3><span class="hint">
+        调仓 {{ btResult.rebalanceCount }} 次 · 有效股票 {{ btResult.effectiveStocks }}
+        <button class="btn-ghost sm" style="margin-left:12px" @click="exportMLBacktest('html')">导出HTML</button>
+        <button class="btn-ghost sm" style="margin-left:6px" @click="exportMLBacktest('excel')">导出Excel</button>
+      </span></div>
       <div class="kpi-row">
         <div class="kpi"><div class="n">{{ fmtPct(btResult.metrics.cumulativeReturn) }}</div><div class="l">累计收益</div></div>
         <div class="kpi"><div class="n">{{ fmtPct(btResult.metrics.annualizedReturn) }}</div><div class="l">年化</div></div>

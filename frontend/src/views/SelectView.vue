@@ -1,12 +1,17 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '../api/client'
 import { useToast } from '../stores/toast'
 import { useWatchlistStore } from '../stores/watchlist'
+import { useResearchStore } from '../stores/research'
 import { stripPrefix, fmtPct, fmtNum } from '../utils/format'
+import Skeleton from '../components/Skeleton.vue'
 
 const { toast } = useToast()
 const watchlist = useWatchlistStore()
+const router = useRouter()
+const research = useResearchStore()
 
 const BOARD_OPTIONS = [
   { value: 'all', label: '全部A股' },
@@ -88,6 +93,7 @@ async function runSelect() {
       factors: selectedFactors.value, filters: buildFilters()
     })
     result.value = data
+    research.setCurrentSelectResult({ board: board.value, poolSize: Number(poolSize.value), rows: data.rows })
   } catch (e) {
     toast(e.message)
     result.value = null
@@ -138,6 +144,12 @@ async function buyIntoPortfolio() {
   } finally {
     applying.value = false
   }
+}
+
+// 把当前候选池参数带到主回测页（打通选股→回测，旧版选股结果只能加自选/买入）
+function gotoBacktest() {
+  research.setOptimalParams({ board: board.value, poolSize: Number(poolSize.value) })
+  router.push('/backtest')
 }
 
 onMounted(loadCatalog)
@@ -193,7 +205,11 @@ onMounted(loadCatalog)
       </div>
     </div>
 
-    <div v-if="result" class="card">
+    <div v-if="loading" class="card">
+      <div class="card-head"><h2>选股结果</h2><span class="hint">计算中…</span></div>
+      <Skeleton type="rows" :count="8" />
+    </div>
+    <div v-else-if="result" class="card">
       <div class="card-head">
         <h2>选股结果</h2>
         <span class="count">候选池 {{ result.candidateSize }}/{{ result.universeSize }} 只，取前 {{ result.rows.length }} 只</span>
@@ -204,6 +220,7 @@ onMounted(loadCatalog)
         <button class="btn-ghost" :disabled="applying" @click="addToWatchlist">加入自选</button>
         <input class="cash-input" v-model="totalCash" type="number" placeholder="买入总资金" />
         <button class="btn-primary" :disabled="applying" @click="buyIntoPortfolio">一键买入模拟盘(等权)</button>
+        <button class="btn-ghost" @click="gotoBacktest">用该股池回测</button>
       </div>
       <table>
         <thead>

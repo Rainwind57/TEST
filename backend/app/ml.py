@@ -10,6 +10,7 @@ import os
 import json
 import asyncio
 import datetime
+import logging
 from collections import defaultdict
 
 import numpy as np
@@ -18,6 +19,8 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error
 
 from . import adapters, db
+
+logger = logging.getLogger(__name__)
 from .factors import (
     FACTORS, SNAPSHOT_FACTORS, mean, std, bucket_index,
     annualized_return, annualized_volatility, sharpe_ratio, sortino_ratio,
@@ -31,6 +34,55 @@ os.makedirs(ML_DIR, exist_ok=True)
 
 TRADING_DAYS = 252
 
+# 需要额外拉取的快照因子（行情快照 row 不自带，须调财务/资金流接口）
+_FINANCE_KEYS = {"roe", "net_margin", "revenue_yoy", "profit_yoy",
+                 "gross_margin", "debt_ratio", "eps", "bps", "roa"}
+_MONEYFLOW_KEYS = {"main_net_pct", "north_holding_pct"}
+_FIN_TO_FIELD = {
+    "roe": "roe", "net_margin": "netMargin", "revenue_yoy": "revenueYoY",
+    "profit_yoy": "profitYoY", "gross_margin": "grossMargin", "debt_ratio": "debtRatio",
+    "eps": "eps", "bps": "bps", "roa": "roa",
+}
+
+
+async def _enrich_pool_extra(pool: list[dict], snap_keys: list[str]) -> None:
+    """对候选池逐股拉取财务/资金流字段，就地写入 row（与 selection.fetch_extra 对齐）。
+
+    旧版 ML 只喂 pe/pb/turnover 三个行情自带字段；扩展后 ep/bp/mkt_cap/roe 等全可入模型，
+    训练与推理（score_latest/backtest_model）共用同一份 feature_names 同构对齐。
+    """
+    need_fin = bool(set(snap_keys) & _FINANCE_KEYS)
+    need_mf = bool(set(snap_keys) & _MONEYFLOW_KEYS)
+    if not need_fin and not need_mf:
+        return
+    sem = asyncio.Semaphore(10)
+
+    async def one(row):
+        code = row["code"]
+        async with sem:
+            if need_fin:
+                try:
+                    fin = await adapters.fetch_finance_summary(code)
+                except Exception:
+                    fin = {}
+                for k, f in _FIN_TO_FIELD.items():
+                    row[k] = fin.get(f)
+            if need_mf:
+                if "main_net_pct" in snap_keys:
+                    try:
+                        mf = await adapters.fetch_money_flow(code)
+                    except Exception:
+                        mf = {}
+                    row["main_net_pct"] = mf.get("mainNetPct")
+                if "north_holding_pct" in snap_keys:
+                    try:
+                        nh = await adapters.fetch_north_holding(code)
+                    except Exception:
+                        nh = {}
+                    row["north_holding_pct"] = nh.get("holdRatio")
+
+    await asyncio.gather(*(one(r) for r in pool))
+
 
 async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                         hist: int = 240, progress_cb=None,
@@ -38,13 +90,16 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     """构建 ML 数据集：候选池每只股票算全部量价因子 + 未来 N 日收益。
 
     返回 {features, target, codes, dates, feature_names}。
-    use_snapshot=True 时追加 pe/pb/turnover 最新快照作为静态特征（含前视风险，
-    仅探索用；推理 score_latest/backtest_model 会按 feature_names 一致拉取）。
+    use_snapshot=True 时追加全部快照因子（含财务/资金流，需额外拉取）作为静态特征
+    （含前视风险，仅探索用；推理 score_latest/backtest_model 会按 feature_names 一致拉取）。
     """
     pool = await adapters.fetch_market_list(board, pool_size)
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
-    snapshot_keys = ["pe", "pb", "turnover"] if use_snapshot else []
+    # 旧版硬编码 ["pe","pb","turnover"]，扩展为全部快照因子（含 ep/bp/mkt_cap/roe 等）
+    snapshot_keys = list(SNAPSHOT_FACTORS.keys()) if use_snapshot else []
+    if snapshot_keys:
+        await _enrich_pool_extra(pool, snapshot_keys)
     row_by_code = {r["code"]: r for r in pool}
     total = len(codes)
 
@@ -57,7 +112,8 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
             progress_cb(idx + 1, total)
         try:
             kline = await adapters.fetch_kline(code, hist)
-        except Exception:
+        except Exception as e:
+            logger.warning("ML数据集拉取K线失败 code=%s: %s", code, e)
             continue
         if len(kline) < 60 + n:
             continue
@@ -435,6 +491,9 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
     snap_set = set(SNAPSHOT_FACTORS)
 
     pool = await adapters.fetch_market_list(board, pool_size)
+    # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
+    if snap_keys:
+        await _enrich_pool_extra(pool, snap_keys)
     sem = asyncio.Semaphore(15)
     collected = []
 
@@ -443,7 +502,8 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
         async with sem:
             try:
                 kline = await adapters.fetch_kline(code, 260)
-            except Exception:
+            except Exception as e:
+                logger.warning("ML打分拉取K线失败 code=%s: %s", code, e)
                 return
         if len(kline) < 60:
             return
@@ -501,6 +561,9 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         raise ValueError(f"未知基准: {benchmark}")
 
     pool = await adapters.fetch_market_list(board, pool_size)
+    # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
+    if snap_keys:
+        await _enrich_pool_extra(pool, snap_keys)
     codes = [row["code"] for row in pool]
     is_st = {r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
              for r in pool}
@@ -510,7 +573,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         async with sem:
             try:
                 kline = await adapters.fetch_kline(code, hist + n + 25)
-            except Exception:
+            except Exception as e:
+                logger.warning("ML回测拉取K线失败 code=%s: %s", code, e)
                 return code, []
             return code, kline
 
@@ -535,6 +599,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         arr = kline_to_arrays(kl)
         code_cache[code] = {
             "closes": arr["close"],
+            "volumes": arr["volume"],
             "smap": {k: compute_factor_series(k, arr) for k in tech_keys},
             "kline": kl,
         }
@@ -562,7 +627,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
 
     bench_date_idx = {row["date"]: idx for idx, row in enumerate(bench_series)} if bench_series else {}
 
-    for t in range(25, len(ref_dates) - n, max(1, n)):
+    for t in range(60, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
         cross_feats, cross_codes, cross_rets = [], [], []
         for code in series:
@@ -592,6 +657,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
                 continue
             if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
+                continue
+            # 停牌处理：持仓期内有停牌日（成交量=0）则跳过，避免跨停牌缺口价算收益失真
+            vols = cc["volumes"]
+            if any(vols[j] == 0 for j in range(i, i + n + 1)):
                 continue
             cross_codes.append(code)
             cross_feats.append(fvals)

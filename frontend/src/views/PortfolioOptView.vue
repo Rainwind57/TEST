@@ -1,10 +1,12 @@
 <script setup>
 import { ref, computed } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '../api/client'
 import { useToast } from '../stores/toast'
 import EChart from '../components/EChart.vue'
 
 const { toast } = useToast()
+const router = useRouter()
 
 const codesText = ref('sh600519,sz000001,sz300750,sh601318,sh600000')
 const muText = ref('0.10,0.05,0.08,0.12,0.03')
@@ -53,6 +55,8 @@ async function applyToPortfolio() {
     const ok = res.applied.filter(a => a.qty).length
     const fail = res.applied.length - ok
     toast(`建仓完成：成功 ${ok} 只${fail ? `，失败 ${fail}` : ''}`)
+    // 旧版只 toast 不跳转，用户不知道去哪看结果。建仓成功后跳模拟盘页
+    if (ok > 0) router.push('/portfolio')
   } catch (e) { toast(e.message) }
   finally { applying.value = false }
 }

@@ -1,8 +1,9 @@
 """参数寻优路由：Optuna 贝叶斯搜索回测参数，Walk-Forward IS/OOS 评估。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import optimize, jobs
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/optimize", tags=["optimize"])
 
@@ -11,6 +12,7 @@ class OptimizeBody(BaseModel):
     board: str = "all"
     poolSize: int = 60
     factor: str = "momentum"
+    modelId: str | None = None      # 指定时对 ML 模型策略寻优（与技术因子二选一）
     groups: int = 5
     n: int = 5
     hist: int = 180
@@ -39,7 +41,7 @@ def optimize_backtest(body: OptimizeBody):
 
 
 @router.post("/save-strategy")
-def save_as_strategy(body: SaveStrategyBody):
+def save_as_strategy(body: SaveStrategyBody, uid: int = Depends(require_user_id)):
     """把最优参数回写为策略。"""
     try:
         return optimize.save_best_as_strategy(body.baseConfig, body.bestParams, body.name)

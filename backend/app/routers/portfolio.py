@@ -1,10 +1,11 @@
 """模拟盘路由：下单、持仓查询、净值曲线、重置。"""
 import datetime
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
 
 from .. import adapters, db
 from ..auth import get_user_id_from_auth
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
@@ -72,7 +73,7 @@ async def get_portfolio():
 
 
 @router.post("/order")
-async def place_order(body: OrderBody):
+async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
     if body.side not in ("buy", "sell"):
         raise HTTPException(400, "side 必须为 buy 或 sell")
     if body.qty <= 0 or body.qty % 100 != 0:

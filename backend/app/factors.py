@@ -406,6 +406,14 @@ SNAPSHOT_FACTORS = {
     "revenue_yoy": {"label": "营收同比(%)", "group": "fundamental", "direction": 1, "format": "num"},
     "profit_yoy": {"label": "净利同比(%)", "group": "fundamental", "direction": 1, "format": "num"},
     "main_net_pct": {"label": "主力净流入占比", "group": "moneyflow", "direction": 1, "format": "pct"},
+    # 以下四个：adapters.fetch_finance_summary 已拉取但旧版未注册进 SNAPSHOT_FACTORS（数据白拉）
+    "gross_margin": {"label": "毛利率(%)", "group": "fundamental", "direction": 1, "format": "num"},
+    "debt_ratio": {"label": "资产负债率(%)", "group": "fundamental", "direction": -1, "format": "num"},
+    "eps": {"label": "每股收益", "group": "fundamental", "direction": 1, "format": "num"},
+    "bps": {"label": "每股净资产", "group": "fundamental", "direction": 1, "format": "num"},
+    # 质量类：ROA（新增，由总资产/净利润算）；北向资金类：个股持股比例（新增数据源）
+    "roa": {"label": "ROA(%)", "group": "fundamental", "direction": 1, "format": "num"},
+    "north_holding_pct": {"label": "北向持股比例(%)", "group": "moneyflow", "direction": 1, "format": "num"},
 }
 
 _SNAPSHOT_FIELD_MAP = {
@@ -414,6 +422,9 @@ _SNAPSHOT_FIELD_MAP = {
     # 资金流/财务快照因子（由 selection.run_select 勾选时批量拉取填充 row，非行情快照自带）
     "roe": "roe", "net_margin": "net_margin", "revenue_yoy": "revenue_yoy",
     "profit_yoy": "profit_yoy", "main_net_pct": "main_net_pct",
+    "gross_margin": "gross_margin", "debt_ratio": "debt_ratio",
+    "eps": "eps", "bps": "bps",
+    "roa": "roa", "north_holding_pct": "north_holding_pct",
 }
 
 

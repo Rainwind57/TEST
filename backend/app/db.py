@@ -86,6 +86,19 @@ def init_db():
         salt TEXT NOT NULL,
         created_at TEXT NOT NULL
     )""")
+    # 异步任务表：旧版 job 元数据纯内存，重启即丢、多 worker 不共享。落 SQLite 后历史可查。
+    cur.execute("""CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        config TEXT NOT NULL,
+        status TEXT NOT NULL,
+        progress INTEGER DEFAULT 0,
+        message TEXT DEFAULT '',
+        result TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    )""")
 
     # 多用户：为研究资产表加 user_id 列（ALTER 兼容旧库）
     _ensure_column(cur, "saved_strategies", "user_id", "INTEGER DEFAULT 0")
@@ -316,6 +329,93 @@ def _parse_backtest_run(row):
         pass
     try:
         d["metrics"] = json.loads(d["metrics"]) if d.get("metrics") else {}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return d
+
+
+# ---------------- 异步任务（jobs 表） ----------------
+
+def create_job_row(jid: str, kind: str, config: dict) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO jobs (id, kind, config, status, progress, message, created_at) "
+        "VALUES (?, ?, ?, 'pending', 0, '', ?)",
+        (jid, kind, _json_dumps(config), datetime.datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_job_row(jid: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (jid,)).fetchone()
+    conn.close()
+    return _parse_job_row(row) if row else None
+
+
+def list_job_rows(limit: int = 50) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 200)),)
+    ).fetchall()
+    conn.close()
+    return [_parse_job_row(r) for r in rows]
+
+
+def update_job_row(jid: str, **fields) -> None:
+    allowed = {"status", "progress", "message", "result", "error", "finished_at"}
+    sets = []
+    vals = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k == "result":
+            v = _json_dumps(v) if v is not None else None
+        sets.append(f"{k} = ?")
+        vals.append(v)
+    if not sets:
+        return
+    vals.append(jid)
+    conn = get_conn()
+    conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", vals)
+    conn.commit()
+    conn.close()
+
+
+def delete_job_row(jid: str) -> None:
+    conn = get_conn()
+    conn.execute("DELETE FROM jobs WHERE id = ?", (jid,))
+    conn.commit()
+    conn.close()
+
+
+def prune_old_jobs(max_rows: int = 200) -> None:
+    """超过上限时删除最旧的已终结 job（done/error/cancelled）。"""
+    conn = get_conn()
+    finished = conn.execute(
+        "SELECT id FROM jobs WHERE status IN ('done','error','cancelled') "
+        "ORDER BY created_at ASC"
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"]
+    if total > max_rows:
+        for r in finished[:total - max_rows]:
+            conn.execute("DELETE FROM jobs WHERE id = ?", (r["id"],))
+    conn.commit()
+    conn.close()
+
+
+def _parse_job_row(row):
+    import json
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["config"] = json.loads(d["config"]) if d.get("config") else {}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        d["result"] = json.loads(d["result"]) if d.get("result") else None
     except (json.JSONDecodeError, TypeError):
         pass
     return d

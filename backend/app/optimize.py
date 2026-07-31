@@ -35,7 +35,6 @@ def _objective(trial: optuna.Trial, base: dict, full_hist: int, is_end_date: str
     cfg = {
         "board": base["board"],
         "poolSize": trial.suggest_int("poolSize", 30, 150, step=10),
-        "factor": base["factor"],
         "groups": trial.suggest_int("groups", 3, 8),
         "n": trial.suggest_int("n", 1, 10),
         "hist": full_hist,
@@ -46,6 +45,11 @@ def _objective(trial: optuna.Trial, base: dict, full_hist: int, is_end_date: str
         "applyCost": base["applyCost"],
         "endDate": is_end_date,
     }
+    # 模型策略与因子策略二选一：有 modelId 走 ML 信号回测，否则技术因子（打通模型寻优）
+    if base.get("modelId"):
+        cfg["modelId"] = base["modelId"]
+    else:
+        cfg["factor"] = base["factor"]
     try:
         loop = asyncio.new_event_loop()
         result = loop.run_until_complete(sel.run_backtest(sel.BacktestBody(**cfg)))
@@ -105,7 +109,7 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -
 def _run_with(base: dict, full_hist: int, params: dict,
               start_date: str | None = None, end_date: str | None = None) -> dict:
     cfg = {
-        "board": base["board"], "factor": base["factor"],
+        "board": base["board"],
         "poolSize": params.get("poolSize", base["poolSize"]),
         "groups": params.get("groups", base["groups"]),
         "n": params.get("n", base["n"]),
@@ -115,6 +119,10 @@ def _run_with(base: dict, full_hist: int, params: dict,
         "applyCost": base["applyCost"],
         "startDate": start_date, "endDate": end_date,
     }
+    if base.get("modelId"):
+        cfg["modelId"] = base["modelId"]
+    else:
+        cfg["factor"] = base["factor"]
     try:
         loop = asyncio.new_event_loop()
         result = loop.run_until_complete(sel.run_backtest(sel.BacktestBody(**cfg)))
@@ -132,11 +140,15 @@ def _run_with(base: dict, full_hist: int, params: dict,
 def save_best_as_strategy(base_config: dict, best_params: dict, name: str) -> dict:
     """把最优参数回写为策略（kind=backtest）。"""
     cfg = {
-        "board": base_config["board"], "factor": base_config["factor"],
+        "board": base_config["board"],
         "poolSize": best_params["poolSize"], "groups": best_params["groups"],
         "n": best_params["n"], "hist": base_config["hist"],
         "commissionRate": base_config["commissionRate"], "stampDuty": base_config["stampDuty"],
         "slippage": base_config["slippage"], "benchmark": base_config["benchmark"],
         "applyCost": base_config["applyCost"],
     }
+    if base_config.get("modelId"):
+        cfg["modelId"] = base_config["modelId"]
+    else:
+        cfg["factor"] = base_config["factor"]
     return db.create_strategy(name, "backtest", cfg)

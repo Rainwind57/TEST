@@ -1,10 +1,14 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '../api/client'
 import { useToast } from '../stores/toast'
+import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
 
 const { toast } = useToast()
+const router = useRouter()
+const research = useResearchStore()
 
 const BOARD_OPTIONS = [
   { value: 'all', label: '全部A股' },
@@ -75,6 +79,14 @@ const returnLineOption = computed(() => {
   }
 })
 
+// 用首个显著因子带到主回测页做分层回测（打通多因子回归→回测）
+function gotoBacktest() {
+  const sig = result.value?.summary?.find(s => Math.abs(s.tStat) >= 2) || result.value?.summary?.[0]
+  const factor = sig?.key || selectedKeys.value[0]
+  research.setOptimalParams({ factor, board: board.value, poolSize: Number(poolSize.value), n: Number(days.value), hist: Number(hist.value) })
+  router.push('/backtest')
+}
+
 onMounted(loadFactorOptions)
 </script>
 
@@ -90,6 +102,7 @@ onMounted(loadFactorOptions)
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
       <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="360" /></div>
       <button class="btn-primary" :disabled="loading" @click="runRegression">{{ loading ? '计算中…' : '运行多因子回归' }}</button>
+      <button class="btn-ghost" v-if="result" @click="gotoBacktest">用显著因子回测</button>
     </div>
     <div class="hint" style="margin-bottom:12px">
       Fama-MacBeth 风格截面回归：每 N 个交易日用截面因子暴露（z-score 标准化）对未来 N 日收益做多元线性回归，
