@@ -1,0 +1,13 @@
+# Docker 构建忽略（减小镜像体积 + 避免本地缓存污染）
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+*.md
+quant.db
+ml_models/*.joblib
+ml_models/*.json
+.venv
+.env
+tests/_smoke*

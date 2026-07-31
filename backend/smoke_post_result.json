@@ -1,0 +1,122 @@
+[
+  {
+    "name": "/api/portfolio-opt (mean_variance)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"codes\":[\"a\",\"b\",\"c\"],\"weights\":[0.4,0.19999999999999998,0.4],\"stats\":{\"return\":0.10200000000000001,\"volatility\":0.150996688705415,\"sharpe\":0.6755115021031723},\"method\":\"mean_variance\"}"
+  },
+  {
+    "name": "/api/portfolio-opt (max_sharpe)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"codes\":[\"a\",\"b\"],\"weights\":[0.5,0.5],\"stats\":{\"return\":0.125,\"volatility\":0.19364916731037085,\"sharpe\":0.6454972243679028},\"method\":\"max_sharpe\"}"
+  },
+  {
+    "name": "/api/portfolio-opt (risk_parity)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"codes\":[\"a\",\"b\",\"c\"],\"weights\":[0.3333333333333333,0.3333333333333333,0.3333333333333333],\"stats\":{\"return\":0.1,\"volatility\":0.12909944487358055,\"sharpe\":0.7745966692414835},\"method\":\"risk_parity\"}"
+  },
+  {
+    "name": "/api/portfolio-opt (equal)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"codes\":[\"a\",\"b\"],\"weights\":[0.5,0.5],\"stats\":{\"return\":0.15000000000000002,\"volatility\":0.18027756377319948,\"sharpe\":0.8320502943378437},\"method\":\"equal\"}"
+  },
+  {
+    "name": "/api/reports/backtest (html)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "<!DOCTYPE html>\n<html lang=\"zh-CN\"><head><meta charset=\"UTF-8\">\n<title>回测报告 · 动量</title>\n<style>\nbody{font-family:-apple-system,\"Segoe UI\",\"PingFang SC\",sans-serif;background:#0b1020;color:#e6ebf5;mar"
+  },
+  {
+    "name": "/api/reports/backtest (excel)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "PK\u0003\u0004\u0014\u0000\u0000\u0000\b\u0000L��\\F�MH�\u0000\u0000\u0000�\u0000\u0000\u0000\u0010\u0000\u0000\u0000docProps/app.xmlM�M\u000b�0\u0010D�J�ݤ��AbAԣ��{L76�d�d��壟\u001f�\u0019��`�%#Af\u000fE�\u0018R�6\u00133m�*v�h�D�Tcp���\"1�\u0015:�-\u001c�>\"$V˶]+�\fi�qA_a3�\u001dQ�ְ�4���Xб8V\u000bA�1�a\u000b �8\u0013$z� z�ɕV��l�B.s�e�\u001e?]�߁�\u0005PK\u0003\u0004\u0014\u0000\u0000\u0000\b\u0000L�"
+  },
+  {
+    "name": "/api/portfolio/reset",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"cash\":1000000.0,\"marketValue\":0.0,\"totalAssets\":1000000.0,\"totalPnl\":0.0,\"totalPnlPct\":0.0,\"positions\":[],\"trades\":[],\"equity\":[{\"ts\":\"2026-07-31T17:34:24.805045\",\"value\":1000000.0}]}"
+  },
+  {
+    "name": "/api/strategies (save)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"id\":6,\"name\":\"冒烟策略\",\"kind\":\"backtest\",\"config\":{\"factor\":\"momentum\"},\"created_at\":\"2026-07-31T17:34:24.843283\",\"user_id\":3}"
+  },
+  {
+    "name": "/api/user-factors (save)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"id\":5,\"name\":\"冒烟组合因子\",\"kind\":\"composite\",\"definition\":{\"factors\":[{\"key\":\"momentum\",\"weight\":1.0}]},\"created_at\":\"2026-07-31T17:34:24.861334\",\"user_id\":3}"
+  },
+  {
+    "name": "/api/backtest-runs (save)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"id\":4,\"strategy_id\":6,\"config\":{\"factor\":\"momentum\"},\"metrics\":{\"sharpe\":1.0},\"report_path\":null,\"created_at\":\"2026-07-31T17:34:24.879500\",\"user_id\":3}"
+  },
+  {
+    "name": "/api/optimize/save-strategy",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"id\":7,\"name\":\"优化冒烟\",\"kind\":\"backtest\",\"config\":{\"board\":\"all\",\"poolSize\":60,\"groups\":5,\"n\":5,\"hist\":180,\"commissionRate\":0.00025,\"stampDuty\":0.001,\"slippage\":0.001,\"benchmark\":\"none\",\"applyCost\":tru"
+  },
+  {
+    "name": "/api/risk/attribution (空持仓)",
+    "status": 422,
+    "ok": "FAIL",
+    "body": "{\"detail\":\"当前无持仓，无法做风险归因\"}"
+  },
+  {
+    "name": "/api/quote (实时)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"sh600000\":{\"name\":\"浦发银行\",\"code\":\"600000\",\"price\":9.51,\"preClose\":9.71,\"open\":9.59,\"volume\":138263800.0,\"bid\":9.51,\"ask\":9.52,\"high\":9.59,\"low\":9.28,\"amount\":1299500000.0,\"turnover\":0.42,\"pe\":6.3,\"mk"
+  },
+  {
+    "name": "/api/select/backtest (网络)",
+    "status": 422,
+    "ok": "FAIL",
+    "body": "{\"detail\":\"有效截面样本不足，无法完成分层回测\"}"
+  },
+  {
+    "name": "/api/regression (网络)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"factorLabel\":\"20日动量\",\"methodLabel\":\"普通最小二乘(OLS)\",\"n\":5,\"coefs\":[0.005328274994341328,-0.2788521657491714],\"r2\":0.14937120074380084,\"sampleSize\":35,\"ic\":-0.3864857057431761,\"rankIc\":-0.37310924369747"
+  },
+  {
+    "name": "/api/intraday/backtest (网络)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"trades\":[],\"metrics\":{\"nTrades\":0,\"winRate\":0.0,\"totalPnl\":0,\"avgPnl\":0.0,\"sharpe\":0.0,\"costRate\":0.0035000000000000005,\"applyCost\":true,\"tPlus1\":true},\"nBars\":48,\"period\":\"5\"}"
+  },
+  {
+    "name": "/api/portfolio-opt/estimate (网络)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"codes\":[\"sh600000\",\"sz000001\"],\"mu\":[0.24106430281977675,0.27378801231695726],\"cov\":[[0.07332279072461544,0.04749595740706131],[0.04749595740706131,0.04297299605597185]]}"
+  },
+  {
+    "name": "/api/jobs (submit backtest)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"jobId\":\"b150a73c5ef6\",\"status\":\"pending\"}"
+  },
+  {
+    "name": "/api/jobs/b150a73c5ef6 (poll)",
+    "status": 200,
+    "ok": "PASS",
+    "body": "{\"id\":\"b150a73c5ef6\",\"kind\":\"backtest\",\"config\":{\"factor\":\"momentum\",\"poolSize\":20,\"hist\":30},\"status\":\"error\",\"progress\":0,\"message\":\"任务执行中\",\"result\":null,\"error\":\"422: 有效截面样本不足，无法完成分层回测\",\"created_at"
+  },
+  {
+    "name": "/api/jobs/b150a73c5ef6 (cancel)",
+    "status": 404,
+    "ok": "FAIL",
+    "body": "{\"detail\":\"任务不存在或已完成\"}"
+  }
+]

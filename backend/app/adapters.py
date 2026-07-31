@@ -28,7 +28,8 @@ async def _http_get(url: str, timeout: int = 10, headers: dict | None = None,
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=timeout, headers=headers or {}) as client:
+            async with httpx.AsyncClient(timeout=timeout, headers=headers or {},
+                                         follow_redirects=True) as client:
                 return await client.get(url)
         except Exception as e:
             last_exc = e
@@ -609,32 +610,35 @@ MINUTE_CACHE_TTL = 120  # 秒
 
 
 async def fetch_minute_kline(code: str, period: str = "5", count: int = 240) -> list[dict]:
-    """分钟级 K 线（腾讯）。
+    """分钟级 K 线（新浪）。
 
     period: "1"=1分钟, "5"=5分钟, "15"=15分钟, "30"=30分钟, "60"=60分钟。
     count: K 线数量。默认 240（≈ 一个交易日的 1 分钟数）。
     返回 [{datetime, open, close, high, low, volume}]，按时间升序。
+
+    注：原腾讯 web.ifzq.gtimg.cn 分钟接口已 301 跳 web3 域名，部分网络 DNS 解析失败；
+    新浪 money.finance.sina.com.cn 接口稳定且直接返回 JSON。
     """
     cache_key = f"{code}:{period}:{count}"
     cached = _minute_cache.get(cache_key)
     if cached and time.time() - cached[0] < MINUTE_CACHE_TTL:
         return cached[1]
 
-    url = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline/get"
-           f"?param={code},m{period},{count}")
-    resp = await _http_get(url, 10)
-    data = (resp.json() or {}).get("data", {}).get(code, {})
-    arr = data.get(f"m{period}") or []
+    # 新浪 scale 与 period 一致（1/5/15/30/60）
+    url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol={code}&scale={period}&datalen={count}")
+    resp = await _http_get(url, 10, headers=_SINA_HEADERS)
+    arr = resp.json() or []
     out = []
     for row in arr:
         try:
             out.append({
-                "datetime": row[0],
-                "open": float(row[1]), "close": float(row[2]),
-                "high": float(row[3]), "low": float(row[4]),
-                "volume": float(row[5]),
+                "datetime": row["day"],
+                "open": float(row["open"]), "close": float(row["close"]),
+                "high": float(row["high"]), "low": float(row["low"]),
+                "volume": float(row["volume"]),
             })
-        except (IndexError, ValueError):
+        except (KeyError, ValueError, TypeError):
             continue
     _minute_cache[cache_key] = (time.time(), out)
     return out

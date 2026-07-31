@@ -158,3 +158,95 @@ def risk_decomposition(weights: np.ndarray, X: np.ndarray, sigma_f: np.ndarray,
         "totalRisk": float(np.sqrt(max(0, total_var))),
         "factorRiskPct": factor_var / total_var if total_var > 0 else 0.0,
     }
+
+
+def estimate_specific_variances(stock_data: list[dict], X: np.ndarray, codes: list[str],
+                                factor_returns: np.ndarray, n: int = 1) -> np.ndarray:
+    """逐股特质方差估计（旧版路由层用截面残差方差标量广播到所有股票，过粗）。
+
+    用每只股票的时序残差 r_t - X_t @ factor_returns 算其方差，输出 (n_stocks,)。
+    样本不足（<20）时退化为截面均值，避免单股方差估计失真。
+    """
+    if X.size == 0 or not codes:
+        return np.zeros(0)
+    by_code = {s["code"]: s for s in stock_data}
+    sigmas = np.zeros(len(codes))
+    fallback_vals = []
+    for i, code in enumerate(codes):
+        s = by_code.get(code, {})
+        kline = s.get("kline", [])
+        if len(kline) < 30:
+            continue
+        arr = _safe_kline_arrays(kline)
+        if arr is None:
+            continue
+        closes = arr["close"]
+        rets = []
+        xrows = []
+        for t in range(25, len(closes) - n):
+            row = _stock_style_row(s, arr, t)
+            if row is None or closes[t] == 0:
+                continue
+            xrows.append(row)
+            rets.append(closes[t + n] / closes[t] - 1.0)
+        if len(xrows) < 20:
+            continue
+        Xt = _zscore_cols(np.array(xrows, dtype=np.float64))
+        rt = np.array(rets, dtype=np.float64)
+        resid = rt - Xt @ factor_returns
+        sigmas[i] = float(np.var(resid, ddof=max(1, len(resid) - len(factor_returns) - 1)))
+        fallback_vals.append(sigmas[i])
+    mean_v = float(np.mean(fallback_vals)) if fallback_vals else 0.0
+    sigmas = np.where(sigmas > 0, sigmas, mean_v)
+    return sigmas
+
+
+def _safe_kline_arrays(kline: list[dict]):
+    """安全转换 K 线，失败返回 None（隔离单股异常不影响整组）。"""
+    try:
+        return kline_to_arrays(kline)
+    except Exception:
+        return None
+
+
+def _stock_style_row(s: dict, arr: dict, t: int):
+    """取某股 t 时刻的风格因子行（与 build_style_panel 截面一致）。"""
+    mom = compute_factor_series("momentum", arr)
+    vol = compute_factor_series("volatility", arr)
+    m = series_at(mom, t)
+    v = series_at(vol, t)
+    quote = s.get("quote", {})
+    turnover = quote.get("turnover")
+    pe = quote.get("pe")
+    pb = quote.get("pb")
+    if any(x is None for x in [m, v, turnover, pe, pb]) or pe == 0 or pb == 0:
+        return None
+    return [m, v, turnover, 1.0 / pe, 1.0 / pb]
+
+
+def value_at_risk(returns: np.ndarray, weights: np.ndarray | None = None,
+                  alpha: float = 0.05) -> dict:
+    """VaR（历史模拟法）：组合收益分布的 alpha 分位数。
+
+    returns: (n_periods,) 组合收益时序，或 (n_periods, n_assets) 个股收益时序
+    weights: 个股收益时需传权重，组合收益时为 None
+    alpha: 置信水平尾部（0.05 = 95% VaR）
+    """
+    arr = np.asarray(returns, dtype=np.float64)
+    if arr.ndim == 2 and weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        port = arr @ w
+    else:
+        port = arr
+    port = port[~np.isnan(port)]
+    if len(port) < 30:
+        return {"var": 0.0, "cvar": 0.0, "n": len(port), "warning": "样本不足，需≥30"}
+    var = float(-np.quantile(port, alpha))
+    cvar = float(-np.mean(port[port <= np.quantile(port, alpha)]))
+    return {"var": var, "cvar": cvar, "n": len(port), "alpha": alpha}
+
+
+def conditional_var(returns: np.ndarray, weights: np.ndarray | None = None,
+                     alpha: float = 0.05) -> float:
+    """CVaR/Expected Shortfall：尾部均值。便捷封装，仅返回数值。"""
+    return value_at_risk(returns, weights, alpha)["cvar"]

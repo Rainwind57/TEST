@@ -1,0 +1,27 @@
+# 量化研究平台一键启动（P2-11 可复现环境）
+# docker compose up -d → 后端 + 前端同时起，数据卷持久化
+services:
+  backend:
+    build: ./backend
+    container_name: quant-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # 数据库与模型持久化（容器重建不丢）
+      - backend-data:/app/data
+    environment:
+      - QUANT_JWT_SECRET=${QUANT_JWT_SECRET:-change-me-in-production}
+      - QUANT_CORS_ORIGINS=${QUANT_CORS_ORIGINS:-http://localhost:5173}
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: quant-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend-data:

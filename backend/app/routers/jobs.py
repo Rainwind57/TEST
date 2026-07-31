@@ -16,7 +16,7 @@ from .optimize import OptimizeBody
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 _VALID_KINDS = ("select", "backtest", "factor-regression",
-                "ml-evaluate", "ml-train", "ml-backtest", "optimize")
+                "ml-evaluate", "ml-train", "ml-backtest", "ml-optimize", "optimize")
 
 
 class JobSubmitBody(BaseModel):
@@ -100,6 +100,13 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
             ev = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
             meta = await loop.run_in_executor(None, ml.train_final_model, dataset, cfg.modelType)
             return {"model": meta, "evaluation": ev}
+        jobs.submit(jid, _run())
+    elif kind == "ml-optimize":
+        async def _run():
+            dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist, use_snapshot=cfg.useSnapshot)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)
         jobs.submit(jid, _run())
     else:  # ml-backtest
         from .ml import MLBacktestBody

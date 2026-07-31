@@ -99,6 +99,15 @@ def init_db():
         created_at TEXT NOT NULL,
         finished_at TEXT
     )""")
+    # 调度器运行记录：旧版 _last_run/_last_signals 纯内存，重启即丢、无法审计。
+    cur.execute("""CREATE TABLE IF NOT EXISTS scheduler_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        success INTEGER NOT NULL,
+        payload TEXT,
+        error TEXT
+    )""")
 
     # 多用户：为研究资产表加 user_id 列（ALTER 兼容旧库）
     _ensure_column(cur, "saved_strategies", "user_id", "INTEGER DEFAULT 0")
@@ -416,6 +425,64 @@ def _parse_job_row(row):
         pass
     try:
         d["result"] = json.loads(d["result"]) if d.get("result") else None
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return d
+
+
+# ---------------- 调度器运行记录（scheduler_runs 表） ----------------
+
+def log_scheduler_run(task: str, success: bool, payload: dict | None = None,
+                      error: str | None = None) -> None:
+    """写一条调度器运行记录（_last_run/_last_signals 的持久化镜像）。"""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO scheduler_runs (task, ts, success, payload, error) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task, datetime.datetime.now().isoformat(),
+         1 if success else 0,
+         _json_dumps(payload) if payload is not None else None,
+         error)
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_scheduler_runs(limit: int = 20) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, task, ts, success, payload, error FROM scheduler_runs "
+        "ORDER BY id DESC LIMIT ?",
+        (max(1, min(limit, 100)),)
+    ).fetchall()
+    conn.close()
+    import json
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d["payload"]) if d.get("payload") else None
+        except (json.JSONDecodeError, TypeError):
+            pass
+        out.append(d)
+    return out
+
+
+def get_last_scheduler_run(task: str) -> dict | None:
+    """取某个任务最近一次运行记录（供 monitor 接口在内存态丢失后兜底）。"""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, task, ts, success, payload, error FROM scheduler_runs "
+        "WHERE task = ? ORDER BY id DESC LIMIT 1",
+        (task,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    import json
+    d = dict(row)
+    try:
+        d["payload"] = json.loads(d["payload"]) if d.get("payload") else None
     except (json.JSONDecodeError, TypeError):
         pass
     return d

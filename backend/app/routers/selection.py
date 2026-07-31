@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-from .. import adapters, db, ml
+from .. import adapters, db, ml, backtest_event
 from .auth import require_user_id
 from ..factors import (
     FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, composite_score,
@@ -89,7 +89,8 @@ class FilterSpec(BaseModel):
 class SelectBody(BaseModel):
     board: str = "all"
     poolSize: int = 200
-    factors: list[FactorSpec]
+    factors: list[FactorSpec] = []   # 旧版固定规格加权（key/weight/direction）
+    expression: str | None = None    # P1-6 表达式引擎：传表达式时优先于 factors
     topN: int = 20
     filters: FilterSpec = FilterSpec()
 
@@ -225,8 +226,17 @@ async def run_select(body: SelectBody):
         for idx, row in enumerate(scored_rows):
             row[uf_key] = scores[idx]
 
-    specs = [{"key": s.key, "weight": s.weight, "direction": s.direction} for s in body.factors]
-    scored = composite_score(scored_rows, specs)
+    # P1-6 表达式引擎：传 expression 时用安全 AST 求值，替代固定规格 composite_score
+    from .. import factor_expr
+    if body.expression:
+        scores = factor_expr.evaluate_expression(body.expression, scored_rows)
+        for idx, row in enumerate(scored_rows):
+            row["score"] = scores[idx]
+            row["factorDetail"] = {"expression": body.expression}
+        scored = scored_rows
+    else:
+        specs = [{"key": s.key, "weight": s.weight, "direction": s.direction} for s in body.factors]
+        scored = composite_score(scored_rows, specs)
     scored.sort(key=lambda r: r["score"], reverse=True)
     for rank, row in enumerate(scored, start=1):
         row["rank"] = rank
@@ -475,6 +485,95 @@ async def run_backtest(body: BacktestBody):
         "config": body.model_dump(),
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
     }
+
+
+class EventBacktestBody(BaseModel):
+    """事件驱动回测（P1-9）：具体下单时序 + 撮合 + 流动性约束。
+
+    与分层回测互补：分层评价因子，事件驱动验证策略的可实盘性。
+    signal: momentum_breakout（动量突破买入、回落卖出）| mean_reversion（均值回归）
+    """
+    board: str = "all"
+    poolSize: int = 20
+    signal: str = "momentum_breakout"
+    factor: str = "momentum"
+    threshold: float = 0.05  # 信号阈值
+    hist: int = 180
+    initialCash: float = 1_000_000.0
+    commissionRate: float = 0.00025
+    stampDuty: float = 0.001
+    slippage: float = 0.001
+    applyCost: bool = True
+    maxVolumePct: float = 0.10
+    maxPositionPct: float = 0.20
+    tradeQty: int = 1000
+
+
+@router.post("/backtest-event")
+async def run_event_backtest(body: EventBacktestBody):
+    """事件驱动回测：逐 bar 撮合 + T+1 + 涨跌停 + 流动性约束（P1-9）。"""
+    try:
+        pool = await adapters.fetch_market_list(body.board, body.poolSize)
+    except Exception as e:
+        raise HTTPException(502, f"候选池获取失败: {e}")
+    codes = [r["code"] for r in pool]
+    sem = asyncio.Semaphore(15)
+    kline_by_code = {}
+
+    async def fetch_one(code):
+        async with sem:
+            try:
+                kl = await adapters.fetch_kline(code, body.hist)
+                return code, kl
+            except Exception:
+                return code, []
+    fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
+    for code, kl in fetched:
+        if len(kl) >= 40:
+            kline_by_code[code] = kl
+    if len(kline_by_code) < 3:
+        raise HTTPException(422, "有效股票样本不足，需≥3 只且历史≥40 日")
+
+    cfg = backtest_event.EventBacktestConfig(
+        initial_cash=body.initialCash, commission_rate=body.commissionRate,
+        stamp_duty=body.stampDuty, slippage=body.slippage, apply_cost=body.applyCost,
+        max_volume_pct=body.maxVolumePct, max_position_pct=body.maxPositionPct,
+    )
+    bt = backtest_event.EventBacktest(cfg, kline_by_code)
+
+    # 预计算每只股票因子序列
+    factor_series = {}
+    for code in kline_by_code:
+        arr = kline_to_arrays(kline_by_code[code])
+        factor_series[code] = compute_factor_series(body.factor, arr)
+
+    def signal_fn(date, prev, state):
+        orders = []
+        for code in kline_by_code:
+            fseries = factor_series.get(code)
+            if fseries is None:
+                continue
+            idx = bt._date_idx_by_code[code].get(date)
+            if idx is None:
+                continue
+            val = series_at(fseries, idx)
+            if val is None:
+                continue
+            pos = state["positions"].get(code, {})
+            cur_qty = pos.get("qty", 0)
+            if body.signal == "momentum_breakout":
+                if val > body.threshold and cur_qty == 0:
+                    orders.append(backtest_event.Order(code=code, side="buy", qty=body.tradeQty))
+                elif val < -body.threshold and cur_qty > 0:
+                    orders.append(backtest_event.Order(code=code, side="sell", qty=cur_qty))
+            elif body.signal == "mean_reversion":
+                if val < -body.threshold and cur_qty == 0:
+                    orders.append(backtest_event.Order(code=code, side="buy", qty=body.tradeQty))
+                elif val > body.threshold and cur_qty > 0:
+                    orders.append(backtest_event.Order(code=code, side="sell", qty=cur_qty))
+        return orders
+
+    return bt.run(signal_fn)
 
 
 def _equity_curve(returns: list[float]) -> list[float]:

@@ -354,6 +354,116 @@ def train_final_model(dataset: dict, model_type: str = "gbdt") -> dict:
     return meta
 
 
+def optimize_model(dataset: dict, model_type: str = "lightgbm",
+                   n_splits: int = 5, gap: int = 5,
+                   n_trials: int = 30, progress_cb=None) -> dict:
+    """Optuna 对 ML 模型超参寻优（旧版 Optuna 仅接因子回测，ML 调参未闭环）。
+
+    目标 = 时序 Walk-Forward 最后一折 OOS Sharpe（按调仓日聚合多空），
+    杜绝全样本调参后宣称高收益。返回 {best_params, oos_metrics, is_metrics, trials}，
+    并把超参+指标写 ml_models/<ts>_opt.json 作实验追踪。
+    """
+    import optuna
+    X_raw = dataset["features"]
+    y = dataset["target"]
+    dates = dataset["dates"]
+    n = len(y)
+    splits = purged_walk_forward_split(n, n_splits=n_splits, gap=gap)
+    if not splits:
+        raise ValueError("样本不足以做时序交叉验证")
+
+    # 取最后一折作 OOS、之前所有折作 IS（与 optimize.py 的 IS/OOS 切分思路一致）
+    train_idx, test_idx = splits[-1]
+    if len(train_idx) < 50 or len(test_idx) < 10:
+        raise ValueError("最后一折样本不足，需更多数据或减小 gap/n_splits")
+
+    def _eval_oos_sharpe(params: dict) -> float:
+        """用 IS 段训练、OOS 段评估，返回 OOS Sharpe。"""
+        try:
+            pp = _fit_preprocess(X_raw[train_idx])
+            Xtr = _apply_preprocess(X_raw[train_idx], pp)
+            Xte = _apply_preprocess(X_raw[test_idx], pp)
+            ytr, yte = y[train_idx], y[test_idx]
+            m = _build_model(model_type, params)
+            m.fit(Xtr, ytr)
+            pred = m.predict(Xte)
+            oos_records = [(dates[test_idx[j]], float(pred[j]), float(yte[j]))
+                           for j in range(len(test_idx))]
+            return _oos_sharpe_by_date(oos_records)
+        except Exception:
+            return -1e9
+
+    def _objective(trial: optuna.Trial) -> float:
+        if model_type == "lightgbm":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
+                "max_depth": trial.suggest_int("max_depth", -1, 8),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 127, step=8),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            }
+        else:  # gbdt
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 400, step=50),
+                "max_depth": trial.suggest_int("max_depth", 2, 6),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            }
+        return _eval_oos_sharpe(params)
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    for i in range(n_trials):
+        if progress_cb:
+            progress_cb(i + 1, n_trials)
+        study.optimize(_objective, n_trials=1, catch=(Exception,))
+
+    best_params = study.best_params if study.best_trial else {}
+    # 用最优参数重算 IS/OOS 指标
+    pp = _fit_preprocess(X_raw[train_idx])
+    Xtr = _apply_preprocess(X_raw[train_idx], pp)
+    Xte = _apply_preprocess(X_raw[test_idx], pp)
+    ytr, yte = y[train_idx], y[test_idx]
+    best_model = _build_model(model_type, best_params)
+    best_model.fit(Xtr, ytr)
+    pred_is = best_model.predict(Xtr)
+    pred_oos = best_model.predict(Xte)
+    is_sharpe = _oos_sharpe_by_date(
+        [(dates[train_idx[j]], float(pred_is[j]), float(ytr[j])) for j in range(len(train_idx))])
+    oos_sharpe = _oos_sharpe_by_date(
+        [(dates[test_idx[j]], float(pred_oos[j]), float(yte[j])) for j in range(len(test_idx))])
+    oos_ic = _pearson(pred_oos, yte)
+    oos_rank_ic = _spearman(pred_oos, yte)
+
+    trials = [
+        {"number": t.number, "value": t.value, "params": t.params}
+        for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+    result = {
+        "modelType": model_type,
+        "bestParams": best_params,
+        "isSharpe": is_sharpe,
+        "oosSharpe": oos_sharpe,
+        "oosIc": oos_ic,
+        "oosRankIc": oos_rank_ic,
+        "splitDate": dates[test_idx[0]] if len(test_idx) else None,
+        "nTrials": len(trials),
+        "trials": trials,
+    }
+
+    # 实验追踪：超参 + 指标落盘（旧版模型仅文件名时间戳，无法回溯参数）
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        with open(os.path.join(ML_DIR, f"opt_{ts}.json"), "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return result
+
+
 def list_models() -> list[dict]:
     out = []
     if not os.path.isdir(ML_DIR):
@@ -372,11 +482,34 @@ def delete_model(mid: str) -> bool:
     return False
 
 
-def _build_model(model_type: str):
+def _build_model(model_type: str, params: dict | None = None):
+    """构建模型。旧版仅 sklearn GBDT 且超参硬编码（200/4/0.05）；
+    现新增 lightgbm（已在 requirements 声明却从未接线）并支持外部传超参。
+
+    params 非空时用于 Optuna 调参寻优；为空时用合理默认值。
+    """
+    p = params or {}
     if model_type == "gbdt":
         return GradientBoostingRegressor(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, random_state=42,
+            n_estimators=int(p.get("n_estimators", 200)),
+            max_depth=int(p.get("max_depth", 4)),
+            learning_rate=float(p.get("learning_rate", 0.05)),
+            subsample=float(p.get("subsample", 0.8)),
+            random_state=42,
+        )
+    if model_type == "lightgbm":
+        import lightgbm as lgb  # 已在 requirements 声明，首次调用才 import
+        return lgb.LGBMRegressor(
+            n_estimators=int(p.get("n_estimators", 300)),
+            max_depth=int(p.get("max_depth", -1)),
+            learning_rate=float(p.get("learning_rate", 0.05)),
+            num_leaves=int(p.get("num_leaves", 31)),
+            subsample=float(p.get("subsample", 0.8)),
+            colsample_bytree=float(p.get("colsample_bytree", 0.8)),
+            reg_alpha=float(p.get("reg_alpha", 0.0)),
+            reg_lambda=float(p.get("reg_lambda", 0.0)),
+            random_state=42,
+            verbose=-1,
         )
     raise ValueError(f"不支持的模型类型: {model_type}")
 
@@ -492,6 +625,8 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
 
     pool = await adapters.fetch_market_list(board, pool_size)
     # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
+    # 旧版直接引用未定义的 snap_keys 抛 NameError，使 score_latest 完全不可用
+    snap_keys = [k for k in feature_names if k in snap_set]
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
     sem = asyncio.Semaphore(15)

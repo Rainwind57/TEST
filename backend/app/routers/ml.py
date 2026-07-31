@@ -18,6 +18,7 @@ class EvalBody(BaseModel):
     nSplits: int = 5
     gap: int = 5
     useSnapshot: bool = False  # 追加 pe/pb/turniture 快照特征（含前视风险，探索用）
+    nTrials: int = 30  # ml-optimize 用（Optuna 试验数）
 
 
 @router.post("/evaluate")
@@ -58,6 +59,41 @@ async def train(body: EvalBody):
 @router.get("/models")
 def list_models():
     return ml.list_models()
+
+
+class OptimizeMlBody(BaseModel):
+    board: str = "all"
+    poolSize: int = 100
+    n: int = 5
+    hist: int = 240
+    modelType: str = "lightgbm"  # 默认启用已装的 lightgbm（旧版仅 gbdt）
+    nSplits: int = 5
+    gap: int = 5
+    nTrials: int = 30
+    useSnapshot: bool = False
+
+
+@router.post("/optimize")
+async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
+    """ML 超参寻优（Optuna + Walk-Forward OOS Sharpe）。
+
+    旧版 Optuna 仅接因子回测（optimize.optimize_backtest），ML _build_model
+    硬编码超参、无法自动寻优；此端点打通 ML 调参闭环，并落盘实验记录。
+    大数据集建议走 /api/jobs（kind=ml-optimize）。
+    """
+    try:
+        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist, use_snapshot=body.useSnapshot)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"数据集构建失败: {e}")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, ml.optimize_model, dataset, body.modelType, body.nSplits, body.gap, body.nTrials)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return result
 
 
 @router.delete("/models/{mid}")

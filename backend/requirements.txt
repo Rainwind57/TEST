@@ -11,3 +11,6 @@ joblib>=1.4
 apscheduler>=3.10
 optuna>=4.0
 cvxpy>=1.5
+# 测试依赖（P2-13）：核心数值函数单元测试 + numpy_factors 与 factors 数值一致性
+pytest>=8.0
+pytest-asyncio>=0.23

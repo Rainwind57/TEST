@@ -138,17 +138,25 @@ def _run_with(base: dict, full_hist: int, params: dict,
 
 
 def save_best_as_strategy(base_config: dict, best_params: dict, name: str) -> dict:
-    """把最优参数回写为策略（kind=backtest）。"""
+    """把最优参数回写为策略（kind=backtest）。
+
+    base_config 由前端传入，可能只含部分字段（OptimizeBody 有默认值），用 .get 兜底
+    避免缺键 KeyError。默认值与 OptimizeBody 保持一致。
+    """
     cfg = {
-        "board": base_config["board"],
-        "poolSize": best_params["poolSize"], "groups": best_params["groups"],
-        "n": best_params["n"], "hist": base_config["hist"],
-        "commissionRate": base_config["commissionRate"], "stampDuty": base_config["stampDuty"],
-        "slippage": base_config["slippage"], "benchmark": base_config["benchmark"],
-        "applyCost": base_config["applyCost"],
+        "board": base_config.get("board", "all"),
+        "poolSize": best_params.get("poolSize", 60),
+        "groups": best_params.get("groups", 5),
+        "n": best_params.get("n", 5),
+        "hist": base_config.get("hist", 180),
+        "commissionRate": base_config.get("commissionRate", 0.00025),
+        "stampDuty": base_config.get("stampDuty", 0.001),
+        "slippage": base_config.get("slippage", 0.001),
+        "benchmark": base_config.get("benchmark", "none"),
+        "applyCost": base_config.get("applyCost", True),
     }
     if base_config.get("modelId"):
         cfg["modelId"] = base_config["modelId"]
     else:
-        cfg["factor"] = base_config["factor"]
+        cfg["factor"] = base_config.get("factor", "momentum")
     return db.create_strategy(name, "backtest", cfg)
