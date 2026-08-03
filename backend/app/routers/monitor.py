@@ -21,7 +21,9 @@ def status():
 
 
 @router.post("/toggle")
-def toggle(body: ToggleBody):
+async def toggle(body: ToggleBody):
+    # async 必须：AsyncIOScheduler.start() 需运行中事件循环，
+    # 旧版同步路由在线程池跑 → get_event_loop() 抛错 → 前端 network error
     if body.enabled:
         scheduler.start()
     else:

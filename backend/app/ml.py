@@ -482,6 +482,43 @@ def delete_model(mid: str) -> bool:
     return False
 
 
+def load_model_meta(mid: str) -> dict | None:
+    """读取模型元数据（特征名、重要性、超参），供前端可视化与人工调参。"""
+    meta_path = os.path.join(ML_DIR, f"{mid}.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = None
+    else:
+        meta = None
+    path = os.path.join(ML_DIR, f"{mid}.joblib")
+    if not os.path.exists(path):
+        return None
+    try:
+        bundle = joblib.load(path)
+    except Exception:
+        return None
+    feature_names = bundle.get("feature_names", [])
+    model_type = bundle.get("model_type", "gbdt")
+    model = bundle.get("model")
+    # 提取特征重要性（GBDT/LightGBM 均有 feature_importances_）
+    importances = []
+    if model is not None and hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        importances = [{"feature": feature_names[i], "importance": float(imp[i])}
+                       for i in range(min(len(feature_names), len(imp)))]
+    result = {
+        "id": mid, "modelType": model_type, "featureNames": feature_names,
+        "featureImportance": sorted(importances, key=lambda x: x["importance"], reverse=True),
+    }
+    if meta:
+        result["trainedAt"] = meta.get("trainedAt")
+        result["nSamples"] = meta.get("nSamples")
+    return result
+
+
 def _build_model(model_type: str, params: dict | None = None):
     """构建模型。旧版仅 sklearn GBDT 且超参硬编码（200/4/0.05）；
     现新增 lightgbm（已在 requirements 声明却从未接线）并支持外部传超参。
@@ -614,8 +651,31 @@ def _load_model(mid: str) -> dict:
     return bundle
 
 
+def _apply_feature_weights(Xp: np.ndarray, feature_names: list[str],
+                           feature_weights: dict) -> np.ndarray:
+    """人工调参：按特征名对输入做权重缩放（GBDT 黑盒下最直观的干预手段）。
+
+    特征权重改变输入分布 → 决策树分裂路径变化 → 预测分排序变化。
+    """
+    if not feature_weights:
+        return Xp
+    Xw = Xp.copy()
+    for i, name in enumerate(feature_names):
+        w = feature_weights.get(name)
+        if w is not None:
+            Xw[:, i] = Xw[:, i] * float(w)
+    return Xw
+
+
+def _apply_threshold(preds: list[float], threshold: float | None) -> list[float]:
+    """人工调参：预测分整体偏移（单调变换，不影响排序；用于选股绝对分过滤）。"""
+    if not threshold:
+        return preds
+    return [p + float(threshold) for p in preds]
+
+
 async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
-                       progress_cb=None) -> list[dict]:
+                       progress_cb=None, adjust: dict | None = None) -> list[dict]:
     """加载落盘模型对候选池最新截面打分，返回按预测分降序的打分列表。"""
     bundle = _load_model(mid)
     feature_names = bundle["feature_names"]
@@ -663,7 +723,13 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
 
     X = np.array([r["fvals"] for r in collected], dtype=np.float64)
     Xp = _apply_preprocess(X, params)
+    if adjust:
+        Xp = _apply_feature_weights(Xp, feature_names, adjust.get("featureWeights") or {})
     preds = model.predict(Xp)
+    if adjust:
+        preds = _apply_threshold(preds.tolist(), adjust.get("threshold"))
+    else:
+        preds = preds.tolist()
     rows = [{"code": r["code"], "name": r["name"], "score": float(p)}
             for r, p in zip(collected, preds)]
     rows.sort(key=lambda x: x["score"], reverse=True)
@@ -676,7 +742,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                          n: int = 5, hist: int = 180, commission_rate: float = 0.00025,
                          stamp_duty: float = 0.001, slippage: float = 0.001,
                          benchmark: str = "none", apply_cost: bool = True,
-                         progress_cb=None) -> dict:
+                         progress_cb=None, adjust: dict | None = None) -> dict:
     """用落盘模型预测分作为截面信号做分层回测，响应结构与 /api/select/backtest 一致，
     前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。"""
     bundle = _load_model(mid)
@@ -804,6 +870,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             continue
 
         Xp = _apply_preprocess(np.array(cross_feats, dtype=np.float64), params)
+        if adjust:
+            Xp = _apply_feature_weights(Xp, feature_names, adjust.get("featureWeights") or {})
         preds = model.predict(Xp).tolist()
 
         ic = _pearson(preds, cross_rets)

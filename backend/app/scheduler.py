@@ -53,6 +53,7 @@ def start():
     _scheduler.add_job(_scan_signals, CronTrigger(hour=15, minute=10, day_of_week="mon-fri"))
     _scheduler.start()
     _enabled = True
+    db.set_scheduler_enabled(True)
 
 
 def stop():
@@ -61,6 +62,7 @@ def stop():
         _scheduler.shutdown(wait=False)
         _scheduler = None
     _enabled = False
+    db.set_scheduler_enabled(False)
 
 
 async def _load_trading_days() -> set[str]:

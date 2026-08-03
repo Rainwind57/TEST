@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import QuoteView from '../views/QuoteView.vue'
+import DataView from '../views/DataView.vue'
 import FactorView from '../views/FactorView.vue'
 import RegressionView from '../views/RegressionView.vue'
 import FactorRegressionView from '../views/FactorRegressionView.vue'
@@ -19,6 +20,7 @@ const routes = [
   { path: '/', redirect: '/quote' },
   { path: '/login', name: 'login', component: LoginView, meta: { label: '登录' } },
   { path: '/quote', name: 'quote', component: QuoteView, meta: { label: '行情' } },
+  { path: '/data', name: 'data', component: DataView, meta: { label: '数据市场' } },
   { path: '/factor', name: 'factor', component: FactorView, meta: { label: '因子' } },
   { path: '/regression', name: 'regression', component: RegressionView, meta: { label: '回归' } },
   { path: '/factor-regression', name: 'factor-regression', component: FactorRegressionView, meta: { label: '多因子回归' } },

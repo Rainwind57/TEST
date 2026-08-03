@@ -9,11 +9,31 @@ const { toast } = useToast()
 const loading = ref(false)
 const result = ref(null)
 
+const codesInput = ref('')
+const weightsInput = ref('')
+
 async function run() {
   loading.value = true
   try {
     result.value = await api.get('/risk/attribution')
-    toast('归因完成')
+    toast('持仓归因完成')
+  } catch (e) { toast(e.message) }
+  finally { loading.value = false }
+}
+
+async function runCustom() {
+  const codes = codesInput.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean)
+  if (!codes.length) { toast('请输入组合代码，逗号分隔'); return }
+  const weights = weightsInput.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean)
+  if (weights.length && weights.length !== codes.length) { toast('权重数量必须与代码数量一致'); return }
+  loading.value = true
+  try {
+    result.value = await api.post('/risk/attribution', {
+      codes,
+      weights: weights.length ? weights.map(Number) : null,
+      name: '自定义组合',
+    })
+    toast('自定义归因完成')
   } catch (e) { toast(e.message) }
   finally { loading.value = false }
 }
@@ -44,7 +64,16 @@ const contribOption = computed(() => {
   <div>
     <div class="card">
       <div class="card-head"><h3>Barra 风格风险归因</h3><span class="hint">对当前模拟盘持仓做方差分解</span></div>
-      <button class="btn-primary" :disabled="loading" @click="run">{{ loading ? '计算中…' : '运行归因' }}</button>
+      <button class="btn-primary" :disabled="loading" @click="run">{{ loading ? '计算中…' : '运行归因(模拟盘持仓)' }}</button>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>自定义组合归因</h3><span class="hint">传任意代码/权重组合，可复用选股结果或组合优化输出</span></div>
+      <div class="custom-inputs">
+        <div class="field grow"><label>代码（逗号分隔）</label><input v-model="codesInput" placeholder="如 600519,000001,300750" /></div>
+        <div class="field"><label>权重（可选，与代码一一对应）</label><input v-model="weightsInput" placeholder="如 0.5,0.3,0.2，留空为等权" /></div>
+      </div>
+      <button class="btn-primary sm" :disabled="loading" @click="runCustom">{{ loading ? '计算中…' : '自定义归因' }}</button>
     </div>
 
     <div v-if="result" class="card">
@@ -87,4 +116,9 @@ const contribOption = computed(() => {
 .kpi .l { color: var(--text-mute); font-size: 12px; margin-top: 4px; }
 .hint { color: var(--text-mute); font-size: 12px; font-weight: 400; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }
+.custom-inputs { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+.custom-inputs .field { margin-bottom: 0; }
+.custom-inputs .grow { flex: 2; min-width: 260px; }
+.custom-inputs input { width: 100%; }
+.btn-primary.sm { padding: 7px 16px; font-size: 13px; }
 </style>

@@ -414,6 +414,21 @@ SNAPSHOT_FACTORS = {
     # 质量类：ROA（新增，由总资产/净利润算）；北向资金类：个股持股比例（新增数据源）
     "roa": {"label": "ROA(%)", "group": "fundamental", "direction": 1, "format": "num"},
     "north_holding_pct": {"label": "北向持股比例(%)", "group": "moneyflow", "direction": 1, "format": "num"},
+    # 行业因子（需通过 adapters.fetch_sector_map 拉取）
+    "sector": {"label": "申万一级行业", "group": "sector", "direction": 0, "format": "categorical"},
+}
+
+# 行业因子（中性化用，非打分因子，不参与 composite_score 直接排序）
+SECTOR_FACTORS = {
+    "sector": {"label": "申万一级行业", "group": "sector"},
+}
+
+# 宏观因子（需通过 adapters.fetch_macro_indicator 拉取）
+MACRO_FACTORS = {
+    "cpi": {"label": "CPI当月同比(%)", "group": "macro", "direction": 0, "format": "pct"},
+    "ppi": {"label": "PPI当月同比(%)", "group": "macro", "direction": 0, "format": "pct"},
+    "pmi": {"label": "制造业PMI", "group": "macro", "direction": 0, "format": "num"},
+    "m2": {"label": "M2同比(%)", "group": "macro", "direction": 0, "format": "pct"},
 }
 
 _SNAPSHOT_FIELD_MAP = {
@@ -425,6 +440,7 @@ _SNAPSHOT_FIELD_MAP = {
     "gross_margin": "gross_margin", "debt_ratio": "debt_ratio",
     "eps": "eps", "bps": "bps",
     "roa": "roa", "north_holding_pct": "north_holding_pct",
+    "sector": "sector",
 }
 
 
@@ -438,6 +454,8 @@ def snapshot_factor_value(row: dict, key: str):
     if key == "bp":
         pb = row.get("pb")
         return None if not pb else 1 / pb
+    if key == "sector":
+        return row.get("sector", "")
     field = _SNAPSHOT_FIELD_MAP.get(key)
     return row.get(field) if field else None
 
@@ -481,6 +499,25 @@ def neutralized_zscore(values: list, exposures: list[list[float]]) -> list[float
     for k, i in enumerate(valid_idx):
         out[i] = z[k]
     return out
+
+
+def sector_dummies(codes: list[str], sector_map: dict[str, str]) -> list[list[float]]:
+    """将行业映射转为哑变量矩阵（一维行业，每列一个行业，每行只有一个1）。
+
+    用于 neutralized_zscore 的 exposures 参数，剥离行业影响。
+    """
+    unique_sectors = sorted(set(s for s in sector_map.values() if s))
+    if not unique_sectors:
+        return [[0.0] for _ in codes]
+    idx = {s: i for i, s in enumerate(unique_sectors)}
+    dummies = []
+    for code in codes:
+        s = sector_map.get(code, "")
+        row = [0.0] * len(unique_sectors)
+        if s in idx:
+            row[idx[s]] = 1.0
+        dummies.append(row)
+    return dummies
 
 
 def composite_score(rows: list[dict], specs: list[dict]) -> list[dict]:

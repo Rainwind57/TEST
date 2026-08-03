@@ -8,7 +8,8 @@ router = APIRouter(prefix="/api/intraday", tags=["intraday"])
 
 
 class IntradayBody(BaseModel):
-    code: str
+    code: str = ""
+    codes: list[str] | None = None   # 组合级分钟回测：传 codes 时对多标的批量执行
     period: str = "5"
     count: int = 240
     signalLookback: int = 10
@@ -21,10 +22,13 @@ class IntradayBody(BaseModel):
     stampDuty: float = 0.001
     slippage: float = 0.001
     applyCost: bool = True
+    saveArtifact: bool = False   # 回测结果落盘为中间结果
 
 
 @router.post("/backtest")
 async def backtest(body: IntradayBody):
+    if not body.code and not body.codes:
+        raise HTTPException(400, "code（单股）或 codes（组合）至少提供一个")
     cfg = intraday.IntradayConfig(
         code=body.code, period=body.period, count=body.count,
         signal_lookback=body.signalLookback, entry_threshold=body.entryThreshold,
@@ -34,6 +38,15 @@ async def backtest(body: IntradayBody):
         slippage=body.slippage, applyCost=body.applyCost,
     )
     try:
-        return await intraday.run_intraday_backtest(cfg)
+        if body.codes:
+            result = await intraday.run_intraday_pool_backtest(body.codes, cfg)
+        else:
+            result = await intraday.run_intraday_backtest(cfg)
     except Exception as e:
         raise HTTPException(502, f"分钟级回测失败: {e}")
+    if body.saveArtifact:
+        from .. import artifacts
+        meta = artifacts.save_artifact("intraday", result,
+                                       name=f"分钟回测-{body.code or '组合'}")
+        result["artifact"] = meta
+    return result

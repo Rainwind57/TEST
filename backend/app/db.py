@@ -108,6 +108,11 @@ def init_db():
         payload TEXT,
         error TEXT
     )""")
+    # P0修复：kv 配置表，用于持久化调度器开关等状态（重启后恢复）
+    cur.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""")
 
     # 多用户：为研究资产表加 user_id 列（ALTER 兼容旧库）
     _ensure_column(cur, "saved_strategies", "user_id", "INTEGER DEFAULT 0")
@@ -486,3 +491,27 @@ def get_last_scheduler_run(task: str) -> dict | None:
     except (json.JSONDecodeError, TypeError):
         pass
     return d
+
+
+# ---------------- settings 持久化（P0修复） ----------------
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+
+def get_scheduler_enabled() -> bool:
+    return get_setting("scheduler_enabled", "0") == "1"
+
+
+def set_scheduler_enabled(enabled: bool) -> None:
+    set_setting("scheduler_enabled", "1" if enabled else "0")

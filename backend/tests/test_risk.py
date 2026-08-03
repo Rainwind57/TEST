@@ -123,15 +123,16 @@ def test_estimate_specific_variances_per_stock():
     n = 120
     mk = lambda: (np.cumprod(1 + np.random.randn(n) * 0.02 + 0.001) * 10).tolist()
     sd = [
-        {"code": f"c{i}", "quote": {"turnover": 1.0, "pe": 15.0 + i, "pb": 2.0},
+        {"code": f"c{i}", "quote": {"turnover": 1.0, "pe": 15.0 + i, "pb": 2.0,
+                                    "mktCap": 100.0 + i, "debtRatio": 40.0 + i},
          "kline": [{"date": f"2024-{j // 28 + 1:02d}-{j % 28 + 1:02d}",
                     "open": c, "close": c, "high": c, "low": c, "volume": 1000}
                    for j, c in enumerate(mk())]}
         for i in range(3)
     ]
-    X = np.random.randn(3, 5)
+    X = np.random.randn(3, len(risk.STYLE_FACTORS))
     codes = ["c0", "c1", "c2"]
-    fr = np.random.randn(5)
+    fr = np.random.randn(len(risk.STYLE_FACTORS))
     se = risk.estimate_specific_variances(sd, X, codes, fr)
     assert len(se) == 3
     assert np.all(se >= 0)

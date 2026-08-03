@@ -68,16 +68,16 @@ const chartOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 30, top: 30, bottom: 50 },
     tooltip: { trigger: 'item' },
-    legend: { textStyle: { color: '#e6ebf5' }, bottom: 0 },
+    legend: { textStyle: { color: '#5b6675' }, bottom: 0 },
     xAxis: {
-      type: 'value', name: result.value.factorLabel, nameTextStyle: { color: '#7c89a8' },
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' },
-      splitLine: { lineStyle: { color: '#1c2238' } }
+      type: 'value', name: result.value.factorLabel, nameTextStyle: { color: '#8a94a6' },
+      axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' },
+      splitLine: { lineStyle: { color: '#e9edf5' } }
     },
     yAxis: {
-      type: 'value', name: `未来${result.value.n}日收益率`, nameTextStyle: { color: '#7c89a8' },
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' },
-      splitLine: { lineStyle: { color: '#1c2238' } }
+      type: 'value', name: `未来${result.value.n}日收益率`, nameTextStyle: { color: '#8a94a6' },
+      axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' },
+      splitLine: { lineStyle: { color: '#e9edf5' } }
     },
     series: [
       {

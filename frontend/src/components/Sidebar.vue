@@ -8,6 +8,7 @@ const route = useRoute()
 const auth = useAuthStore()
 const items = [
   { path: '/quote', label: '行情', icon: 'Q' },
+  { path: '/data', label: '数据市场', icon: 'D' },
   { path: '/factor', label: '因子', icon: 'F' },
   { path: '/regression', label: '回归', icon: 'R' },
   { path: '/factor-regression', label: '多因子回归', icon: 'M' },
@@ -103,7 +104,7 @@ nav { display: flex; flex-direction: column; gap: 4px; flex: 1; overflow-y: auto
   width: 22px; height: 22px;
   display: flex; align-items: center; justify-content: center;
   font-size: 11px; font-weight: 700;
-  background: rgba(255,255,255,.08);
+  background: rgba(30, 42, 70, .06);
   border-radius: 6px;
 }
 

@@ -14,20 +14,36 @@ import warnings
 
 from . import db
 
-# JWT 密钥：必须设置环境变量 QUANT_JWT_SECRET。未设时每次启动随机生成，
-# 杜绝旧版“固定字符串可被读源码伪造 token”的隐患（代价是重启后已签发 token 失效，
-# 对安全可接受）。生产部署务必设置 QUANT_JWT_SECRET。
+# JWT 密钥：优先读环境变量 QUANT_JWT_SECRET；未设时从 DB settings 表读取持久化密钥；
+# 都不存在时随机生成并持久化，避免重启后 token 全部失效（P2修复）。
 _JWT_ENV = os.environ.get("QUANT_JWT_SECRET")
 if _JWT_ENV:
     JWT_SECRET = _JWT_ENV
 else:
-    JWT_SECRET = secrets.token_hex(32)
-    warnings.warn(
-        "QUANT_JWT_SECRET 未设置，本次启动使用随机密钥（重启后所有 token 失效）；"
-        "生产环境必须设置该环境变量。",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+    try:
+        _saved = db.get_setting("jwt_secret", "")
+        if _saved:
+            JWT_SECRET = _saved
+        else:
+            JWT_SECRET = secrets.token_hex(32)
+            db.set_setting("jwt_secret", JWT_SECRET)
+    except Exception:
+        JWT_SECRET = secrets.token_hex(32)
+        warnings.warn(
+            "QUANT_JWT_SECRET 未设置且 DB 不可用，使用临时随机密钥（启动后 init_db 完成会自动持久化）",
+            RuntimeWarning, stacklevel=2,
+        )
+
+
+def ensure_secret_persisted() -> None:
+    """DB 初始化完成后调用：若密钥为临时生成且未持久化，则写入 settings 表。"""
+    if _JWT_ENV:
+        return
+    try:
+        if db.get_setting("jwt_secret", "") == "":
+            db.set_setting("jwt_secret", JWT_SECRET)
+    except Exception:
+        pass
 JWT_TTL = 7 * 24 * 3600  # 7 天
 
 

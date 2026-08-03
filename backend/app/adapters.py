@@ -5,6 +5,7 @@ import re
 import time
 import datetime
 import httpx
+from urllib.parse import urlencode
 from collections import OrderedDict
 
 from . import db
@@ -183,6 +184,10 @@ BOARD_MATCHERS = {
     "gem": lambda c: c.startswith(("300", "301")),
     "star": lambda c: c.startswith(("688", "689")),
     "bse": lambda c: c.startswith(("8", "920")),
+    # 指数/ETF（代码前缀匹配，需配合 fetch_index_list 拉取成分）
+    "hs300": lambda c: True,       # 沪深300（需从成分表过滤）
+    "zz500": lambda c: True,       # 中证500
+    "etf": lambda c: c.startswith(("sh51", "sz159")),
 }
 
 _SINA_HEADERS = {
@@ -299,15 +304,19 @@ async def fetch_eastmoney_market(board: str = "all", limit: int = 300) -> list[d
     """东方财富全市场/分板块行情快照（新浪降级 fallback）。
 
     单页拉取（pz=limit），字段与 _parse_sina_market_row 对齐；按 board 过滤。
+    多主机降级（push2 主站可能被网络拦截 → push2delay）。
     """
     fs = _EASTMONEY_FS.get(board, _EASTMONEY_FS["all"])
     matcher = BOARD_MATCHERS.get(board, BOARD_MATCHERS["all"])
     limit = max(1, min(limit, 3000))
-    url = ("https://push2.eastmoney.com/api/qt/clist/get"
-           f"?pn=1&pz={limit}&po=1&np=1&fltt=2&invt=2&fid=f6&fs={fs}"
-           f"&fields=f12,f13,f14,f2,f3,f5,f6,f8,f9,f23,f20,f21")
-    resp = await _http_get(url, 15)
-    rows = (resp.json() or {}).get("data", {}).get("diff") or []
+    try:
+        data = await _eastmoney_clist({
+            "pn": 1, "pz": limit, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+            "fid": "f6", "fs": fs, "fields": "f12,f13,f14,f2,f3,f5,f6,f8,f9,f23,f20,f21",
+        })
+        rows = (data or {}).get("data", {}).get("diff") or []
+    except Exception:
+        return []
     items = rows.values() if isinstance(rows, dict) else rows
     out = []
     seen: set[str] = set()
@@ -642,3 +651,408 @@ async def fetch_minute_kline(code: str, period: str = "5", count: int = 240) -> 
             continue
     _minute_cache[cache_key] = (time.time(), out)
     return out
+
+
+# ---------------- 东方财富 clist 多主机降级 ----------------
+
+_EASTMONEY_CLIST_HOSTS = ("push2.eastmoney.com", "push2delay.eastmoney.com")
+_EASTMONEY_HOST_OK: str | None = None  # 记录最近可用主机，避免每次分页都重试挂掉的主机
+
+
+async def _eastmoney_clist(params: dict) -> dict:
+    """调用东财 clist 接口，主/备用主机依次尝试（push2 主站可能被网络拦截）。"""
+    global _EASTMONEY_HOST_OK
+    last_err: Exception | None = None
+    hosts = list(_EASTMONEY_CLIST_HOSTS)
+    if _EASTMONEY_HOST_OK in hosts:
+        hosts.remove(_EASTMONEY_HOST_OK)
+        hosts.insert(0, _EASTMONEY_HOST_OK)
+    for host in hosts:
+        try:
+            url = f"https://{host}/api/qt/clist/get?{urlencode(params)}"
+            resp = await _http_get(url, 15)
+            _EASTMONEY_HOST_OK = host
+            return resp.json() or {}
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    return {}
+
+
+async def _eastmoney_clist_pages(fs: str, fields: str, fid: str = "f3",
+                                 page_size: int = 100, max_pages: int = 60) -> list[dict]:
+    """分页拉取东财 clist（pz 上限 100，需翻页）。返回去重后的原始行列表。"""
+    async def fetch_page(pn: int) -> list:
+        try:
+            data = await _eastmoney_clist({
+                "pn": pn, "pz": page_size, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                "fid": fid, "fs": fs, "fields": fields,
+            })
+            rows = (data.get("data") or {}).get("diff") or []
+            return rows.values() if isinstance(rows, dict) else rows
+        except Exception:
+            return []
+
+    pages: list[list] = [await fetch_page(1)]
+    if not pages[0]:
+        return []
+    pn = 2
+    while pn <= max_pages:
+        end = min(pn + 8, max_pages + 1)
+        batch = await asyncio.gather(*(fetch_page(p) for p in range(pn, end)))
+        got_any = False
+        for rows in batch:
+            if rows:
+                got_any = True
+            pages.append(rows)
+        pn = end
+        if not got_any:
+            break
+    seen: set[str] = set()
+    out = []
+    for rows in pages:
+        for item in rows:
+            key = str(item.get("f12", ""))
+            if key and key not in seen:
+                seen.add(key)
+                out.append(item)
+    return out
+
+
+# ---------------- 指数成分股（东方财富） ----------------
+
+_index_constituent_cache: dict[str, tuple[float, list[str]]] = {}
+INDEX_CACHE_TTL = 3600  # 1h，成分股变动低频
+
+# 指数 → 东财板块代码（fs=b:BKxxxx 拉成分，push2 实测有效）
+_INDEX_BOARD_MAP = {
+    "sh000300": "BK0500",   # 沪深300
+    "sh000905": "BK0701",   # 中证500
+}
+
+
+async def fetch_index_constituents(index_code: str) -> list[str]:
+    """拉取指数成分股列表（沪深300/中证500），返回 sh/sz 前缀代码列表。"""
+    cache_key = index_code
+    cached = _index_constituent_cache.get(cache_key)
+    if cached and time.time() - cached[0] < INDEX_CACHE_TTL:
+        return cached[1]
+
+    board = _INDEX_BOARD_MAP.get(index_code)
+    if not board:
+        return []
+
+    try:
+        rows = await _eastmoney_clist_pages(f"b:{board}", "f12,f13", max_pages=6)
+        codes = []
+        for item in rows:
+            code = _eastmoney_code(item.get("f12", ""), item.get("f13", 0))
+            if code:
+                codes.append(code)
+        _index_constituent_cache[cache_key] = (time.time(), codes)
+        return codes
+    except Exception:
+        return _index_constituent_cache.get(cache_key, (0, []))[1]
+
+
+# ---------------- 行业分类（东方财富） ----------------
+
+_sector_cache: dict[str, tuple[float, dict[str, str]]] = {}
+SECTOR_CACHE_TTL = 86400  # 24h，行业分类变动极低频
+
+
+async def fetch_sector_map() -> dict[str, str]:
+    """拉取全市场股票→行业映射（code → sector_name）。
+
+    返回 {sh600519: "食品饮料", ...}，用于行业因子/中性化。
+    """
+    cache_key = "sector_map"
+    cached = _sector_cache.get(cache_key)
+    if cached and time.time() - cached[0] < SECTOR_CACHE_TTL:
+        return cached[1]
+
+    try:
+        rows = await _eastmoney_clist_pages(
+            "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+            "f12,f13,f100", max_pages=70)
+        sector_map = {}
+        for item in rows:
+            code = _eastmoney_code(item.get("f12", ""), item.get("f13", 0))
+            sector = item.get("f100", "")
+            if code and sector:
+                sector_map[code] = sector
+        _sector_cache[cache_key] = (time.time(), sector_map)
+        return sector_map
+    except Exception:
+        return _sector_cache.get(cache_key, (0, {}))[1]
+
+
+# ---------------- 宏观数据（东方财富数据中心） ----------------
+
+# 指标 → (报表名, 取值字段, 单位)。字段名经真实响应核对：
+# CPI/PPI 用"同比"，PMI 用制造业指数，M2 用货币供应量同比。
+_MACRO_REPORTS = {
+    "CPI": ("RPT_ECONOMY_CPI", "NATIONAL_SAME", "同比%"),
+    "PPI": ("RPT_ECONOMY_PPI", "BASE_SAME", "同比%"),
+    "PMI": ("RPT_ECONOMY_PMI", "MAKE_INDEX", "指数"),
+    "M2": ("RPT_ECONOMY_CURRENCY_SUPPLY", "BASIC_CURRENCY_SAME", "同比%"),
+}
+
+
+async def fetch_macro_indicator(indicator: str) -> dict | None:
+    """拉取宏观指标（CPI/PPI/PMI/M2），返回最新一期值。"""
+    spec = _MACRO_REPORTS.get((indicator or "").strip().upper())
+    if not spec:
+        return None
+    report, value_field, unit = spec
+    url = (f"https://datacenter-web.eastmoney.com/api/data/v1/get"
+           f"?reportName={report}&columns=ALL&pageSize=1&sortColumns=REPORT_DATE&sortTypes=-1")
+    try:
+        resp = await _http_get(url, 10)
+        records = (resp.json() or {}).get("result", {}).get("data") or []
+        if not records:
+            return None
+        r = records[0]
+        return {
+            "indicator": (indicator or "").strip().upper(),
+            "value": r.get(value_field),
+            "date": r.get("REPORT_DATE") or r.get("REGULAR_DATE"),
+            "unit": unit,
+        }
+    except Exception:
+        return None
+
+
+# ---------------- 期货/期权行情（中金所→新浪 hq；商品→东财 ulist，双源保新鲜） ----------------
+
+_future_cache: dict[str, tuple[float, dict]] = {}
+FUTURE_CACHE_TTL = 30
+
+# 中金所品种（新浪 CFF_ 前缀实时新鲜）
+_CFF_FAMILIES = {"IF", "IH", "IC", "IM", "T", "TF", "TS"}
+
+# 商品期货品种 → 东财市场代码（113上期/114大商/115郑商/143广期）。
+# 新浪 hq.sinajs.cn 商品连续合约（RB0/AU0）实测返回 2024 年陈旧快照，改用东财 ulist。
+_FUTURE_MARKET: dict[str, int] = {}
+for _f in ("CU", "AL", "ZN", "PB", "NI", "SN", "AU", "AG", "RB", "HC", "SS", "WR",
+           "FU", "BU", "RU", "SP", "AO", "BR", "EC", "LU", "NR", "SC"):
+    _FUTURE_MARKET[_f] = 113
+for _f in ("A", "B", "C", "CS", "M", "Y", "P", "J", "JM", "I", "L", "V", "PP",
+           "EG", "PG", "RR", "LH", "EB", "JD", "FB", "BB"):
+    _FUTURE_MARKET[_f] = 114
+for _f in ("SR", "CF", "TA", "OI", "MA", "FG", "RM", "ZC", "SF", "SM", "AP", "CJ",
+           "CY", "UR", "SA", "PF", "PK", "PX", "SH", "WH", "PM", "RI", "LR", "JR", "RS", "RO"):
+    _FUTURE_MARKET[_f] = 115
+_FUTURE_MARKET["SI"] = 143
+_FUTURE_MARKET["LC"] = 143
+
+
+def _is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _future_secid(code: str) -> str:
+    """新浪期货代码（仅中金所使用）：IF2608 → CFF_IF2608。"""
+    c = code.strip().upper()
+    for prefix in ("CFF_", "NF_"):
+        if c.startswith(prefix):
+            c = c[len(prefix):]
+    family = c.rstrip("0123456789")
+    if family in _CFF_FAMILIES:
+        return f"CFF_{c}"
+    return f"{family[0]}{family[1:].lower()}0".upper() if family else c
+
+
+def _future_em_symbol(code: str) -> str | None:
+    """商品期货 → 东财 secid（如 113.au2612 / 113.rbm 主连）。
+
+    纯品种（au）或 X0（AU0）连续写法 → 东财主连 {family}m；带月份（au2612）原样。
+    """
+    c = (code or "").strip()
+    if not c:
+        return None
+    up = c.upper()
+    for prefix in ("CFF_", "NF_"):
+        if up.startswith(prefix):
+            up = up[len(prefix):]
+            c = c[len(prefix):]
+    family = up.rstrip("0123456789")
+    market = _FUTURE_MARKET.get(family)
+    if not market:
+        return None
+    if family == up or up.endswith("0"):
+        symbol = f"{family.lower()}m"          # 主连：rbm/aum/mm
+    else:
+        symbol = c if market == 115 else c.lower()   # 郑商所代码保留大写
+    return f"{market}.{symbol}"
+
+
+def _parse_sina_future(text: str) -> dict[str, dict]:
+    """解析新浪 hq.sinajs.cn 期货响应（中金所格式，parts[0]=最新价）。"""
+    out: dict[str, dict] = {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line.startswith("var hq_str_") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        secid = key.replace("var hq_str_", "").strip()
+        raw = raw.strip().strip(";").strip('"')
+        parts = raw.split(",")
+        if len(parts) < 15 or not parts[0] or not _is_number(parts[0]):
+            continue
+
+        def f(idx):
+            try:
+                return float(parts[idx])
+            except (IndexError, ValueError):
+                return 0.0
+
+        price = f(0)
+        if price <= 0:
+            continue
+        pre_settle = f(3) or f(1)
+        open_interest = f(14) if f(14) > 0 else f(12)
+        out[secid] = {
+            "name": secid, "code": secid,
+            "price": price, "preSettle": pre_settle, "preClose": pre_settle,
+            "open": f(2), "high": price, "low": price,
+            "volume": f(4), "amount": f(5), "openInterest": open_interest,
+            "changePct": (price / pre_settle - 1.0) if pre_settle > 0 else 0.0,
+        }
+    return out
+
+
+async def fetch_future_quotes(codes: list[str]) -> dict:
+    """期货实时行情。
+
+    - 中金所（IF/IH/IC/IM/T/TF/TS）→ 新浪 hq.sinajs.cn（实时新鲜，已验证）
+    - 商品期货 → 东财 push2delay ulist（fltt=2 自动按合约精度格式化，避免新浪陈旧快照）
+    codes 示例: ["IF2608", "rb2610", "au2612", "AU0"]
+    返回 {原代码: {name, price, preClose, open, high, low, volume, amount, openInterest, changePct}}
+    """
+    if not codes:
+        return {}
+    cache_key = ",".join(codes)
+    cached = _future_cache.get(cache_key)
+    if cached and time.time() - cached[0] < FUTURE_CACHE_TTL:
+        return cached[1]
+
+    out: dict[str, dict] = {}
+    sina_codes, em_codes = [], []
+    for c in codes:
+        up = c.strip().upper()
+        for prefix in ("CFF_", "NF_"):
+            if up.startswith(prefix):
+                up = up[len(prefix):]
+        if up.rstrip("0123456789") in _CFF_FAMILIES:
+            sina_codes.append(c)
+        else:
+            em_codes.append(c)
+
+    # 中金所 → 新浪
+    if sina_codes:
+        secids = [_future_secid(c) for c in sina_codes]
+        try:
+            resp = await _http_get(f"https://hq.sinajs.cn/list={','.join(secids)}",
+                                   10, headers=_SINA_HEADERS)
+            parsed = _parse_sina_future(resp.content.decode("gbk", errors="ignore"))
+            for c in sina_codes:
+                secid = _future_secid(c)
+                if secid in parsed:
+                    out[c] = parsed[secid]
+        except Exception:
+            pass
+
+    # 商品 → 东财 ulist
+    if em_codes:
+        em_secids: list[str] = []
+        em2orig: dict[str, str] = {}
+        for c in em_codes:
+            s = _future_em_symbol(c)
+            if s:
+                em_secids.append(s)
+                # 响应按 f12（symbol，无市场前缀）回填原始代码
+                em2orig.setdefault(s.split(".", 1)[1], c)
+        if em_secids:
+            url = ("https://push2delay.eastmoney.com/api/qt/ulist.np/get"
+                   f"?fltt=2&invt=2&secids={','.join(em_secids)}"
+                   "&fields=f2,f3,f4,f5,f6,f12,f14,f15,f16,f17,f18")
+            try:
+                resp = await _http_get(url, 10)
+                rows = (resp.json() or {}).get("data", {}).get("diff") or []
+                for item in (rows.values() if isinstance(rows, dict) else rows):
+                    orig = em2orig.get(item.get("f12", ""))
+                    if not orig:
+                        continue
+                    price = _num(item, "f2")
+                    if price is None:
+                        continue
+                    out[orig] = {
+                        "name": item.get("f14", orig), "code": orig,
+                        "price": price,
+                        "preSettle": _num(item, "f18") or 0.0,
+                        "preClose": _num(item, "f18") or 0.0,
+                        "open": _num(item, "f17") or 0.0,
+                        "high": _num(item, "f15") or 0.0,
+                        "low": _num(item, "f16") or 0.0,
+                        "volume": _num(item, "f5") or 0.0,
+                        "amount": _num(item, "f6") or 0.0,
+                        "openInterest": 0.0,   # ulist 无持仓量字段，K线接口可提供
+                        "changePct": _num(item, "f3") or 0.0,
+                    }
+            except Exception:
+                pass
+
+    _future_cache[cache_key] = (time.time(), out)
+    return out
+
+
+async def fetch_future_kline(code: str, days: int = 150) -> list[dict]:
+    """期货日K线（新浪 InnerFuturesNewService）。
+
+    code 示例: "IF2608"（无需交易所前缀）
+    返回 [{date, open, close, high, low, volume, openInterest}]
+    """
+    symbol = code.strip().upper()
+    for prefix in ("CFF_", "NF_"):
+        if symbol.startswith(prefix):
+            symbol = symbol[len(prefix):]
+            break
+    url = (f"https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+           f"var%20t=/InnerFuturesNewService.getDailyKLine?symbol={symbol}")
+    try:
+        resp = await _http_get(url, 10, headers=_SINA_HEADERS)
+        text = resp.text
+        if "(" not in text or not text.endswith(");"):
+            return []
+        payload = text[text.index("(") + 1: text.rindex(")")]
+        rows = json.loads(payload)
+        out = []
+        for r in rows[-days:]:
+            try:
+                out.append({
+                    "date": r["d"],
+                    "open": float(r["o"]), "high": float(r["h"]),
+                    "low": float(r["l"]), "close": float(r["c"]),
+                    "volume": float(r["v"]),
+                    "openInterest": float(r.get("p") or 0),
+                })
+            except (TypeError, ValueError, KeyError):
+                continue
+        return out
+    except Exception:
+        return []
+
+
+# ---------------- 行业/宏观因子集成端点（供路由层调用） ----------------
+
+async def get_sector_exposures(codes: list[str]) -> list[list[float]]:
+    """对一组股票代码返回行业哑变量矩阵，供选股中性化使用。"""
+    from .factors import sector_dummies
+    sector_map = await fetch_sector_map()
+    return sector_dummies(codes, sector_map)

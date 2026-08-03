@@ -37,6 +37,19 @@ def optimize_backtest(body: OptimizeBody):
         result = optimize.optimize_backtest(body.model_dump(), body.nTrials)
     except Exception as e:
         raise HTTPException(502, f"寻优失败: {e}")
+    # 寻优结果落盘：最优参数可被"保存策略→回测→组合→风险"链路复用
+    from .. import artifacts
+    try:
+        meta = artifacts.save_artifact("optimize", {
+            "baseConfig": body.model_dump(),
+            "bestParams": result.get("bestParams", {}),
+            "isMetrics": result.get("isMetrics"),
+            "oosMetrics": result.get("oosMetrics"),
+            "splitDate": result.get("splitDate"),
+        }, name=f"寻优-{body.factor or body.modelId}")
+        result["artifact"] = meta
+    except Exception:
+        pass
     return result
 
 

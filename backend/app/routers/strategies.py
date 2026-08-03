@@ -7,10 +7,11 @@ from ..auth import get_user_id_from_auth
 from .auth import require_user_id
 from . import selection as sel
 from .intraday import IntradayBody
+from . import ml as ml_router
 
 router = APIRouter(prefix="/api", tags=["strategies"])
 
-VALID_KINDS = ("select", "backtest", "regression", "intraday")
+VALID_KINDS = ("select", "backtest", "regression", "intraday", "ml")
 
 
 def _uid(request: Request) -> int:
@@ -73,6 +74,9 @@ async def run_strategy(sid: int, request: Request):
                 slippage=ib.slippage, applyCost=ib.applyCost,
             )
             return await intraday.run_intraday_backtest(icfg)
+        if kind == "ml":
+            from .ml import MLBacktestBody
+            return await ml_router.ml_backtest(MLBacktestBody(**cfg))
     except TypeError as e:
         raise HTTPException(400, f"策略配置字段不匹配: {e}")
     raise HTTPException(400, f"暂不支持一键运行 kind={kind}")
@@ -93,13 +97,15 @@ def list_user_factors(request: Request):
 
 @router.post("/user-factors")
 def save_user_factor(body: UserFactorBody, uid: int = Depends(require_user_id)):
-    if body.kind != "composite":
-        raise HTTPException(400, "目前仅支持 composite 类型自定义因子")
+    if body.kind not in ("composite", "model"):
+        raise HTTPException(400, "目前仅支持 composite / model 类型自定义因子")
     if not body.name.strip():
         raise HTTPException(400, "name 不能为空")
-    factors = (body.definition or {}).get("factors") or []
-    if not factors:
-        raise HTTPException(400, "definition.factors 不能为空")
+    definition = body.definition or {}
+    if body.kind == "composite" and not definition.get("factors"):
+        raise HTTPException(400, "composite 类型需要 definition.factors")
+    if body.kind == "model" and not definition.get("modelId"):
+        raise HTTPException(400, "model 类型需要 definition.modelId")
     return db.create_user_factor(body.name.strip(), body.kind, body.definition, uid)
 
 

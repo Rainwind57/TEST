@@ -52,8 +52,8 @@ const klineOption = computed(() => {
   return {
     backgroundColor: 'transparent',
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: dates, axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' } },
-    yAxis: { scale: true, axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    xAxis: { type: 'category', data: dates, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' } },
+    yAxis: { scale: true, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
     series: [{
       type: 'candlestick', data: values,

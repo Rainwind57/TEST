@@ -43,8 +43,8 @@ const equityOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 20, top: 20, bottom: 40 },
     tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: labels, axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' } },
-    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    xAxis: { type: 'category', data: labels, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' } },
+    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     series: [{
       type: 'line', data: values, showSymbol: false, smooth: true,
       lineStyle: { color: '#4f8cff', width: 2 },

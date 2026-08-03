@@ -1,18 +1,18 @@
 :root {
-  --bg: #0a0e1a;
-  --bg-2: #111827;
-  --card: #161b2c;
-  --card-2: #1c2238;
-  --border: #2a3354;
-  --text: #e6ebf5;
-  --text-dim: #7c89a8;
-  --text-mute: #4a5578;
-  --up: #ff4d4f;
-  --down: #21c08b;
-  --flat: #8b95b0;
-  --accent: #4f8cff;
+  --bg: #f4f6fb;
+  --bg-2: #eef1f7;
+  --card: #ffffff;
+  --card-2: #f6f8fc;
+  --border: #e3e8f1;
+  --text: #1e2635;
+  --text-dim: #5b6675;
+  --text-mute: #8f9aab;
+  --up: #e5484d;
+  --down: #0aa36e;
+  --flat: #9aa4b5;
+  --accent: #2f6bff;
   --accent-2: #6c5ce7;
-  --shadow: 0 4px 24px rgba(0, 0, 0, .4);
+  --shadow: 0 4px 20px rgba(24, 40, 90, .08);
   --sidebar-w: 220px;
 }
 
@@ -24,7 +24,7 @@ html, body, #app {
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  background: radial-gradient(ellipse at top, #1a2140 0%, var(--bg) 60%);
+  background: radial-gradient(ellipse at top, #e9edf6 0%, var(--bg) 60%);
   color: var(--text);
   line-height: 1.5;
 }
@@ -44,6 +44,24 @@ input, select {
   outline: none;
   transition: border-color .2s, box-shadow .2s;
 }
+
+/* 复选框/单选框：恢复原生方框+勾号，用主题色（上面 appearance:none 会剥掉原生外观） */
+input[type="checkbox"], input[type="radio"] {
+  appearance: auto;
+  -webkit-appearance: auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+input[type="checkbox"]:disabled, input[type="radio"]:disabled { cursor: not-allowed; opacity: .5; }
 input:hover, select:hover { border-color: var(--accent); }
 input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,140,255,.15); }
 input::placeholder { color: var(--text-mute); }
@@ -171,7 +189,7 @@ tbody tr:last-child td { border-bottom: none; }
 .price-change { display: flex; flex-direction: column; gap: 2px; font-size: 15px; font-weight: 600; font-family: "SF Mono", "Roboto Mono", monospace; }
 
 .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-.grid-4 .item { background: rgba(0,0,0,.2); border: 1px solid var(--border); padding: 14px; border-radius: 10px; }
+.grid-4 .item { background: rgba(30, 42, 70, .035); border: 1px solid var(--border); padding: 14px; border-radius: 10px; }
 .grid-4 .item .label { font-size: 11px; color: var(--text-mute); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .5px; }
 .grid-4 .item .value { font-size: 17px; font-weight: 600; font-family: "SF Mono", "Roboto Mono", monospace; }
 

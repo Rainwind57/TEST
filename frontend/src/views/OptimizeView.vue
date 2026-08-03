@@ -211,5 +211,5 @@ onMounted(async () => {
 .kpi .l { color: var(--text-mute); font-size: 12px; margin-top: 4px; }
 .hint { color: var(--text-mute); font-size: 12px; font-weight: 400; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }
-.warn-box { background: rgba(255,180,84,.08); border: 1px solid #ffb45444; border-radius: 8px; padding: 10px; margin-top: 10px; font-size: 13px; color: #ffd9a0; }
+.warn-box { background: rgba(255,180,84,.12); border: 1px solid #ffb45455; border-radius: 8px; padding: 10px; margin-top: 10px; font-size: 13px; color: #7a5200; }
 </style>

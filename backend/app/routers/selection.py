@@ -25,6 +25,7 @@ router = APIRouter(prefix="/api/select", tags=["select"])
 BOARD_LABELS = {
     "all": "全部A股", "sh_main": "沪市主板", "sz_main": "深市主板",
     "gem": "创业板", "star": "科创板", "bse": "北交所",
+    "hs300": "沪深300", "zz500": "中证500", "etf": "ETF基金",
 }
 
 BENCHMARKS = {
@@ -93,9 +94,18 @@ class SelectBody(BaseModel):
     expression: str | None = None    # P1-6 表达式引擎：传表达式时优先于 factors
     topN: int = 20
     filters: FilterSpec = FilterSpec()
+    startDate: str | None = None     # 选股时间区间下界（YYYY-MM-DD），不传则用最新截面
+    endDate: str | None = None       # 选股时间区间上界（YYYY-MM-DD）
+    codes: list[str] | None = None   # 自定义股票池（传 code 列表则跳过 market_list 拉取）
+    modelId: str | None = None       # ML 模型 ID：指定时用模型预测分选股（与 factors 二选一）
+    adjustId: str | None = None      # 调参配置 artifact id（配合 modelId 使用）
+    adjust: dict | None = None       # 或直接传 {featureWeights, threshold}
+    saveArtifact: bool = False       # 选股结果落盘为中间结果，供下一环节（回测/组合/风险）复用
 
 
-async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int = 260) -> dict:
+async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int = 260,
+                                end_date: str | None = None,
+                                start_date: str | None = None) -> dict:
     sem = asyncio.Semaphore(15)
 
     async def one(code):
@@ -107,8 +117,20 @@ async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int =
                 return code, {}
             if len(kline) < 25:
                 return code, {}
-            i = len(kline) - 1
-            vals = {key: FACTORS[key]["calc"](kline, i) for key in keys if key in FACTORS}
+            # 时间区间过滤：指定 startDate/endDate 时在区间内取最后一个截面
+            if start_date or end_date:
+                filtered = kline
+                if start_date:
+                    filtered = [r for r in filtered if r["date"] >= start_date]
+                if end_date:
+                    filtered = [r for r in filtered if r["date"] <= end_date]
+                if len(filtered) < 25:
+                    return code, {}
+                i = len(filtered) - 1
+                vals = {key: FACTORS[key]["calc"](filtered, i) for key in keys if key in FACTORS}
+            else:
+                i = len(kline) - 1
+                vals = {key: FACTORS[key]["calc"](kline, i) for key in keys if key in FACTORS}
             return code, vals
 
     results = await asyncio.gather(*(one(c) for c in codes))
@@ -117,6 +139,39 @@ async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int =
 
 @router.post("")
 async def run_select(body: SelectBody):
+    # ML 模型选股：指定 modelId 时直接用模型预测分排名（打通 ML→选股→模拟盘/盯盘）
+    if body.modelId:
+        adjust = body.adjust or None
+        if body.adjustId and not adjust:
+            from .. import artifacts as _artifacts
+            rec = _artifacts.load_artifact(body.adjustId)
+            if not rec:
+                raise HTTPException(404, f"调参配置不存在: {body.adjustId}")
+            adjust = rec.get("payload")
+        try:
+            rows = await ml.score_latest(body.modelId, body.board, body.poolSize, adjust=adjust)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"ML 打分失败: {e}")
+        result = {
+            "universeSize": len(rows),
+            "candidateSize": len(rows),
+            "rows": rows[: max(1, body.topN)],
+            "modelId": body.modelId,
+        }
+        if body.saveArtifact:
+            from .. import artifacts
+            meta = artifacts.save_artifact("select", {
+                "codes": [r["code"] for r in rows[: max(1, body.topN)]],
+                "rows": rows[: max(1, body.topN)],
+                "config": body.model_dump(),
+            }, name=f"ML选股-{body.modelId}")
+            result["artifact"] = meta
+        return result
+
     if not body.factors:
         raise HTTPException(400, "请至少选择一个因子")
     builtin_keys = set(FACTORS) | set(SNAPSHOT_FACTORS)
@@ -136,10 +191,20 @@ async def run_select(body: SelectBody):
             raise HTTPException(400, f"自定义因子不存在: {s.key}")
         uf_defs[s.key] = uf["definition"]
 
-    try:
-        pool = await adapters.fetch_market_list(body.board, body.poolSize)
-    except Exception as e:
-        raise HTTPException(502, f"候选池获取失败: {e}")
+    # 自定义股票池：传 codes 时跳过 market_list 拉取，直接用指定代码
+    if body.codes:
+        pool = [{"code": c, "name": c} for c in body.codes]
+    elif body.board in ("hs300", "zz500"):
+        index_map = {"hs300": "sh000300", "zz500": "sh000905"}
+        constituents = await adapters.fetch_index_constituents(index_map[body.board])
+        if not constituents:
+            raise HTTPException(502, f"获取{body.board}成分股失败")
+        pool = [{"code": c, "name": c} for c in constituents[:body.poolSize]]
+    else:
+        try:
+            pool = await adapters.fetch_market_list(body.board, body.poolSize)
+        except Exception as e:
+            raise HTTPException(502, f"候选池获取失败: {e}")
 
     f = body.filters
     candidates = []
@@ -166,9 +231,21 @@ async def run_select(body: SelectBody):
     tech_keys = [s.key for s in body.factors if s.key in FACTORS]
     snap_keys = [s.key for s in body.factors if s.key in SNAPSHOT_FACTORS]
 
+    # 行业因子：勾选时拉取申万一级行业映射，填充到每只候选股
+    if "sector" in snap_keys:
+        try:
+            sector_map = await adapters.fetch_sector_map()
+            for row in candidates:
+                row["sector"] = sector_map.get(row["code"], "")
+        except Exception:
+            for row in candidates:
+                row["sector"] = ""
+
     tech_values = {}
     if tech_keys:
-        tech_values = await _fetch_technical_values([c["code"] for c in candidates], tech_keys)
+        tech_values = await _fetch_technical_values([c["code"] for c in candidates], tech_keys,
+                                                     end_date=body.endDate,
+                                                     start_date=body.startDate)
 
     # 资金流/财务快照因子：行情快照不含，勾选时逐股批量拉取（并发 10）
     EXTRA_FINANCE = {"roe", "net_margin", "revenue_yoy", "profit_yoy",
@@ -241,10 +318,21 @@ async def run_select(body: SelectBody):
     for rank, row in enumerate(scored, start=1):
         row["rank"] = rank
 
-    return {
+    result = {
         "universeSize": len(pool), "candidateSize": len(candidates),
         "rows": scored[: max(1, body.topN)],
     }
+    # 选股结果落盘：供"选股→回测/组合/风险"下一环节读取 codes 复用
+    if body.saveArtifact:
+        from .. import artifacts
+        top_codes = [r["code"] for r in scored[: max(1, body.topN)]]
+        meta = artifacts.save_artifact("select", {
+            "codes": top_codes,
+            "rows": scored[: max(1, body.topN)],
+            "config": body.model_dump(),
+        }, name=f"选股-{body.board}")
+        result["artifact"] = meta
+    return result
 
 
 class BacktestBody(BaseModel):
@@ -262,12 +350,14 @@ class BacktestBody(BaseModel):
     applyCost: bool = True
     startDate: str | None = None      # 调仓日下界（YYYY-MM-DD，含），用于 IS/OOS 不重叠切分
     endDate: str | None = None        # 调仓日上界（YYYY-MM-DD，含）
+    codes: list[str] | None = None    # 自定义股票池（传 code 列表则跳过 market_list 拉取）
+    saveArtifact: bool = False        # 回测结果落盘为中间结果，供组合/风险环节复用
 
 
 @router.post("/backtest")
 async def run_backtest(body: BacktestBody):
     # 模型策略：指定 modelId 时走 ML 信号分层回测，响应结构与技术因子回测一致，
-    # 前端图表零成本复用（打通“主回测页导入模型”，旧版 modelId 无门可入）。
+    # 前端图表零成本复用（打通”主回测页导入模型”，旧版 modelId 无门可入）。
     if body.modelId:
         try:
             res = await ml.backtest_model(
@@ -275,6 +365,11 @@ async def run_backtest(body: BacktestBody):
                 body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
             )
             res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
+            if body.saveArtifact:
+                from .. import artifacts
+                meta = artifacts.save_artifact("backtest", res,
+                                               name=f"ML回测-{body.modelId}")
+                res["artifact"] = meta
             return res
         except FileNotFoundError as e:
             raise HTTPException(404, str(e))
@@ -293,7 +388,10 @@ async def run_backtest(body: BacktestBody):
         raise HTTPException(400, f"未知基准: {body.benchmark}")
 
     try:
-        pool = await adapters.fetch_market_list(body.board, body.poolSize)
+        if body.codes:
+            pool = [{"code": c, "name": c} for c in body.codes]
+        else:
+            pool = await adapters.fetch_market_list(body.board, body.poolSize)
     except Exception as e:
         raise HTTPException(502, f"候选池获取失败: {e}")
 
@@ -475,7 +573,7 @@ async def run_backtest(body: BacktestBody):
     ic_stats = information_coefficient_stats([p["ic"] for p in ic_series], ppy)
     mean_rank_ic = mean([p["rankIc"] for p in ic_series])
 
-    return {
+    result = {
         "factorLabel": FACTORS[body.factor]["label"], "groups": groups, "n": n,
         "meanIc": ic_stats["meanIc"], "meanRankIc": mean_rank_ic,
         "icWinRate": ic_stats["icWinRate"], "icIr": ic_stats["icIr"],
@@ -485,6 +583,11 @@ async def run_backtest(body: BacktestBody):
         "config": body.model_dump(),
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
     }
+    if body.saveArtifact:
+        from .. import artifacts
+        meta = artifacts.save_artifact("backtest", result, name=f"回测-{body.factor}")
+        result["artifact"] = meta
+    return result
 
 
 class EventBacktestBody(BaseModel):

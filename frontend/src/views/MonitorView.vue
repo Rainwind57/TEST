@@ -67,7 +67,7 @@ onMounted(refresh)
         <span class="hint" v-else>已关闭</span>
       </div>
       <div class="warn-box">
-        自动调仓仅限模拟盘，默认关闭，需显式开启。节假日未做日历过滤，仅排除周末。
+        自动调仓仅限模拟盘，默认开启（重启保持状态）。交易日历基于K线数据动态推断，非周末且不在节假日则执行。
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-primary" :disabled="loading" @click="toggle">
@@ -83,7 +83,7 @@ onMounted(refresh)
     </div>
 
     <div class="card">
-      <h3>盯盘信号（watchlist 前20）</h3>
+      <h3>盯盘信号（全量扫描）</h3>
       <div v-if="!signals.length" class="empty-hint">暂无信号，调度器运行后 15:10 生成</div>
       <table v-else class="data-table">
         <thead><tr><th>代码</th><th>动量</th><th>RSI</th><th>信号</th></tr></thead>
@@ -110,7 +110,7 @@ onMounted(refresh)
 .data-table th, .data-table td { border: 1px solid var(--border); padding: 9px 11px; text-align: left; }
 .data-table th { background: var(--card-2); color: var(--text-dim); font-weight: 600; }
 .warn-tag { background: #ffb454; color: #1a1a2e; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 600; }
-.warn-box { background: rgba(255,180,84,.08); border: 1px solid #ffb45444; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #ffd9a0; }
+.warn-box { background: rgba(255,180,84,.12); border: 1px solid #ffb45455; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #7a5200; }
 .status-row { margin-top: 12px; display: flex; gap: 24px; font-size: 13px; color: var(--text-dim); }
 .hint { color: var(--text-mute); font-size: 12px; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }

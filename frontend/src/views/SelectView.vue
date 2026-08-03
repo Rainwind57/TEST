@@ -51,7 +51,9 @@ const groupedCatalog = computed(() => {
 const selectedFactors = computed(() =>
   catalog.value
     .filter(f => factorState[f.key]?.checked)
-    .map(f => ({ key: f.key, weight: Number(factorState[f.key].weight) || 1, direction: factorState[f.key].direction }))
+    // direction=0 的因子（行业/宏观等）仅作信息展示，不参与加权打分
+    .filter(f => Number(factorState[f.key].direction) !== 0)
+    .map(f => ({ key: f.key, weight: Number(factorState[f.key].weight) || 1, direction: Number(factorState[f.key].direction) }))
 )
 
 const factorColumns = computed(() =>
@@ -152,6 +154,28 @@ function gotoBacktest() {
   router.push('/backtest')
 }
 
+// 选股结果落盘为中间结果（artifact），供回测/组合/风险环节读取 codes 复用
+const savingArtifact = ref(false)
+const savedArtifactId = ref('')
+async function saveArtifact() {
+  if (!result.value) return
+  savingArtifact.value = true
+  try {
+    const meta = await api.post('/artifacts', {
+      kind: 'select',
+      payload: {
+        codes: result.value.rows.map(r => r.code),
+        rows: result.value.rows,
+        config: { board: board.value, poolSize: Number(poolSize.value), topN: Number(topN.value) },
+      },
+      name: `选股-${board.value}-${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+    })
+    savedArtifactId.value = meta.id
+    toast(`已保存中间结果：${meta.id}`)
+  } catch (e) { toast(e.message) }
+  finally { savingArtifact.value = false }
+}
+
 onMounted(loadCatalog)
 </script>
 
@@ -191,10 +215,11 @@ onMounted(loadCatalog)
           <div class="group-title">{{ GROUP_LABELS[group] || group }}</div>
           <div class="factor-chip" v-for="f in list" :key="f.key">
             <label class="checkbox-field"><input type="checkbox" v-model="factorState[f.key].checked" /> {{ f.label }}</label>
-            <input class="weight-input" type="number" step="0.1" v-model="factorState[f.key].weight" :disabled="!factorState[f.key].checked" title="权重" />
-            <select class="direction-select" v-model.number="factorState[f.key].direction" :disabled="!factorState[f.key].checked">
+            <input class="weight-input" type="number" step="0.1" v-model="factorState[f.key].weight" :class="{ dim: !factorState[f.key].checked }" title="权重（未勾选不参与，可提前编辑）" />
+            <select class="direction-select" v-model.number="factorState[f.key].direction" :class="{ dim: !factorState[f.key].checked }">
               <option :value="1">正向</option>
               <option :value="-1">反向</option>
+              <option v-if="factorState[f.key].direction === 0" :value="0">不参与</option>
             </select>
           </div>
         </div>
@@ -221,6 +246,8 @@ onMounted(loadCatalog)
         <input class="cash-input" v-model="totalCash" type="number" placeholder="买入总资金" />
         <button class="btn-primary" :disabled="applying" @click="buyIntoPortfolio">一键买入模拟盘(等权)</button>
         <button class="btn-ghost" @click="gotoBacktest">用该股池回测</button>
+        <button class="btn-ghost" :disabled="savingArtifact" @click="saveArtifact">{{ savingArtifact ? '保存中…' : '保存为中间结果' }}</button>
+        <span v-if="savedArtifactId" class="hint">{{ savedArtifactId }}</span>
       </div>
       <table>
         <thead>
@@ -266,6 +293,7 @@ onMounted(loadCatalog)
 }
 .weight-input { width: 60px; padding: 6px 8px; }
 .direction-select { width: 66px; padding: 6px 8px; }
+.factor-chip .dim { opacity: .45; }
 .run-row { display: flex; align-items: center; gap: 14px; padding: 16px 20px 20px; flex-wrap: wrap; }
 
 .apply-row { display: flex; align-items: center; gap: 12px; padding: 16px 22px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }

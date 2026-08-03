@@ -128,3 +128,53 @@ async def run_intraday_backtest(cfg: IntradayConfig) -> dict:
         "nBars": len(kline),
         "period": cfg.period,
     }
+
+
+async def run_intraday_pool_backtest(codes: list[str], cfg: IntradayConfig) -> dict:
+    """组合级分钟回测（P2-3）：多标的共享同一日内策略参数，各自独立进出场。
+
+    返回每只股票的明细 + 组合汇总（总 PnL/笔数/胜率/per-trade Sharpe）。
+    组合不调仓（各股独立全仓笔），聚焦"多标的日内策略批量评估"。
+    """
+    if not codes:
+        return {"error": "codes 不能为空"}
+    if len(codes) > 50:
+        return {"error": "组合标的过多，单次最多 50 只"}
+
+    per_code: list[dict] = []
+    for code in codes:
+        c = IntradayConfig(
+            code=code, period=cfg.period, count=cfg.count,
+            signal_lookback=cfg.signal_lookback, entry_threshold=cfg.entry_threshold,
+            take_profit=cfg.take_profit, stop_loss=cfg.stop_loss,
+            shares_per_trade=cfg.shares_per_trade, max_trades=cfg.max_trades,
+            commissionRate=cfg.commissionRate, stampDuty=cfg.stampDuty,
+            slippage=cfg.slippage, applyCost=cfg.applyCost,
+        )
+        try:
+            res = await run_intraday_backtest(c)
+            per_code.append({"code": code, **res})
+        except Exception as e:
+            per_code.append({"code": code, "error": str(e)})
+
+    all_trades = [t for pc in per_code if "trades" in pc for t in pc["trades"]]
+    returns = [t["pnl"] / (t["entry_price"] * t["shares"])
+               for t in all_trades if t["entry_price"] * t["shares"] > 0]
+    total_invest = sum(t["entry_price"] * t["shares"] for t in all_trades)
+    cost_buy = (cfg.commissionRate + cfg.slippage) if cfg.applyCost else 0.0
+    cost_sell = (cfg.commissionRate + cfg.stampDuty + cfg.slippage) if cfg.applyCost else 0.0
+    metrics = {
+        "nCodes": len(codes),
+        "effectiveCodes": sum(1 for pc in per_code if "error" not in pc),
+        "nTrades": len(all_trades),
+        "winRate": sum(1 for r in returns if r > 0) / len(returns) if returns else 0.0,
+        "totalPnl": sum(t["pnl"] for t in all_trades),
+        "totalInvest": total_invest,
+        "totalReturn": (sum(t["pnl"] for t in all_trades) / total_invest) if total_invest > 0 else 0.0,
+        "avgPnl": mean(returns) if returns else 0.0,
+        "sharpe": sharpe_ratio(returns, periods_per_year=1) if returns else 0.0,
+        "costRate": (cost_buy + cost_sell) if cfg.applyCost else 0.0,
+        "applyCost": cfg.applyCost,
+        "tPlus1": True,
+    }
+    return {"perCode": per_code, "metrics": metrics, "period": cfg.period, "pool": True}

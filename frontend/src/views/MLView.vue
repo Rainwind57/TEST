@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import api, { longTask, downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
@@ -29,6 +29,44 @@ const scoring = ref('')
 const scoreResult = ref(null)
 const btLoading = ref('')
 const btResult = ref(null)
+
+// ---- 人工调参（特征权重 / 阈值） ----
+const adjustPanel = ref('')
+const adjustMeta = ref(null)
+const featureWeights = reactive({})
+const threshold = ref(null)
+const lastAdjustId = ref('')
+
+async function openAdjust(m) {
+  if (adjustPanel.value === m.id) { adjustPanel.value = ''; return }
+  adjustPanel.value = m.id
+  lastAdjustId.value = ''
+  threshold.value = null
+  try {
+    adjustMeta.value = await api.get(`/ml/models/${m.id}/params`)
+    for (const k of Object.keys(featureWeights)) delete featureWeights[k]
+    for (const f of adjustMeta.value.featureNames || []) featureWeights[f] = 1
+  } catch (e) { toast(e.message); adjustPanel.value = '' }
+}
+
+function adjustPayload() {
+  const fw = {}
+  for (const [k, v] of Object.entries(featureWeights)) {
+    const num = Number(v)
+    if (k && v !== '' && v !== null && isFinite(num)) fw[k] = num
+  }
+  const th = (threshold.value === '' || threshold.value === null || threshold.value === undefined)
+    ? null : Number(threshold.value)
+  return { featureWeights: fw, threshold: th }
+}
+
+async function saveAdjust(m) {
+  try {
+    const res = await api.post(`/ml/models/${m.id}/adjust`, { ...adjustPayload(), saveArtifact: true })
+    lastAdjustId.value = res.adjustId || ''
+    toast(lastAdjustId.value ? `调参配置已保存：${lastAdjustId.value}` : '调参已应用（未保存）')
+  } catch (e) { toast(e.message) }
+}
 
 function evalConfig() {
   return {
@@ -98,14 +136,17 @@ function gotoBacktest(m) {
   router.push('/backtest')
 }
 
-// 用模型对候选池最新截面打分（ML→选股闭环）
+// 用模型对候选池最新截面打分（ML→选股闭环，支持人工调参权重/阈值）
 async function runScore(m) {
   scoring.value = m.id
   scoreResult.value = null
   try {
-    scoreResult.value = await longTask('/ml/score', {
-      modelId: m.id, board: board.value, poolSize: Number(poolSize.value),
-    })
+    const payload = { modelId: m.id, board: board.value, poolSize: Number(poolSize.value) }
+    if (adjustPanel.value === m.id) {
+      const adj = adjustPayload()
+      if (Object.keys(adj.featureWeights).length || adj.threshold !== null) payload.adjust = adj
+    }
+    scoreResult.value = await longTask('/ml/score', payload)
     toast(`打分完成，共 ${scoreResult.value.length} 只`)
   } catch (e) { toast(e.message) }
   finally { scoring.value = '' }
@@ -239,12 +280,33 @@ onUnmounted(() => { pollActive = false })
             <td>
               <button class="btn-ghost sm" :disabled="scoring===m.id" @click="runScore(m)">{{ scoring===m.id ? '打分中…' : '打分选股' }}</button>
               <button class="btn-ghost sm" :disabled="btLoading===m.id" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
+              <button class="btn-ghost sm" @click="openAdjust(m)">{{ adjustPanel===m.id ? '收起调参' : '调参' }}</button>
               <button class="btn-ghost sm" @click="gotoBacktest(m)">去主回测</button>
               <button class="btn-ghost sm danger" @click="deleteModel(m.id)">删除</button>
             </td>
           </tr>
         </tbody>
       </table>
+      <div v-if="adjustPanel && adjustMeta" class="adjust-box">
+        <div class="card-head">
+          <h4>人工调参：{{ adjustPanel }}</h4>
+          <span class="hint">调整特征权重或预测阈值，保存后打分/回测即时生效</span>
+        </div>
+        <div class="adj-threshold">
+          <label>预测阈值偏移</label>
+          <input v-model="threshold" type="number" step="0.01" placeholder="默认 0" />
+        </div>
+        <div class="adj-features">
+          <div class="adj-row" v-for="f in (adjustMeta.featureNames || [])" :key="f">
+            <span class="adj-name" :title="f">{{ f }}</span>
+            <input class="adj-weight" v-model="featureWeights[f]" type="number" step="0.1" min="0" />
+          </div>
+        </div>
+        <div class="panel-toolbar">
+          <button class="btn-primary sm" @click="saveAdjust({ id: adjustPanel })">保存调参配置</button>
+          <span v-if="lastAdjustId" class="hint">已保存 adjustId：{{ lastAdjustId }}（打分/回测自动生效）</span>
+        </div>
+      </div>
     </div>
 
     <div v-if="scoreResult" class="card">
@@ -291,4 +353,12 @@ onUnmounted(() => { pollActive = false })
 .muted { color: var(--text-mute); font-size: 12px; }
 .btn-ghost.sm.danger { color: #ff6b6b; }
 .btn-ghost.sm { padding: 4px 10px; font-size: 12px; }
+.adjust-box { border-top: 1px solid var(--border); padding: 16px 22px; }
+.adj-threshold { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+.adj-threshold input { width: 120px; }
+.adj-features { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; max-height: 260px; overflow: auto; }
+.adj-row { display: flex; align-items: center; gap: 8px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.adj-name { flex: 1; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.adj-weight { width: 70px; }
+.panel-toolbar { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
 </style>

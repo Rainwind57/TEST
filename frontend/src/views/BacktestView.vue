@@ -47,6 +47,24 @@ const modelOptions = ref([])
 const showSave = ref(false)
 const strategyName = ref('')
 
+// 从中间结果（选股 artifact）读取自定义股池，回测直接使用该 codes
+const artifactInput = ref('')
+const artifactCodes = ref([])
+const loadingArtifact = ref(false)
+async function loadArtifact() {
+  const aid = artifactInput.value.trim()
+  if (!aid) { toast('请输入中间结果 ID'); return }
+  loadingArtifact.value = true
+  try {
+    const rec = await api.get('/artifacts/' + aid)
+    const codes = rec.payload?.codes || []
+    if (!codes.length) { toast('该中间结果不含股票代码'); return }
+    artifactCodes.value = codes
+    toast(`已载入 ${codes.length} 只股票（${rec.name || ''}）`)
+  } catch (e) { toast(e.message) }
+  finally { loadingArtifact.value = false }
+}
+
 async function loadFactorOptions() {
   const data = await api.get('/select/factors')
   factorOptions.value = data.filter(f => f.kline)
@@ -65,6 +83,7 @@ const backtestConfig = () => {
     commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
     slippage: Number(slippage.value),
   }
+  if (artifactCodes.value.length) cfg.codes = artifactCodes.value
   if (strategySource.value === 'model') {
     cfg.modelId = modelId.value
   } else {
@@ -126,8 +145,8 @@ const groupBarOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 30, top: 30, bottom: 40 },
     tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: data.map(d => `G${d.group}`), axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' } },
-    yAxis: { type: 'value', name: `平均未来${result.value.n}日收益`, nameTextStyle: { color: '#7c89a8' }, axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', formatter: v => (v * 100).toFixed(1) + '%' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    xAxis: { type: 'category', data: data.map(d => `G${d.group}`), axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' } },
+    yAxis: { type: 'value', name: `平均未来${result.value.n}日收益`, nameTextStyle: { color: '#8a94a6' }, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6', formatter: v => (v * 100).toFixed(1) + '%' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     series: [{ type: 'bar', data: data.map(d => d.avgReturn), itemStyle: { color: p => (p.value >= 0 ? '#ff4d4f' : '#21c08b') } }]
   }
 })
@@ -139,9 +158,9 @@ const icLineOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 30, top: 40, bottom: 60 },
     tooltip: { trigger: 'axis' },
-    legend: { textStyle: { color: '#e6ebf5' }, top: 0 },
-    xAxis: { type: 'category', data: s.map(d => d.date), axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 } },
-    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    legend: { textStyle: { color: '#5b6675' }, top: 0 },
+    xAxis: { type: 'category', data: s.map(d => d.date), axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6', rotate: 45 } },
+    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     series: [
       { name: 'IC', type: 'line', data: s.map(d => d.ic), showSymbol: false, lineStyle: { color: '#4f8cff', width: 2 } },
       { name: 'RankIC', type: 'line', data: s.map(d => d.rankIc), showSymbol: false, lineStyle: { color: '#6c5ce7', width: 2 } }
@@ -160,9 +179,9 @@ const longShortOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 30, top: 40, bottom: 60 },
     tooltip: { trigger: 'axis' },
-    legend: { textStyle: { color: '#e6ebf5' }, top: 0 },
-    xAxis: { type: 'category', data: s.map(d => d.date), axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 } },
-    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', formatter: v => (v * 100).toFixed(0) + '%' }, splitLine: { lineStyle: { color: '#1c2238' } } },
+    legend: { textStyle: { color: '#5b6675' }, top: 0 },
+    xAxis: { type: 'category', data: s.map(d => d.date), axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6', rotate: 45 } },
+    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6', formatter: v => (v * 100).toFixed(0) + '%' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     series
   }
 })
@@ -229,6 +248,11 @@ onMounted(async () => {
         <select v-model="benchmark"><option v-for="b in BENCH_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option></select>
       </div>
       <button class="btn-primary" :disabled="loading" @click="runBacktest">{{ loading ? '回测中…' : '运行分层回测' }}</button>
+    </div>
+    <div class="panel-toolbar" style="margin-top:8px">
+      <div class="field grow"><label>中间结果 ID（选股页保存的 artifact）</label><input v-model="artifactInput" placeholder="留空则用上方板块/规模拉取候选池" /></div>
+      <button class="btn-ghost" :disabled="loadingArtifact" @click="loadArtifact">{{ loadingArtifact ? '载入中…' : '载入股池' }}</button>
+      <span v-if="artifactCodes.length" class="hint">已用 {{ artifactCodes.length }} 只自定义股池（{{ artifactCodes.slice(0,3).join(',') }}…）</span>
     </div>
     <div class="panel-toolbar" style="margin-top:8px">
       <div class="field"><label><input type="checkbox" v-model="applyCost" /> 启用交易成本</label></div>

@@ -63,14 +63,14 @@ const returnLineOption = computed(() => {
     backgroundColor: 'transparent',
     grid: { left: 60, right: 30, top: 40, bottom: 60 },
     tooltip: { trigger: 'axis' },
-    legend: { textStyle: { color: '#e6ebf5' }, top: 0 },
+    legend: { textStyle: { color: '#5b6675' }, top: 0 },
     xAxis: {
       type: 'category', data: p.map(d => d.date),
-      axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8', rotate: 45 }
+      axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6', rotate: 45 }
     },
     yAxis: {
-      type: 'value', axisLine: { lineStyle: { color: '#2a3354' } }, axisLabel: { color: '#7c89a8' },
-      splitLine: { lineStyle: { color: '#1c2238' } }
+      type: 'value', axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' },
+      splitLine: { lineStyle: { color: '#e9edf5' } }
     },
     series: result.value.keys.map((k, idx) => ({
       name: result.value.summary[idx].label, type: 'line', showSymbol: false,

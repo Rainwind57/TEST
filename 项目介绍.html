@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>量化研究平台 · 项目介绍与使用手册</title>
+<style>
+  :root {
+    --bg: #f4f6fb; --card: #ffffff; --border: #e3e8f1;
+    --text: #1e2635; --dim: #5b6675; --mute: #8f9aab;
+    --accent: #2f6bff; --accent2: #6c5ce7; --up: #e5484d; --down: #0aa36e;
+    --shadow: 0 4px 20px rgba(24,40,90,.08);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(ellipse at top, #e9edf6 0%, var(--bg) 60%);
+    color: var(--text); line-height: 1.7; padding-bottom: 80px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+  header.hero {
+    padding: 56px 24px 40px; text-align: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff; margin-bottom: 32px;
+  }
+  header.hero h1 { font-size: 30px; font-weight: 800; letter-spacing: 1px; }
+  header.hero p { margin-top: 10px; font-size: 15px; opacity: .92; }
+  header.hero .tags { margin-top: 16px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+  header.hero .tags span { background: rgba(255,255,255,.18); padding: 4px 14px; border-radius: 20px; font-size: 12px; }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: var(--shadow); padding: 18px 22px; margin-bottom: 28px;
+  }
+  nav.toc h2 { font-size: 15px; margin-bottom: 10px; }
+  nav.toc a { color: var(--accent); text-decoration: none; font-size: 13px; margin-right: 14px; display: inline-block; }
+  nav.toc a:hover { text-decoration: underline; }
+  .section { margin-bottom: 34px; }
+  .section h2 {
+    font-size: 20px; font-weight: 700; margin-bottom: 14px; padding-left: 12px;
+    border-left: 4px solid var(--accent);
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: var(--shadow); padding: 20px 24px; margin-bottom: 16px;
+  }
+  .card h3 { font-size: 15px; margin-bottom: 10px; }
+  .card p, .card li { font-size: 13.5px; color: var(--dim); }
+  .card li { margin-bottom: 4px; }
+  .card ul, .card ol { padding-left: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .feature-card h3 { color: var(--accent); }
+  .feature-card .path { font-size: 11px; color: var(--mute); background: var(--bg); display: inline-block; padding: 2px 8px; border-radius: 6px; margin-bottom: 8px; font-family: Consolas, monospace; }
+  .badge { display: inline-block; background: rgba(47,107,255,.1); color: var(--accent); border-radius: 6px; padding: 1px 8px; font-size: 11px; margin-right: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  th, td { padding: 10px 14px; border-bottom: 1px solid var(--border); text-align: left; }
+  th { background: var(--bg); color: var(--mute); font-weight: 600; font-size: 12px; }
+  code { background: var(--bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: 12px; font-family: Consolas, monospace; }
+  pre {
+    background: #1e2635; color: #dbe4f3; padding: 16px 20px; border-radius: 10px;
+    overflow-x: auto; font-size: 13px; font-family: Consolas, monospace; line-height: 1.6; margin: 10px 0;
+  }
+  pre .c { color: #7c89a8; }
+  .steps li { margin-bottom: 6px; }
+  .kbd { background: #eef1f7; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 1px 7px; font-size: 12px; font-family: Consolas, monospace; }
+  footer { text-align: center; color: var(--mute); font-size: 12px; margin-top: 40px; }
+  .api-row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding: 8px 2px; font-size: 13px; }
+  .api-row code { background: transparent; border: none; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>量化研究平台</h1>
+  <p>一站式 A 股量化研究系统 · 选股 → 回测 → 组合 → 风控全流程闭环</p>
+  <div class="tags">
+    <span>FastAPI 3.x</span><span>Vue 3 + Vite</span><span>SQLite</span>
+    <span>LightGBM</span><span>CVXPY</span><span>数据源：腾讯 / 新浪 / 东财</span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <nav class="toc">
+    <h2>目录</h2>
+    <a href="#overview">一、项目概述</a>
+    <a href="#quickstart">二、快速上手</a>
+    <a href="#features">三、功能总览</a>
+    <a href="#usage">四、各模块使用说明</a>
+    <a href="#pipeline">五、研究流水线</a>
+    <a href="#arch">六、技术架构</a>
+    <a href="#verify">七、验证与测试</a>
+  </nav>
+
+  <!-- 一、概述 -->
+  <div class="section" id="overview">
+    <h2>一、项目概述</h2>
+    <div class="card">
+      <p>本平台是一套<strong>前后端分离</strong>的 A 股量化研究系统：后端基于 <code>FastAPI</code>（端口 8899），提供行情、因子、回测、机器学习、组合优化、风险归因等 REST API；前端基于 <code>Vue 3 + Vite</code>（端口 5899），提供完整可视化界面。</p>
+      <br>
+      <p><strong>核心能力链路：</strong>数据接入 → 因子计算 → 选股打分 → 分层回测 / 分钟回测 → 模拟盘 / 策略归档 → 组合优化 → 风险归因，支持 <code>ML 模型打分</code>、<code>人工调参</code>、<code>参数寻优</code>，全流程中间结果可落盘复用。</p>
+    </div>
+  </div>
+
+  <!-- 二、快速上手 -->
+  <div class="section" id="quickstart">
+    <h2>二、快速上手</h2>
+    <div class="card">
+      <h3>环境要求</h3>
+      <ul>
+        <li>Python 3.10+（开发环境 3.14），Node.js 18+</li>
+        <li>依赖：<code>fastapi uvicorn httpx numpy pandas scikit-learn lightgbm optuna cvxpy joblib apscheduler openpyxl</code></li>
+        <li>数据库：SQLite（<code>backend/quant.db</code>，首次启动自动建表）</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>启动后端</h3>
+      <pre><span class="c"># 终端 1</span>
+cd backend
+pip install -r requirements.txt
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8899</pre>
+      <p>健康检查：浏览器打开 <code>http://127.0.0.1:8899/api/health</code> 应返回 <code>{"status":"ok"}</code>。</p>
+    </div>
+    <div class="card">
+      <h3>启动前端</h3>
+      <pre><span class="c"># 终端 2</span>
+cd frontend
+npm install
+npm run dev</pre>
+      <p>浏览器访问 <code>http://127.0.0.1:5899</code>，首次使用点击「注册」创建账号（也可匿名使用，但策略/存档按用户隔离）。</p>
+    </div>
+    <div class="card">
+      <h3>Docker 部署（可选）</h3>
+      <pre>docker compose up -d</pre>
+      <p>根目录 <code>docker-compose.yml</code> 同时编排前后端容器。</p>
+    </div>
+  </div>
+
+  <!-- 三、功能总览 -->
+  <div class="section" id="features">
+    <h2>三、功能总览</h2>
+    <div class="grid">
+      <div class="card feature-card">
+        <h3>行情</h3><span class="path">/quote</span>
+        <p>自选股实时行情（腾讯/新浪/东财三源）、分时与日 K 线、涨跌统计。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>数据市场</h3><span class="path">/data</span>
+        <p>期货行情与日 K 线（中金所 + 商品全品种）、宏观指标（CPI/PPI/PMI/M2）、指数成分股。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>因子</h3><span class="path">/factor</span>
+        <p>40+ 因子计算：量价（动量/波动率/乖离）、估值、资金流、北向持股，按分组查看截面。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>回归</h3><span class="path">/regression</span>
+        <p>单因子与未来收益回归，输出 R²、RankIC，一键带因子去分层回测。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>多因子回归</h3><span class="path">/factor-regression</span>
+        <p>Fama-MacBeth 截面回归，因子收益时序列、t 统计量、胜率、显著性检验。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>选股</h3><span class="path">/select</span>
+        <p>多因子加权打分（权重/方向可编辑）、时间区间回看、自定义股池、ML 模型选股、结果落盘复用。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>分层回测</h3><span class="path">/backtest</span>
+        <p>分组回测（IC / 多空组合 / 分组收益）、交易成本、报告导出（HTML/Excel）、自定义股池。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>模拟盘</h3><span class="path">/portfolio</span>
+        <p>模拟买卖、持仓盈亏、资金曲线、支持一键等权买入选股结果。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>策略中心</h3><span class="path">/strategies</span>
+        <p>自定义组合因子（加权 z-score）、策略一键运行、回测存档。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>机器学习</h3><span class="path">/ml</span>
+        <p>GBDT/LightGBM 训练（Walk-Forward CV）、超参寻优、截面打分选股、ML 信号回测、人工调参。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>盯盘调度</h3><span class="path">/monitor</span>
+        <p>定时扫描动量/RSI 信号、可持久化的自动开关、重启恢复运行状态。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>参数寻优</h3><span class="path">/optimize</span>
+        <p>网格搜索策略参数并回测验证，最优参数一键回写策略 / 应用回测。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>组合优化</h3><span class="path">/portfolio-opt</span>
+        <p>均值方差 / 最大夏普 / 风险平价等权求解，历史数据自动估计 μ/Σ。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>分钟回测</h3><span class="path">/intraday</span>
+        <p>分钟级日内策略回测（含 T+1、成本、止盈止损），支持多标的同时评估。</p>
+      </div>
+      <div class="card feature-card">
+        <h3>风险归因</h3><span class="path">/risk</span>
+        <p>Barra 风格风险分解（动量/波动/换手/EP/BP/市值）、VaR/CVaR、支持任意自定义组合。</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 四、各模块使用说明 -->
+  <div class="section" id="usage">
+    <h2>四、各模块使用说明</h2>
+
+    <div class="card">
+      <h3>1. 行情 <span class="badge">行情页</span></h3>
+      <ol class="steps">
+        <li>在输入框输入 6 位代码（如 <code>600519</code>）或带前缀（<code>sh600519</code>）后点「添加」；</li>
+        <li>左侧列表点击股票查看实时行情与 90 日 K 线；</li>
+        <li>「手动刷新」强制拉取最新价，「删除」移出自选。</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h3>2. 数据市场 <span class="badge">数据市场页</span></h3>
+      <ul>
+        <li><strong>期货行情：</strong>输入合约代码查询，如 <code>IF2608</code>（股指）、<code>rb2610</code>（螺纹钢）、<code>au2612</code>（沪金）、<code>AU0</code>（主连）。点「K线」查看日 K 图；</li>
+        <li><strong>宏观指标：</strong>自动展示 CPI / PPI / PMI / M2 最新一期数值与月份；</li>
+        <li><strong>指数成分：</strong>加载沪深300 / 中证500 成分股，一键把前 50 只加入自选。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>3. 因子 <span class="badge">因子页</span></h3>
+      <p>选择分组（量价/估值/资金流等）→ 点「计算自选股因子」查看因子截面表。技术因子基于近 260 日 K 线，量能/基本面因子来自实时行情快照。</p>
+    </div>
+
+    <div class="card">
+      <h3>4. 回归 &amp; 多因子回归</h3>
+      <ul>
+        <li><strong>单因子回归：</strong>选板块与因子 → 运行回归 → 看散点/拟合线与 RankIC → 「用该因子回测」跳转分层回测；</li>
+        <li><strong>多因子回归：</strong>用<strong>复选框勾选</strong> ≥2 个因子 → 运行，输出各因子平均收益、t 统计量（|t|≥2 显著）、胜率，点「用显著因子回测」。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>5. 选股（多因子加权打分）<span class="badge">核心</span></h3>
+      <ol class="steps">
+        <li>选板块、候选池规模、Top N；</li>
+        <li>勾选参与打分的因子，<strong>编辑每个因子的权重（数字框）与方向（正向/反向）</strong>——未勾选因子也可提前编辑权重，勾选后生效；</li>
+        <li>可填时间区间 <code>startDate/endDate</code> 做历史截面选股，或填自定义代码池；</li>
+        <li>也可填模型 ID 走 <strong>ML 预测分选股</strong>（调参配置自动生效）；</li>
+        <li>点「运行选股」得到排名与综合得分，结果可「加入自选 / 一键买入模拟盘 / 用该股池回测 / 保存为中间结果」。</li>
+      </ol>
+      <p>行业 / 宏观因子（方向=不参与）仅作信息展示，不稀释综合得分。</p>
+    </div>
+
+    <div class="card">
+      <h3>6. 分层回测 <span class="badge">核心</span></h3>
+      <ol class="steps">
+        <li>选择板块（或在上方「中间结果 ID」填入选股页保存的 ID，使用自定义股池）；</li>
+        <li>选策略来源：技术因子（选因子）或 ML 模型；设定分组数、持有天数 N、历史长度、基准；</li>
+        <li>可勾选「启用交易成本」（佣金/印花税/滑点）；</li>
+        <li>运行后查看分组收益、IC / RankIC 时序、多空累计曲线与全部绩效指标；</li>
+        <li>「保存为策略 / 导出 HTML / 导出 Excel」归档与输出。</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h3>7. 模拟盘 <span class="badge">模拟盘页</span></h3>
+      <p>选择自选股 → 切换「买入/卖出」→ 输入数量与价格下单；资产卡片实时展示总资产/持仓/盈亏，资金曲线可回看。</p>
+    </div>
+
+    <div class="card">
+      <h3>8. 策略中心</h3>
+      <ul>
+        <li><strong>自定义因子：</strong>添加多行「成分因子 + 权重 + 方向」加权合成新因子，保存后可在选股中使用；</li>
+        <li><strong>策略：</strong>保存的策略一键运行 → 回测 → 自动归档关键指标。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>9. 机器学习 <span class="badge">ML</span></h3>
+      <ol class="steps">
+        <li>设参数（模型类型、CV 折数、历史长度，可勾选含快照因子）→「评估(CV)」/「训练并落盘」；</li>
+        <li>已训练模型可「打分选股」「ML回测」「去主回测」；</li>
+        <li><strong>人工调参：</strong>点「调参」展开面板，调整各特征权重与预测阈值偏移 → 「保存调参配置」，之后打分/回测自动应用；</li>
+        <li>「删除」清理模型文件。</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h3>10. 盯盘调度</h3>
+      <p>点击「启动 / 停止」开关（默认状态持久化，重启服务自动恢复）。运行后每个交易日 15:10 自动扫描自选股动量/RSI 信号并生成报告。</p>
+    </div>
+
+    <div class="card">
+      <h3>11. 参数寻优 / 组合优化</h3>
+      <ul>
+        <li><strong>参数寻优：</strong>设参数范围与步长 → 开始寻优 → 看最优组合的绩效；「回写为策略 / 应用到回测」一键流转；</li>
+        <li><strong>组合优化：</strong>输入代码 → 「从代码自动生成 μ/Σ」→ 选择方法（均值方差/最大夏普/风险平价/等权）→ 求解得到权重与组合统计，「应用组合」买入模拟盘。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>12. 分钟回测</h3>
+      <p>输入单只股票或代码列表（≤50 只），设日内信号参数、止盈止损、成本 → 开始回测，输出每笔交易、胜率、per-trade Sharpe。</p>
+    </div>
+
+    <div class="card">
+      <h3>13. 风险归因</h3>
+      <ul>
+        <li><strong>模拟盘持仓归因：</strong>一键对当前持仓做 Barra 风格分解；</li>
+        <li><strong>自定义组合归因：</strong>输入代码（可带权重）→ 对任意组合做风格暴露 / 因子贡献 / VaR-CVaR 分析。</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 五、研究流水线 -->
+  <div class="section" id="pipeline">
+    <h2>五、研究流水线（中间结果复用）</h2>
+    <div class="card">
+      <p>平台支持跨页面闭环研究，中间结果落盘为 artifact 供下一环节复用：</p>
+      <pre><span class="c">选股（保存为中间结果）</span>
+  │  └─ /api/artifacts 生成 ID（如 20260803_162832_b184ac）
+  ▼
+<span class="c">分层回测（填入中间结果 ID 载入自定义股池）</span>
+  │  └─ 回测结果也可保存为 artifact
+  ▼
+<span class="c">组合优化 / 风险归因（读取 codes 或直接粘贴）</span>
+  │
+  ▼
+<span class="c">模拟盘 / 策略归档</span></pre>
+      <p>ML 链路同理：<code>训练 → 调参（adjustId）→ 打分选股 / ML 回测</code>，调参配置随 artifact 持久化，重启不丢。</p>
+    </div>
+  </div>
+
+  <!-- 六、技术架构 -->
+  <div class="section" id="arch">
+    <h2>六、技术架构</h2>
+    <div class="card">
+      <table>
+        <tr><th>层次</th><th>技术</th><th>说明</th></tr>
+        <tr><td>前端</td><td>Vue 3 + Vite + ECharts + Pinia + Axios</td><td>14 个功能页面，亮色主题，响应式布局</td></tr>
+        <tr><td>后端</td><td>FastAPI + APScheduler + SQLite</td><td>REST API、限流中间件、结构化日志、JWT 鉴权（密钥落库持久化）</td></tr>
+        <tr><td>量化</td><td>numpy/pandas + sklearn + LightGBM + Optuna + CVXPY</td><td>向量化因子、事件驱动回测、Walk-Forward CV、组合优化</td></tr>
+        <tr><td>数据源</td><td>腾讯 / 新浪 / 东财</td><td>行情三源互备、期货双源（新浪中金所 + 东财商品）、缓存 + 限流退避</td></tr>
+        <tr><td>测试</td><td>pytest 155 项 + FastAPI TestClient</td><td>单元/集成全覆盖，网络端点冒烟验证</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- 七、验证 -->
+  <div class="section" id="verify">
+    <h2>七、验证与测试</h2>
+    <div class="card">
+      <table>
+        <tr><th>项</th><th>结果</th></tr>
+        <tr><td>pytest 测试套件</td><td>155 passed / 0 failed</td></tr>
+        <tr><td>GET / POST 端点冒烟</td><td>17/20 通过（3 项为空样本合理校验）</td></tr>
+        <tr><td>前端构建</td><td>vite build 通过</td></tr>
+        <tr><td>真实数据校验</td><td>沪深300/中证500 成分、行业映射、CPI/PPI/PMI/M2、期货行情/K线均已实拉验证</td></tr>
+      </table>
+      <br>
+      <p class="hint">提示：生产部署请设置环境变量 <code>QUANT_JWT_SECRET</code>；期货/指数/宏观数据依赖网络，断网时相关功能自动降级返回空。</p>
+    </div>
+  </div>
+
+  <footer>量化研究平台 · 项目介绍与使用手册 · 2026-08</footer>
+</div>
+</body>
+</html>
