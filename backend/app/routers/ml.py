@@ -1,6 +1,6 @@
 """机器学习路由：构建数据集 → 时序 CV 评估 → 训练并落盘模型。"""
 import asyncio
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from pydantic import BaseModel
 
 from .. import ml, jobs
@@ -19,13 +19,15 @@ class EvalBody(BaseModel):
     gap: int = 5
     useSnapshot: bool = False  # 追加 pe/pb/turniture 快照特征（含前视风险，探索用）
     nTrials: int = 30  # ml-optimize 用（Optuna 试验数）
+    assetClass: str = "a-share"  # a-share | future（期货主力连续合约池）
 
 
 @router.post("/evaluate")
 async def evaluate(body: EvalBody):
     """同步评估（小数据集）。大数据集建议走 /api/jobs 异步提交。"""
     try:
-        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist, use_snapshot=body.useSnapshot)
+        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
+                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -41,7 +43,8 @@ async def evaluate(body: EvalBody):
 async def train(body: EvalBody):
     """构建数据集 + 训练最终模型并落盘。"""
     try:
-        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist, use_snapshot=body.useSnapshot)
+        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
+                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -71,6 +74,7 @@ class OptimizeMlBody(BaseModel):
     gap: int = 5
     nTrials: int = 30
     useSnapshot: bool = False
+    assetClass: str = "a-share"  # a-share | future
 
 
 @router.post("/optimize")
@@ -82,7 +86,8 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
     大数据集建议走 /api/jobs（kind=ml-optimize）。
     """
     try:
-        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist, use_snapshot=body.useSnapshot)
+        dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
+                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -94,6 +99,20 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
     except ValueError as e:
         raise HTTPException(422, str(e))
     return result
+
+
+@router.post("/models/import")
+async def import_model(file: UploadFile = File(...), uid: int = Depends(require_user_id)):
+    """导入外部训练好的模型文件（joblib bundle：model + feature_names [+ preprocess]）。
+
+    落盘到 ml_models/ 并登记元数据，之后即可与平台内模型同等用于打分/回测/盯盘。
+    """
+    data = await file.read()
+    try:
+        meta = ml.import_model_file(file.filename or "model.joblib", data)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return meta
 
 
 @router.delete("/models/{mid}")
@@ -171,6 +190,7 @@ class ScoreBody(BaseModel):
     saveArtifact: bool = False   # 打分结果落盘为中间结果（选股结果 codes 供下一环节复用）
     adjustId: str | None = None  # 调参配置 artifact id（/models/{mid}/adjust 产出）
     adjust: dict | None = None   # 或直接传 {featureWeights, threshold}
+    assetClass: str = "a-share"  # a-share | future
 
 
 @router.post("/score")
@@ -181,7 +201,8 @@ async def score(body: ScoreBody):
     """
     try:
         adjust = _load_adjust(body.adjustId, body.adjust)
-        rows = await ml.score_latest(body.modelId, body.board, body.poolSize, adjust=adjust)
+        rows = await ml.score_latest(body.modelId, body.board, body.poolSize,
+                                     adjust=adjust, asset_class=body.assetClass)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -217,6 +238,7 @@ class MLBacktestBody(BaseModel):
     applyCost: bool = True
     adjustId: str | None = None  # 调参配置 artifact id
     adjust: dict | None = None   # 或直接传 {featureWeights, threshold}
+    assetClass: str = "a-share"  # a-share | future
 
 
 @router.post("/backtest")
@@ -230,7 +252,7 @@ async def ml_backtest(body: MLBacktestBody):
         return await ml.backtest_model(
             body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
             body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
-            adjust=adjust,
+            adjust=adjust, asset_class=body.assetClass,
         )
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))

@@ -11,6 +11,11 @@ const lastRun = ref(null)
 const signals = ref([])
 const equity = ref([])
 const loading = ref(false)
+// P5：信号引擎配置（rule=内置规则 | model=落盘 ML 模型）
+const mode = ref('rule')
+const modelId = ref('')
+const modelOptions = ref([])
+const savingCfg = ref(false)
 
 async function loadStatus() {
   try {
@@ -18,7 +23,26 @@ async function loadStatus() {
     enabled.value = s.enabled
     lastRun.value = s.lastRun
     signals.value = s.signals || []
+    if (s.config) {
+      mode.value = s.config.mode || 'rule'
+      modelId.value = s.config.modelId || ''
+    }
   } catch (e) { toast(e.message) }
+}
+
+async function loadModels() {
+  try { modelOptions.value = await api.get('/ml/models') }
+  catch (e) { /* 静默 */ }
+}
+
+async function saveConfig() {
+  if (mode.value === 'model' && !modelId.value) { toast('模型模式下请先选择模型'); return }
+  savingCfg.value = true
+  try {
+    const cfg = await api.post('/monitor/config', { mode: mode.value, modelId: modelId.value })
+    toast(cfg.mode === 'model' ? `信号引擎已切换为模型 ${cfg.modelId}` : '信号引擎已切换为内置规则')
+  } catch (e) { toast(e.message) }
+  finally { savingCfg.value = false }
 }
 
 async function loadEquity() {
@@ -56,7 +80,7 @@ const fmt = v => v == null ? '-' : Number(v).toFixed(3)
 const fmtPct = v => v == null ? '-' : (Number(v) * 100).toFixed(2) + '%'
 const fmtTime = t => t ? t.slice(0, 19).replace('T', ' ') : '-'
 
-onMounted(refresh)
+onMounted(() => { refresh(); loadModels() })
 </script>
 
 <template>
@@ -70,6 +94,19 @@ onMounted(refresh)
         自动调仓仅限模拟盘，默认开启（重启保持状态）。交易日历基于K线数据动态推断，非周末且不在节假日则执行。
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
+        <div class="field"><label>信号引擎</label>
+          <select v-model="mode">
+            <option value="rule">内置规则（动量+RSI）</option>
+            <option value="model">ML模型打分</option>
+          </select>
+        </div>
+        <div v-if="mode === 'model'" class="field"><label>模型</label>
+          <select v-model="modelId">
+            <option value="">请选择模型</option>
+            <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ m.id }}</option>
+          </select>
+        </div>
+        <button class="btn-ghost" :disabled="savingCfg" @click="saveConfig">{{ savingCfg ? '保存中…' : '保存配置' }}</button>
         <button class="btn-primary" :disabled="loading" @click="toggle">
           {{ enabled ? '停止调度' : '开启调度' }}
         </button>
@@ -86,12 +123,14 @@ onMounted(refresh)
       <h3>盯盘信号（全量扫描）</h3>
       <div v-if="!signals.length" class="empty-hint">暂无信号，调度器运行后 15:10 生成</div>
       <table v-else class="data-table">
-        <thead><tr><th>代码</th><th>动量</th><th>RSI</th><th>信号</th></tr></thead>
+        <thead><tr><th>代码</th><th>引擎</th><th>动量</th><th>RSI</th><th>模型得分</th><th>信号</th></tr></thead>
         <tbody>
           <tr v-for="s in signals" :key="s.code">
             <td>{{ s.code }}</td>
-            <td class="up">{{ fmtPct(s.momentum) }}</td>
-            <td>{{ fmt(s.rsi) }}</td>
+            <td>{{ s.mode === 'model' ? 'ML模型' : '规则' }}</td>
+            <td>{{ s.momentum == null ? '-' : fmtPct(s.momentum) }}</td>
+            <td>{{ s.rsi == null ? '-' : fmt(s.rsi) }}</td>
+            <td :class="(s.score || 0) > 0 ? 'up' : 'down'">{{ s.score == null ? '-' : fmt(s.score) }}</td>
             <td><span class="tag" v-if="s.signal">{{ s.signal }}</span><span v-else class="muted">-</span></td>
           </tr>
         </tbody>

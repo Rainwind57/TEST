@@ -11,13 +11,33 @@ class ToggleBody(BaseModel):
     enabled: bool
 
 
+class SignalConfigBody(BaseModel):
+    mode: str  # rule=内置动量/RSI 规则 | model=落盘 ML 模型打分
+    modelId: str = ""
+
+
 @router.get("/status")
 def status():
     return {
         "enabled": scheduler.is_enabled(),
         "lastRun": scheduler.last_run(),
         "signals": scheduler.last_signals(),
+        "config": scheduler.get_signal_config(),
     }
+
+
+@router.get("/config")
+def get_signal_config():
+    return scheduler.get_signal_config()
+
+
+@router.post("/config")
+def set_signal_config(body: SignalConfigBody):
+    """设置盯盘信号引擎：rule 规则或指定 ML 模型（modelId 必填）。"""
+    try:
+        return scheduler.set_signal_config(body.mode, body.modelId)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.post("/toggle")

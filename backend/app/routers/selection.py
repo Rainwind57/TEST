@@ -100,6 +100,7 @@ class SelectBody(BaseModel):
     modelId: str | None = None       # ML 模型 ID：指定时用模型预测分选股（与 factors 二选一）
     adjustId: str | None = None      # 调参配置 artifact id（配合 modelId 使用）
     adjust: dict | None = None       # 或直接传 {featureWeights, threshold}
+    assetClass: str = "a-share"      # a-share | future（仅 modelId 分支生效）
     saveArtifact: bool = False       # 选股结果落盘为中间结果，供下一环节（回测/组合/风险）复用
 
 
@@ -149,7 +150,8 @@ async def run_select(body: SelectBody):
                 raise HTTPException(404, f"调参配置不存在: {body.adjustId}")
             adjust = rec.get("payload")
         try:
-            rows = await ml.score_latest(body.modelId, body.board, body.poolSize, adjust=adjust)
+            rows = await ml.score_latest(body.modelId, body.board, body.poolSize,
+                                         adjust=adjust, asset_class=body.assetClass)
         except FileNotFoundError as e:
             raise HTTPException(404, str(e))
         except ValueError as e:
@@ -189,7 +191,7 @@ async def run_select(body: SelectBody):
         uf = db.get_user_factor(uf_id)
         if not uf:
             raise HTTPException(400, f"自定义因子不存在: {s.key}")
-        uf_defs[s.key] = uf["definition"]
+        uf_defs[s.key] = uf
 
     # 自定义股票池：传 codes 时跳过 market_list 拉取，直接用指定代码
     if body.codes:
@@ -298,8 +300,15 @@ async def run_select(body: SelectBody):
             entry[key] = tech_values.get(row["code"], {}).get(key)
         scored_rows.append(entry)
 
-    for uf_key, definition in uf_defs.items():
-        scores = compute_user_factor_scores(scored_rows, definition)
+    for uf_key, uf in uf_defs.items():
+        definition = uf["definition"] or {}
+        if uf["kind"] == "expression":
+            # 表达式因子：用安全 AST 引擎对已计算出的因子列求值（momentum - volatility*0.5 等）
+            from .. import factor_expr
+            expr = definition.get("expression") or ""
+            scores = factor_expr.evaluate_expression(expr, scored_rows) if expr else [0.0] * len(scored_rows)
+        else:
+            scores = compute_user_factor_scores(scored_rows, definition)
         for idx, row in enumerate(scored_rows):
             row[uf_key] = scores[idx]
 
@@ -351,6 +360,7 @@ class BacktestBody(BaseModel):
     startDate: str | None = None      # 调仓日下界（YYYY-MM-DD，含），用于 IS/OOS 不重叠切分
     endDate: str | None = None        # 调仓日上界（YYYY-MM-DD，含）
     codes: list[str] | None = None    # 自定义股票池（传 code 列表则跳过 market_list 拉取）
+    assetClass: str = "a-share"       # a-share | future（期货取主力连续合约池，无涨跌停约束）
     saveArtifact: bool = False        # 回测结果落盘为中间结果，供组合/风险环节复用
 
 
@@ -363,6 +373,7 @@ async def run_backtest(body: BacktestBody):
             res = await ml.backtest_model(
                 body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
                 body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
+                asset_class=body.assetClass,
             )
             res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
             if body.saveArtifact:
@@ -390,20 +401,28 @@ async def run_backtest(body: BacktestBody):
     try:
         if body.codes:
             pool = [{"code": c, "name": c} for c in body.codes]
+        elif body.assetClass == "future":
+            # 期货回测：候选池取主力连续合约，K线走期货适配器，无涨跌停/ST 约束
+            pool = [{"code": c, "name": c} for c in adapters.FUTURE_UNIVERSE[:body.poolSize]]
         else:
             pool = await adapters.fetch_market_list(body.board, body.poolSize)
     except Exception as e:
         raise HTTPException(502, f"候选池获取失败: {e}")
 
     codes = [row["code"] for row in pool]
-    is_st = {r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
-             for r in pool}
+    is_st = {} if body.assetClass == "future" else {
+        r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
+        for r in pool
+    }
     sem = asyncio.Semaphore(15)
 
     async def fetch_one(code):
         async with sem:
             try:
-                kline = await adapters.fetch_kline(code, hist)
+                if body.assetClass == "future":
+                    kline = await adapters.fetch_future_kline(code, hist)
+                else:
+                    kline = await adapters.fetch_kline(code, hist)
             except Exception as e:
                 logger.warning("回测拉取K线失败 code=%s: %s", code, e)
                 return code, []
@@ -467,12 +486,16 @@ async def run_backtest(body: BacktestBody):
             closes = cc["closes"]
             if fv is None or closes[i] == 0:
                 continue
-            # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（A 股不可强制成交）
-            limit = _price_limit_ratio(code, is_st.get(code, False))
-            if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
-                continue
-            if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
-                continue
+            # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（A 股不可强制成交；期货无涨跌停跳过）
+            if body.assetClass == "future":
+                limit = None
+            else:
+                limit = _price_limit_ratio(code, is_st.get(code, False))
+            if limit is not None:
+                if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
+                    continue
+                if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
+                    continue
             # 停牌处理：持仓期 [i, i+n] 内有停牌日（成交量=0）则跳过该股该期，
             # 旧版跨停牌用缺口价算收益致收益失真（停牌期间价格冻结，收益恒 0 或跳空失真）
             vols = cc["volumes"]

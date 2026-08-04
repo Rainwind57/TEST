@@ -143,5 +143,5 @@ def test_score_latest_no_name_error():
     """P0-1 回归：score_latest 不再抛 NameError（snap_keys 已定义）。"""
     import inspect
     src = inspect.getsource(ml.score_latest)
-    assert "snap_keys = [k for k in feature_names if k in snap_set]" in src
+    assert "snap_keys = [k for k in feature_names" in src
     assert "snap_set" in src

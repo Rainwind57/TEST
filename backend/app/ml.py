@@ -86,18 +86,28 @@ async def _enrich_pool_extra(pool: list[dict], snap_keys: list[str]) -> None:
 
 async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                         hist: int = 240, progress_cb=None,
-                        use_snapshot: bool = False) -> dict:
+                        use_snapshot: bool = False,
+                        asset_class: str = "a-share") -> dict:
     """构建 ML 数据集：候选池每只股票算全部量价因子 + 未来 N 日收益。
 
     返回 {features, target, codes, dates, feature_names}。
     use_snapshot=True 时追加全部快照因子（含财务/资金流，需额外拉取）作为静态特征
     （含前视风险，仅探索用；推理 score_latest/backtest_model 会按 feature_names 一致拉取）。
+    asset_class=future 时候选池取期货主力连续合约（FUTURE_UNIVERSE），K 线走期货适配器，
+    快照因子不适用（期货无财务/资金流字段），强制忽略。
     """
-    pool = await adapters.fetch_market_list(board, pool_size)
+    if asset_class == "future":
+        pool = [{"code": c, "name": c} for c in adapters.FUTURE_UNIVERSE[:pool_size]]
+        kline_fn = adapters.fetch_future_kline
+        snapshot_keys = []
+    else:
+        pool = await adapters.fetch_market_list(board, pool_size)
+        kline_fn = adapters.fetch_kline
+        # sector 为类别因子（direction=0），不可作数值特征，否则 np.float64 转型崩溃
+        snapshot_keys = [k for k in SNAPSHOT_FACTORS.keys()
+                         if use_snapshot and SNAPSHOT_FACTORS[k].get("format") != "categorical"]
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
-    # 旧版硬编码 ["pe","pb","turnover"]，扩展为全部快照因子（含 ep/bp/mkt_cap/roe 等）
-    snapshot_keys = list(SNAPSHOT_FACTORS.keys()) if use_snapshot else []
     if snapshot_keys:
         await _enrich_pool_extra(pool, snapshot_keys)
     row_by_code = {r["code"]: r for r in pool}
@@ -111,7 +121,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         if progress_cb:
             progress_cb(idx + 1, total)
         try:
-            kline = await adapters.fetch_kline(code, hist)
+            kline = await kline_fn(code, hist)
         except Exception as e:
             logger.warning("ML数据集拉取K线失败 code=%s: %s", code, e)
             continue
@@ -675,18 +685,26 @@ def _apply_threshold(preds: list[float], threshold: float | None) -> list[float]
 
 
 async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
-                       progress_cb=None, adjust: dict | None = None) -> list[dict]:
+                       progress_cb=None, adjust: dict | None = None,
+                       asset_class: str = "a-share") -> list[dict]:
     """加载落盘模型对候选池最新截面打分，返回按预测分降序的打分列表。"""
     bundle = _load_model(mid)
     feature_names = bundle["feature_names"]
     model = bundle["model"]
     params = bundle["preprocess"]
-    snap_set = set(SNAPSHOT_FACTORS)
+    # sector 为类别因子不可作数值特征：从快照集合剔除，避免历史模型含 sector 时特征长度不匹配
+    snap_set = set(SNAPSHOT_FACTORS) - {"sector"}
 
-    pool = await adapters.fetch_market_list(board, pool_size)
-    # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
-    # 旧版直接引用未定义的 snap_keys 抛 NameError，使 score_latest 完全不可用
-    snap_keys = [k for k in feature_names if k in snap_set]
+    if asset_class == "future":
+        pool = [{"code": c, "name": c} for c in adapters.FUTURE_UNIVERSE[:pool_size]]
+        kline_fn = adapters.fetch_future_kline
+        snap_keys = []
+    else:
+        pool = await adapters.fetch_market_list(board, pool_size)
+        kline_fn = adapters.fetch_kline
+        # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
+        # 旧版直接引用未定义的 snap_keys 抛 NameError，使 score_latest 完全不可用
+        snap_keys = [k for k in feature_names if k in snap_set]
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
     sem = asyncio.Semaphore(15)
@@ -696,7 +714,7 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
         code = row["code"]
         async with sem:
             try:
-                kline = await adapters.fetch_kline(code, 260)
+                kline = await kline_fn(code, 260)
             except Exception as e:
                 logger.warning("ML打分拉取K线失败 code=%s: %s", code, e)
                 return
@@ -742,16 +760,16 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                          n: int = 5, hist: int = 180, commission_rate: float = 0.00025,
                          stamp_duty: float = 0.001, slippage: float = 0.001,
                          benchmark: str = "none", apply_cost: bool = True,
-                         progress_cb=None, adjust: dict | None = None) -> dict:
+                         progress_cb=None, adjust: dict | None = None,
+                         asset_class: str = "a-share") -> dict:
     """用落盘模型预测分作为截面信号做分层回测，响应结构与 /api/select/backtest 一致，
     前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。"""
     bundle = _load_model(mid)
     feature_names = bundle["feature_names"]
     model = bundle["model"]
     params = bundle["preprocess"]
-    snap_set = set(SNAPSHOT_FACTORS)
+    snap_set = set(SNAPSHOT_FACTORS) - {"sector"}
     tech_keys = [k for k in feature_names if k not in snap_set]
-    snap_keys = [k for k in feature_names if k in snap_set]
 
     groups = max(2, min(10, groups))
     n = max(1, n)
@@ -761,19 +779,29 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
     if benchmark != "none" and bench_code is None:
         raise ValueError(f"未知基准: {benchmark}")
 
-    pool = await adapters.fetch_market_list(board, pool_size)
+    if asset_class == "future":
+        pool = [{"code": c, "name": c} for c in adapters.FUTURE_UNIVERSE[:pool_size]]
+        kline_fn = adapters.fetch_future_kline
+        snap_keys = []
+    else:
+        pool = await adapters.fetch_market_list(board, pool_size)
+        kline_fn = adapters.fetch_kline
+        # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
+        snap_keys = [k for k in feature_names if k in snap_set]
     # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
     codes = [row["code"] for row in pool]
-    is_st = {r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
-             for r in pool}
+    is_st = {} if asset_class == "future" else {
+        r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
+        for r in pool
+    }
     sem = asyncio.Semaphore(15)
 
     async def fetch_one(code):
         async with sem:
             try:
-                kline = await adapters.fetch_kline(code, hist + n + 25)
+                kline = await kline_fn(code, hist + n + 25)
             except Exception as e:
                 logger.warning("ML回测拉取K线失败 code=%s: %s", code, e)
                 return code, []
@@ -852,13 +880,17 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                 if not sv:
                     continue
                 fvals.extend(sv)
-            # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出
+            # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（期货无涨跌停，跳过）
             closes = cc["closes"]
-            limit = _price_limit_ratio(code, is_st.get(code, False))
-            if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
-                continue
-            if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
-                continue
+            if asset_class == "future":
+                limit = None
+            else:
+                limit = _price_limit_ratio(code, is_st.get(code, False))
+            if limit is not None:
+                if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
+                    continue
+                if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
+                    continue
             # 停牌处理：持仓期内有停牌日（成交量=0）则跳过，避免跨停牌缺口价算收益失真
             vols = cc["volumes"]
             if any(vols[j] == 0 for j in range(i, i + n + 1)):
@@ -978,6 +1010,109 @@ def _equity_curve(returns: list[float]) -> list[float]:
     for r in returns:
         eq.append(eq[-1] * (1.0 + r))
     return eq
+
+
+async def score_codes(mid: str, codes: list[str]) -> list[dict]:
+    """对指定代码列表用落盘模型打分（供盯盘调度复用，不依赖行情列表接口）。
+
+    快照特征用腾讯行情字段（turnover/pe/pb/市值）填充，财务类字段缺失则跳过该股。
+    返回 [{code, score}]，按代码顺序（与输入对齐）。
+    """
+    bundle = _load_model(mid)
+    feature_names = bundle["feature_names"]
+    model = bundle["model"]
+    params = bundle["preprocess"]
+    snap_set = set(SNAPSHOT_FACTORS) - {"sector"}
+    snap_keys = [k for k in feature_names if k in snap_set]
+    quotes = {}
+    if snap_keys:
+        try:
+            quotes = await adapters.fetch_quotes(codes)
+        except Exception:
+            quotes = {}
+    sem = asyncio.Semaphore(15)
+    collected = []
+
+    async def one(code):
+        async with sem:
+            try:
+                kline = await adapters.fetch_kline(code, 260)
+            except Exception as e:
+                logger.warning("盯盘模型打分拉取K线失败 code=%s: %s", code, e)
+                return
+            if len(kline) < 60:
+                return
+            arr = kline_to_arrays(kline)
+            i = len(kline) - 1
+            fvals = []
+            for k in feature_names:
+                if k in snap_set:
+                    v = snapshot_factor_value(quotes.get(code) or {}, k)
+                else:
+                    v = series_at(compute_factor_series(k, arr), i)
+                if v is None:
+                    return
+                fvals.append(v)
+            collected.append((code, fvals))
+
+    await asyncio.gather(*(one(c) for c in codes))
+    if not collected:
+        return []
+    X = np.array([f for _, f in collected], dtype=np.float64)
+    Xp = _apply_preprocess(X, params)
+    preds = model.predict(Xp).tolist()
+    return [{"code": c, "score": float(p)} for c, p in zip([c for c, _ in collected], preds)]
+
+
+def import_model_file(filename: str, data: bytes) -> dict:
+    """导入外部训练好的模型文件（joblib bundle，需含 model 与 feature_names）。
+
+    写入临时文件加载校验通过后落盘 ml_models/，缺失 preprocess 时用恒等预处理
+    （均值0/标准差1）兜底，保证打分/回测/盯盘可推理；随后登记 sidecar JSON 元数据。
+    """
+    import tempfile
+    suffix = os.path.splitext(filename or "model.joblib")[1] or ".joblib"
+    if suffix.lower() not in (".joblib", ".pkl", ".pickle"):
+        raise ValueError("仅支持 .joblib/.pkl/.pickle 模型文件")
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        bundle = joblib.load(tmp)
+    except Exception as e:
+        raise ValueError(f"模型文件无法加载: {e}")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    feature_names = bundle.get("feature_names")
+    model = bundle.get("model")
+    if not feature_names or model is None:
+        raise ValueError("模型文件需包含 model 与 feature_names 字段（本平台 train 产物即此格式）")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    mid = f"import_{ts}"
+    path = os.path.join(ML_DIR, f"{mid}.joblib")
+    joblib.dump({
+        "model": model,
+        "feature_names": list(feature_names),
+        "model_type": bundle.get("model_type", "gbdt"),
+        # 外部模型可能无预处理参数：用恒等变换兜底（clip±inf/均值0/标准差1 不改变输入）
+        "preprocess": bundle.get("preprocess") or {
+            "lo": float("-inf"), "hi": float("inf"),
+            "mean": 0.0, "std": 1.0,
+        },
+    }, path)
+    meta = {
+        "id": mid, "path": path, "modelType": bundle.get("model_type", "gbdt"),
+        "featureNames": list(feature_names),
+        "imported": True, "sourceFile": filename or "",
+        "trainedAt": datetime.datetime.now().isoformat(),
+    }
+    try:
+        with open(os.path.join(ML_DIR, f"{mid}.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return meta
 
 
 def _alpha_beta(bench: list[float], strat: list[float]) -> dict:

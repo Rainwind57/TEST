@@ -145,8 +145,8 @@ async def fetch_eastmoney_quotes(codes: list[str]) -> dict:
     diff = (data or {}).get("data", {}).get("diff") or []
     items = diff.values() if isinstance(diff, dict) else diff
     for item in items:
-        mkt = "sh" if item.get("f13") == 1 else "sz"
-        code = mkt + str(item.get("f12", ""))
+        # 北交所市场位 f13=0 与深市相同，须按代码前缀区分 bj（8/920/4 开头），否则回包键对不上
+        code = _eastmoney_code(item.get("f12", ""), item.get("f13", 0))
         out[code] = _parse_eastmoney(item)
     return out
 
@@ -335,7 +335,28 @@ async def fetch_market_list(board: str = "all", limit: int = 300, sort_field: st
 
     主源新浪 Market_Center（沪深A股全量，分页拉取后按代码前缀做板块过滤）；
     新浪限流/失败时降级到东方财富 clist，避免单源故障导致候选池全空。
+    board 支持 "sector:<行业名>"（如 "sector:半导体"）：拉取全市场后用
+    fetch_sector_map 的 code→行业 映射过滤出目标行业成分池，供选股/回测按行业板块使用。
     """
+    if isinstance(board, str) and board.startswith("sector:"):
+        sector_name = board.split(":", 1)[1].strip()
+        limit = max(1, min(limit, 3000))
+        cache_key = f"{board}:{limit}:{sort_field}"
+        cached = _market_cache.get(cache_key)
+        if cached and time.time() - cached[0] < MARKET_CACHE_TTL:
+            return cached[1]
+        rows = await fetch_market_list("all", 3000, sort_field)
+        if not rows:
+            return []
+        try:
+            sector_map = await fetch_sector_map()
+        except Exception:
+            sector_map = {}
+        out = [r for r in rows if sector_map.get(r["code"]) == sector_name][:limit]
+        if out:
+            _market_cache[cache_key] = (time.time(), out)
+        return out
+
     matcher = BOARD_MATCHERS.get(board, BOARD_MATCHERS["all"])
     limit = max(1, min(limit, 3000))
     cache_key = f"{board}:{limit}:{sort_field}"
@@ -397,6 +418,7 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
 
     三级缓存：内存(L1, 300s) → SQLite 磁盘(L2) → 网络。已有足够历史时直接返回缓存，
     仅在缓存不足或强制刷新时回源，回源后增量写盘。重复回测可减少 90%+ 网络请求。
+    bj 代码中部分 8xxxxx（如 830799）腾讯 fqkline 返回空 day，自动降级到东财日K。
     """
     cache_key = f"{code}:{days}"
     if not force_refresh:
@@ -422,6 +444,13 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
         for row in arr
     ]
 
+    # 北交所：腾讯 8xxxxx 空 day、920xxx 仅当日一根 → 先降级新浪日K（920xxx 全历史），
+    # 仍空再东财日K兜底（东财 secid=0.xxxx 对 920xxx 无数据、对 8xxxxx 有旧历史）
+    if code.startswith("bj") and len(kline) < min(20, days):
+        kline = await _fetch_sina_kline(code, days)
+        if not kline:
+            kline = await _fetch_eastmoney_kline(code, days)
+
     # 空结果禁止写缓存：旧版把限流返回的空 K 线也落盘+入内存缓存，此后 300s 内
     # 所有调用都拿到空数据，单次网络抖动被放大成 5 分钟故障。
     if not kline:
@@ -431,6 +460,59 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     result = merged[-days:]
     _kline_cache_set(cache_key, (time.time(), result))
     return result
+
+
+async def _fetch_sina_kline(code: str, days: int) -> list[dict]:
+    """新浪日K线（北交所主力源：920xxx 全历史，腾讯仅当日；8xxxxx 数据止于换码前）。"""
+    url = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
+           f"?symbol={code}&scale=240&ma=no&datalen={max(1, min(days, 1023))}")
+    try:
+        resp = await _http_get(url, 10)
+        rows = json.loads(resp.text) if resp.text.strip().startswith("[") else []
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        try:
+            out.append({
+                "date": r["day"],
+                "open": float(r["open"]), "close": float(r["close"]),
+                "high": float(r["high"]), "low": float(r["low"]),
+                "volume": float(r["volume"]),
+            })
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
+
+
+async def _fetch_eastmoney_kline(code: str, days: int) -> list[dict]:
+    """东财日K线（北交所兜底，前复权）。返回与 fetch_kline 同构的列表。"""
+    market = "1" if code.startswith("sh") else "0"
+    pure = code[2:]
+    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+           f"?secid={market}.{pure}&fields1=f1,f2,f3"
+           "&fields2=f51,f52,f53,f54,f55,f56,f57"
+           f"&klt=101&fqt=1&end=20500101&lmt={max(1, min(days, 500))}")
+    try:
+        resp = await _http_get(url, 10)
+        klines = (resp.json() or {}).get("data", {}).get("klines") or []
+    except Exception:
+        return []
+    out = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            out.append({
+                "date": parts[0],
+                "open": float(parts[1]), "close": float(parts[2]),
+                "high": float(parts[3]), "low": float(parts[4]),
+                "volume": float(parts[5]),
+            })
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _kline_stale(rows: list[dict], max_age_days: int = 3) -> bool:
@@ -846,6 +928,19 @@ for _f in ("SR", "CF", "TA", "OI", "MA", "FG", "RM", "ZC", "SF", "SM", "AP", "CJ
     _FUTURE_MARKET[_f] = 115
 _FUTURE_MARKET["SI"] = 143
 _FUTURE_MARKET["LC"] = 143
+
+# 期货主力连续合约池（中金所 IF/IH/IC/IM/T/TF/TS + 商品主连 XX0），
+# 供 ML 训练/回测按 assetClass=future 取池。新浪日K接口支持 XX0 主连写法。
+FUTURE_UNIVERSE = [
+    "IF0", "IH0", "IC0", "IM0", "T0", "TF0", "TS0",
+    "CU0", "AL0", "ZN0", "PB0", "NI0", "SN0", "AU0", "AG0", "RB0", "HC0", "SS0",
+    "WR0", "FU0", "BU0", "RU0", "SP0", "AO0", "BR0", "EC0", "LU0", "NR0", "SC0",
+    "A0", "B0", "C0", "CS0", "M0", "Y0", "P0", "J0", "JM0", "I0", "L0", "V0", "PP0",
+    "EG0", "PG0", "RR0", "LH0", "EB0", "JD0", "FB0", "BB0",
+    "SR0", "CF0", "TA0", "OI0", "MA0", "FG0", "RM0", "ZC0", "SF0", "SM0", "AP0", "CJ0",
+    "CY0", "UR0", "SA0", "PF0", "PK0", "PX0", "SH0", "WH0", "PM0", "RI0", "LR0", "JR0",
+    "RS0", "RO0", "SI0", "LC0",
+]
 
 
 def _is_number(s: str) -> bool:

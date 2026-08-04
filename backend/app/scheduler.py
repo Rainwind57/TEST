@@ -36,6 +36,22 @@ def is_enabled() -> bool:
     return _enabled
 
 
+def get_signal_config() -> dict:
+    """读取盯盘信号引擎配置：rule=内置动量/RSI 规则；model=落盘 ML 模型打分。"""
+    return {
+        "mode": db.get_setting("monitor_mode", "rule"),
+        "modelId": db.get_setting("monitor_model_id", ""),
+    }
+
+
+def set_signal_config(mode: str, model_id: str = "") -> dict:
+    if mode not in ("rule", "model"):
+        raise ValueError("mode 必须为 rule 或 model")
+    db.set_setting("monitor_mode", mode)
+    db.set_setting("monitor_model_id", model_id or "")
+    return get_signal_config()
+
+
 def last_run():
     return _last_run
 
@@ -145,36 +161,53 @@ async def _scan_signals():
         if not codes:
             _last_signals = []
             return
-        # 取消旧版 codes[:20] 硬截断：全量扫描 + 信号量限流，超 20 只不再静默丢失
-        sem = asyncio.Semaphore(_SCAN_CONCURRENCY)
+        cfg = get_signal_config()
         signals: list[dict] = []
 
-        async def one(code: str):
-            async with sem:
-                try:
-                    kline = await adapters.fetch_kline(code, 60)
-                except Exception:
-                    return
-                if len(kline) < 25:
-                    return
-                arr = kline_to_arrays(kline)
-                mom = compute_factor_series("momentum", arr)
-                rsi = compute_factor_series("rsi", arr)
-                i = len(kline) - 1
-                m = series_at(mom, i)
-                r = series_at(rsi, i)
-                tag = None
-                if r is not None and r < 30:
-                    tag = "超卖"
-                elif r is not None and r > 70:
-                    tag = "超买"
-                if m is not None and m > 0.1:
-                    tag = (tag + "+突破" if tag else "突破")
-                signals.append({"code": code, "momentum": m, "rsi": r, "signal": tag})
+        # 模型模式：用落盘 ML 模型预测分生成信号（打通 ML→盯盘调度断点）
+        if cfg["mode"] == "model" and cfg.get("modelId"):
+            from . import ml
+            try:
+                scored = await ml.score_codes(cfg["modelId"], codes)
+            except Exception as e:
+                _last_signals = []
+                db.log_scheduler_run("scan_signals", False, error=f"模型打分失败: {e}")
+                return
+            for s in scored:
+                signals.append({
+                    "code": s["code"], "score": s["score"], "signal": "ML看多" if s["score"] > 0 else None,
+                    "mode": "model",
+                })
+        else:
+            # 取消旧版 codes[:20] 硬截断：全量扫描 + 信号量限流，超 20 只不再静默丢失
+            sem = asyncio.Semaphore(_SCAN_CONCURRENCY)
 
-        await asyncio.gather(*(one(c) for c in codes))
+            async def one(code: str):
+                async with sem:
+                    try:
+                        kline = await adapters.fetch_kline(code, 60)
+                    except Exception:
+                        return
+                    if len(kline) < 25:
+                        return
+                    arr = kline_to_arrays(kline)
+                    mom = compute_factor_series("momentum", arr)
+                    rsi = compute_factor_series("rsi", arr)
+                    i = len(kline) - 1
+                    m = series_at(mom, i)
+                    r = series_at(rsi, i)
+                    tag = None
+                    if r is not None and r < 30:
+                        tag = "超卖"
+                    elif r is not None and r > 70:
+                        tag = "超买"
+                    if m is not None and m > 0.1:
+                        tag = (tag + "+突破" if tag else "突破")
+                    signals.append({"code": code, "momentum": m, "rsi": r, "signal": tag, "mode": "rule"})
+
+            await asyncio.gather(*(one(c) for c in codes))
         _last_signals = signals
-        db.log_scheduler_run("scan_signals", True, {"count": len(signals)})
+        db.log_scheduler_run("scan_signals", True, {"count": len(signals), "mode": cfg["mode"]})
     except Exception as e:
         _last_signals = []
         db.log_scheduler_run("scan_signals", False, error=str(e))

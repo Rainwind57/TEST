@@ -33,6 +33,19 @@ const catalog = ref([])
 const factorState = reactive({})
 const checked = reactive(new Set())
 const totalCash = ref(100000)
+// P6：选股时间区间（后端 SelectBody 已支持，前端补控件）
+const startDate = ref('')
+const endDate = ref('')
+// P7：行业板块（从 /api/data/sectors 动态加载，board 传 "sector:<行业名>"）
+const sectorOptions = ref([])
+
+async function loadSectors() {
+  try {
+    const map = await api.get('/data/sectors')
+    const names = [...new Set(Object.values(map || {}))].filter(Boolean).sort((a, b) => a.localeCompare(b, 'zh'))
+    sectorOptions.value = names.map(n => ({ value: 'sector:' + n, label: n }))
+  } catch (e) { /* 行业数据拉取失败不阻塞页面 */ }
+}
 
 const filters = reactive({
   excludeSt: true, minPrice: null, maxPrice: null,
@@ -92,7 +105,8 @@ async function runSelect() {
   try {
     const data = await api.post('/select', {
       board: board.value, poolSize: Number(poolSize.value), topN: Number(topN.value),
-      factors: selectedFactors.value, filters: buildFilters()
+      factors: selectedFactors.value, filters: buildFilters(),
+      startDate: startDate.value || null, endDate: endDate.value || null
     })
     result.value = data
     research.setCurrentSelectResult({ board: board.value, poolSize: Number(poolSize.value), rows: data.rows })
@@ -176,7 +190,7 @@ async function saveArtifact() {
   finally { savingArtifact.value = false }
 }
 
-onMounted(loadCatalog)
+onMounted(() => { loadCatalog(); loadSectors() })
 </script>
 
 <template>
@@ -188,11 +202,19 @@ onMounted(loadCatalog)
           <div class="field"><label>板块</label>
             <select v-model="board">
               <option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option>
+              <optgroup v-if="sectorOptions.length" label="行业板块（动态加载）">
+                <option v-for="s in sectorOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
+              </optgroup>
             </select>
           </div>
           <div class="field"><label>候选池规模(按成交额取前N)</label><input v-model="poolSize" type="number" min="20" max="1000" /></div>
           <div class="field"><label>选出 TopN</label><input v-model="topN" type="number" min="1" max="100" /></div>
           <label class="checkbox-field"><input type="checkbox" v-model="filters.excludeSt" /> 剔除 ST</label>
+        </div>
+        <div class="panel-row">
+          <div class="field"><label>选股区间起始</label><input v-model="startDate" type="date" /></div>
+          <div class="field"><label>选股区间结束</label><input v-model="endDate" type="date" /></div>
+          <span class="hint">不填则用最新行情截面；填了则在区间内取最后一个交易日截面计算</span>
         </div>
         <div class="panel-row">
           <div class="field"><label>价格区间</label>

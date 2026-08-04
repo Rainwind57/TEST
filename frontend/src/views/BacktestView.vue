@@ -37,6 +37,21 @@ const applyCost = ref(true)
 const commissionRate = ref(0.00025)
 const stampDuty = ref(0.001)
 const slippage = ref(0.001)
+// P6：回测时间区间（后端 BacktestBody 已支持，前端补控件）
+const startDate = ref('')
+const endDate = ref('')
+// P7：行业板块（board 传 "sector:<行业名>"）
+const sectorOptions = ref([])
+// P2：资产类别（future 时候选池取期货主力连续合约）
+const assetClass = ref('a-share')
+
+async function loadSectors() {
+  try {
+    const map = await api.get('/data/sectors')
+    const names = [...new Set(Object.values(map || {}))].filter(Boolean).sort((a, b) => a.localeCompare(b, 'zh'))
+    sectorOptions.value = names.map(n => ({ value: 'sector:' + n, label: n }))
+  } catch (e) { /* 行业数据拉取失败不阻塞页面 */ }
+}
 
 const loading = ref(false)
 const saving = ref(false)
@@ -82,6 +97,8 @@ const backtestConfig = () => {
     benchmark: benchmark.value, applyCost: applyCost.value,
     commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
     slippage: Number(slippage.value),
+    startDate: startDate.value || null, endDate: endDate.value || null,
+    assetClass: assetClass.value,
   }
   if (artifactCodes.value.length) cfg.codes = artifactCodes.value
   if (strategySource.value === 'model') {
@@ -190,7 +207,7 @@ const pct = v => v == null ? '-' : (v * 100).toFixed(2) + '%'
 const num = (v, d = 4) => v == null ? '-' : Number(v).toFixed(d)
 
 onMounted(async () => {
-  await Promise.all([loadFactorOptions(), loadModels()])
+  await Promise.all([loadFactorOptions(), loadModels(), loadSectors()])
   // 消费 ML 页写入的当前模型：有则自动切到模型来源并选中（打通 ML→主回测闭环）
   const cm = research.currentModel
   if (cm?.id && modelOptions.value.some(m => m.id === cm.id)) {
@@ -222,8 +239,19 @@ onMounted(async () => {
 <template>
   <div>
     <div class="panel-toolbar">
+      <div class="field"><label>资产类别</label>
+        <select v-model="assetClass">
+          <option value="a-share">A股</option>
+          <option value="future">期货（主力连续）</option>
+        </select>
+      </div>
       <div class="field"><label>板块</label>
-        <select v-model="board"><option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option></select>
+        <select v-model="board">
+          <option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option>
+          <optgroup v-if="sectorOptions.length" label="行业板块（动态加载）">
+            <option v-for="s in sectorOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
+          </optgroup>
+        </select>
       </div>
       <div class="field"><label>候选池规模</label><input v-model="poolSize" type="number" min="20" max="300" /></div>
       <div class="field"><label>策略来源</label>
@@ -244,6 +272,8 @@ onMounted(async () => {
       <div class="field"><label>分组数</label><input v-model="groups" type="number" min="2" max="10" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
       <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="360" /></div>
+      <div class="field"><label>回测起始日</label><input v-model="startDate" type="date" /></div>
+      <div class="field"><label>回测结束日</label><input v-model="endDate" type="date" /></div>
       <div class="field"><label>基准</label>
         <select v-model="benchmark"><option v-for="b in BENCH_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option></select>
       </div>

@@ -97,13 +97,18 @@ def list_user_factors(request: Request):
 
 @router.post("/user-factors")
 def save_user_factor(body: UserFactorBody, uid: int = Depends(require_user_id)):
-    if body.kind not in ("composite", "model"):
-        raise HTTPException(400, "目前仅支持 composite / model 类型自定义因子")
+    if body.kind not in ("composite", "expression", "model"):
+        raise HTTPException(400, "目前仅支持 composite / expression / model 类型自定义因子")
     if not body.name.strip():
         raise HTTPException(400, "name 不能为空")
     definition = body.definition or {}
     if body.kind == "composite" and not definition.get("factors"):
         raise HTTPException(400, "composite 类型需要 definition.factors")
+    if body.kind == "expression":
+        from .. import factor_expr
+        ok, err = factor_expr.validate_expression(definition.get("expression") or "")
+        if not ok:
+            raise HTTPException(400, f"表达式非法: {err}")
     if body.kind == "model" and not definition.get("modelId"):
         raise HTTPException(400, "model 类型需要 definition.modelId")
     return db.create_user_factor(body.name.strip(), body.kind, body.definition, uid)

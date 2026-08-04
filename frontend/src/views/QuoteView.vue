@@ -23,7 +23,7 @@ const activeQuote = computed(() => store.quotes[store.activeCode])
 
 async function addCode() {
   const c = normalizeCode(codeInput.value)
-  if (!c) { toast('代码格式错误，应为 6 位数字或 sh/sz 前缀'); return }
+  if (!c) { toast('代码格式错误，应为 6 位数字或 sh/sz/bj 前缀'); return }
   if (store.codes.includes(c)) { toast('已在自选列表中'); return }
   try {
     await store.addCode(c)
@@ -95,7 +95,7 @@ onUnmounted(() => clearInterval(timer))
     </div>
 
     <div class="search-bar">
-      <input v-model="codeInput" placeholder="输入股票代码添加自选，如 600519 / 000001 / 300750，回车确认" @keydown.enter="addCode" />
+      <input v-model="codeInput" placeholder="输入股票代码添加自选，如 600519 / 000001 / 300750 / 830799 / bj920799，回车确认" @keydown.enter="addCode" />
       <button class="btn-primary" @click="addCode">添加</button>
     </div>
 

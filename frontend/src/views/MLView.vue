@@ -18,6 +18,16 @@ const modelType = ref('gbdt')
 const nSplits = ref(5)
 const gap = ref(5)
 const useSnapshot = ref(false)
+const assetClass = ref('a-share')   // a-share | future（期货主力连续合约池）
+const sectorOptions = ref([])
+
+async function loadSectors() {
+  try {
+    const map = await api.get('/data/sectors')
+    const names = [...new Set(Object.values(map || {}))].filter(Boolean).sort((a, b) => a.localeCompare(b, 'zh'))
+    sectorOptions.value = names.map(n => ({ value: 'sector:' + n, label: n }))
+  } catch (e) { /* 行业数据拉取失败不阻塞页面 */ }
+}
 
 const loading = ref(false)
 const training = ref(false)
@@ -73,7 +83,7 @@ function evalConfig() {
     board: board.value, poolSize: Number(poolSize.value), n: Number(n.value),
     hist: Number(hist.value), modelType: modelType.value,
     nSplits: Number(nSplits.value), gap: Number(gap.value),
-    useSnapshot: useSnapshot.value,
+    useSnapshot: useSnapshot.value, assetClass: assetClass.value,
   }
 }
 
@@ -141,7 +151,7 @@ async function runScore(m) {
   scoring.value = m.id
   scoreResult.value = null
   try {
-    const payload = { modelId: m.id, board: board.value, poolSize: Number(poolSize.value) }
+    const payload = { modelId: m.id, board: board.value, poolSize: Number(poolSize.value), assetClass: assetClass.value }
     if (adjustPanel.value === m.id) {
       const adj = adjustPayload()
       if (Object.keys(adj.featureWeights).length || adj.threshold !== null) payload.adjust = adj
@@ -159,12 +169,30 @@ async function runMLBacktest(m) {
   try {
     const { jobId } = await api.post('/jobs', { kind: 'ml-backtest', config: {
       modelId: m.id, board: board.value, poolSize: Number(poolSize.value),
-      n: Number(n.value), hist: Number(hist.value),
+      n: Number(n.value), hist: Number(hist.value), assetClass: assetClass.value,
     }})
     btResult.value = await pollJob(jobId)
     toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
   } catch (e) { toast(e.message) }
   finally { btLoading.value = '' }
+}
+
+// P4：导入外部模型文件（joblib，含 model + feature_names）
+const importInput = ref(null)
+const importing = ref(false)
+async function importModel() {
+  const el = importInput.value
+  if (!el || !el.files || !el.files.length) { toast('请先选择模型文件（.joblib/.pkl）'); return }
+  importing.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', el.files[0])
+    const meta = await api.post('/ml/models/import', fd, { timeout: 120000 })
+    toast(`已导入模型 ${meta.id}`)
+    await loadModels()
+    el.value = ''
+  } catch (e) { toast(e.message) }
+  finally { importing.value = false }
 }
 
 // ML 回测结果导出（复用主回测页的 /reports/backtest，旧版 ML 回测无导出能力）
@@ -212,7 +240,7 @@ const lsOption = computed(() => {
   }
 })
 
-onMounted(loadModels)
+onMounted(() => { loadModels(); loadSectors() })
 onUnmounted(() => { pollActive = false })
 </script>
 
@@ -221,6 +249,12 @@ onUnmounted(() => { pollActive = false })
     <div class="card">
       <div class="card-head"><h3>机器学习 · 因子收益预测</h3><span class="hint">GBDT + 时序 Walk-Forward CV，防前视偏差</span></div>
       <div class="panel-toolbar">
+        <div class="field"><label>资产类别</label>
+          <select v-model="assetClass">
+            <option value="a-share">A股</option>
+            <option value="future">期货（主力连续）</option>
+          </select>
+        </div>
         <div class="field"><label>板块</label>
           <select v-model="board">
             <option value="all">全部A股</option>
@@ -228,6 +262,10 @@ onUnmounted(() => { pollActive = false })
             <option value="sz_main">深市主板</option>
             <option value="gem">创业板</option>
             <option value="star">科创板</option>
+            <option value="bse">北交所</option>
+            <optgroup v-if="sectorOptions.length" label="行业板块（动态加载）">
+              <option v-for="s in sectorOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
+            </optgroup>
           </select>
         </div>
         <div class="field"><label>候选池</label><input v-model="poolSize" type="number" /></div>
@@ -271,7 +309,12 @@ onUnmounted(() => { pollActive = false })
 
     <div class="card">
       <div class="card-head"><h3>已训练模型</h3><span class="hint">joblib 落盘，可用 joblib.load 复用</span></div>
-      <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」</div>
+      <div class="panel-toolbar" style="margin-top:10px">
+        <input ref="importInput" type="file" accept=".joblib,.pkl,.pickle" class="file-input" />
+        <button class="btn-ghost sm" :disabled="importing" @click="importModel">{{ importing ? '导入中…' : '导入模型文件' }}</button>
+        <span class="hint">支持本平台训练产物或同构 joblib（须含 model + feature_names，缺失预处理参数时按恒等变换兜底）</span>
+      </div>
+      <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」或导入模型文件</div>
       <table v-else class="data-table">
         <thead><tr><th>模型ID</th><th>文件</th><th>操作</th></tr></thead>
         <tbody>
@@ -361,4 +404,5 @@ onUnmounted(() => { pollActive = false })
 .adj-name { flex: 1; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .adj-weight { width: 70px; }
 .panel-toolbar { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
+.file-input { font-size: 12px; color: var(--text-dim); max-width: 320px; }
 </style>
