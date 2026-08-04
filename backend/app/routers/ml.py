@@ -20,6 +20,8 @@ class EvalBody(BaseModel):
     useSnapshot: bool = False  # 追加 pe/pb/turniture 快照特征（含前视风险，探索用）
     nTrials: int = 30  # ml-optimize 用（Optuna 试验数）
     assetClass: str = "a-share"  # a-share | future（期货主力连续合约池）
+    startDate: str | None = None  # 训练集样本起始日（YYYY-MM-DD，含），限定分时段训练
+    endDate: str | None = None    # 训练集样本结束日（YYYY-MM-DD，含）
 
 
 @router.post("/evaluate")
@@ -27,7 +29,8 @@ async def evaluate(body: EvalBody):
     """同步评估（小数据集）。大数据集建议走 /api/jobs 异步提交。"""
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
-                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass)
+                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass,
+                                         start_date=body.startDate, end_date=body.endDate)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -44,7 +47,8 @@ async def train(body: EvalBody):
     """构建数据集 + 训练最终模型并落盘。"""
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
-                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass)
+                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass,
+                                         start_date=body.startDate, end_date=body.endDate)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -75,6 +79,8 @@ class OptimizeMlBody(BaseModel):
     nTrials: int = 30
     useSnapshot: bool = False
     assetClass: str = "a-share"  # a-share | future
+    startDate: str | None = None  # 训练集起始日（分时段训练）
+    endDate: str | None = None    # 训练集结束日
 
 
 @router.post("/optimize")
@@ -87,7 +93,8 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
     """
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
-                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass)
+                                         use_snapshot=body.useSnapshot, asset_class=body.assetClass,
+                                         start_date=body.startDate, end_date=body.endDate)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -113,6 +120,36 @@ async def import_model(file: UploadFile = File(...), uid: int = Depends(require_
     except ValueError as e:
         raise HTTPException(422, str(e))
     return meta
+
+
+@router.get("/models/import-template")
+def get_import_template(uid: int = Depends(require_user_id)):
+    """外部模型导入引导：平台特征清单 + 示例打包代码（P8 降低导入门槛）。"""
+    return ml.model_import_template()
+
+
+class ManualModelBody(BaseModel):
+    name: str = ""
+    featureWeights: dict[str, float] = {}
+    threshold: float | None = None
+    rule: str = ""
+
+
+@router.post("/models/manual")
+def create_manual_model(body: ManualModelBody, uid: int = Depends(require_user_id)):
+    """创建"人造/手动模型"：手工指定因子权重 + 阈值（可选规则说明），
+    落盘为与自动训练产物同构的 bundle，可立即用于打分/回测/盯盘调度。"""
+    try:
+        meta = ml.create_manual_model(body.name, body.featureWeights, body.threshold, body.rule)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return meta
+
+
+@router.get("/manual/features")
+def manual_features(uid: int = Depends(require_user_id)):
+    """手动模型可用的因子清单（与平台 build_dataset 技术因子同构）。"""
+    return ml.manual_feature_options()
 
 
 @router.delete("/models/{mid}")
@@ -239,6 +276,8 @@ class MLBacktestBody(BaseModel):
     adjustId: str | None = None  # 调参配置 artifact id
     adjust: dict | None = None   # 或直接传 {featureWeights, threshold}
     assetClass: str = "a-share"  # a-share | future
+    startDate: str | None = None  # 验证区间起始日（YYYY-MM-DD，含），分时段验证
+    endDate: str | None = None    # 验证区间结束日（YYYY-MM-DD，含）
 
 
 @router.post("/backtest")
@@ -246,6 +285,7 @@ async def ml_backtest(body: MLBacktestBody):
     """ML 信号分层回测（打通 ML→回测，响应结构与 /api/select/backtest 一致，前端图表零成本复用）。
 
     adjustId/adjust 传调参配置时应用人工权重，验证调参后的模型表现。
+    startDate/endDate 限定验证回测的调仓日区间（分时段验证）。
     """
     try:
         adjust = _load_adjust(body.adjustId, body.adjust)
@@ -253,6 +293,8 @@ async def ml_backtest(body: MLBacktestBody):
             body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
             body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
             adjust=adjust, asset_class=body.assetClass,
+            start_date=body.startDate, end_date=body.endDate,
+            config=body.model_dump(),
         )
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))

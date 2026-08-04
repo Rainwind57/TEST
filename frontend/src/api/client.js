@@ -59,14 +59,31 @@ export async function downloadFile(url, payload, filename) {
     timeout: 300000,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
+  saveBlob(res, filename)
+}
+
+// GET 下载（报告历史文件等只读端点），响应处理与 downloadFile 一致
+export async function downloadGet(url, filename) {
+  const token = localStorage.getItem('quant_token')
+  const res = await axios.get(baseURL + url, {
+    responseType: 'blob',
+    timeout: 120000,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  saveBlob(res, filename)
+}
+
+function saveBlob(res, filename) {
   // 校验响应类型：后端报错返回 JSON，不应下成损坏文件
   const ct = res.headers['content-type'] || ''
   if (ct.includes('json') || ct.includes('text/')) {
-    const txt = await res.data.text()
-    let msg = '下载失败'
-    try { const j = JSON.parse(txt); msg = j.detail || j.message || msg }
-    catch (e) { msg = (txt || '').slice(0, 200) || msg }
-    throw new Error(msg)
+    const txt = res.data.text()
+    return txt.then((t) => {
+      let msg = '下载失败'
+      try { const j = JSON.parse(t); msg = j.detail || j.message || msg }
+      catch (e) { msg = (t || '').slice(0, 200) || msg }
+      throw new Error(msg)
+    })
   }
   const disposition = res.headers['content-disposition'] || ''
   const match = disposition.match(/filename=([^;]+)/)

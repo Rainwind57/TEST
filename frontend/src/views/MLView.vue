@@ -19,6 +19,10 @@ const nSplits = ref(5)
 const gap = ref(5)
 const useSnapshot = ref(false)
 const assetClass = ref('a-share')   // a-share | future（期货主力连续合约池）
+const trainStart = ref('')          // 训练集起始日（分时段训练，留空=最近 hist 天）
+const trainEnd = ref('')            // 训练集结束日
+const btStart = ref('')             // ML 回测验证区间起始日
+const btEnd = ref('')               // ML 回测验证区间结束日
 const sectorOptions = ref([])
 
 async function loadSectors() {
@@ -84,6 +88,7 @@ function evalConfig() {
     hist: Number(hist.value), modelType: modelType.value,
     nSplits: Number(nSplits.value), gap: Number(gap.value),
     useSnapshot: useSnapshot.value, assetClass: assetClass.value,
+    startDate: trainStart.value || null, endDate: trainEnd.value || null,
   }
 }
 
@@ -162,7 +167,7 @@ async function runScore(m) {
   finally { scoring.value = '' }
 }
 
-// 用模型预测分做分层回测（ML→回测闭环，走 jobs 异步）
+// 用模型预测分做分层回测（ML→回测闭环，走 jobs 异步；btStart/btEnd 限定验证区间）
 async function runMLBacktest(m) {
   btLoading.value = m.id
   btResult.value = null
@@ -170,6 +175,7 @@ async function runMLBacktest(m) {
     const { jobId } = await api.post('/jobs', { kind: 'ml-backtest', config: {
       modelId: m.id, board: board.value, poolSize: Number(poolSize.value),
       n: Number(n.value), hist: Number(hist.value), assetClass: assetClass.value,
+      startDate: btStart.value || null, endDate: btEnd.value || null,
     }})
     btResult.value = await pollJob(jobId)
     toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
@@ -195,6 +201,53 @@ async function importModel() {
   finally { importing.value = false }
 }
 
+// P4：人造/手动模型（手工指定因子权重，不依赖自动训练）
+const manualFeatures = ref([])
+const manualName = ref('')
+const manualThreshold = ref(0)
+const manualRule = ref('')
+const manualWeights = reactive({})
+const creatingManual = ref(false)
+async function loadManualFeatures() {
+  try {
+    const data = await api.get('/ml/manual/features')
+    manualFeatures.value = data
+    for (const f of data) if (!(f.key in manualWeights)) manualWeights[f.key] = 0
+  } catch (e) { /* 静默 */ }
+}
+async function saveManualModel() {
+  if (!manualName.value.trim()) { toast('请输入模型名称'); return }
+  const fw = {}
+  for (const [k, v] of Object.entries(manualWeights)) {
+    const num = Number(v)
+    if (num !== 0 && isFinite(num)) fw[k] = num
+  }
+  if (!Object.keys(fw).length) { toast('请至少为一个因子设置非零权重'); return }
+  creatingManual.value = true
+  try {
+    const meta = await api.post('/ml/models/manual', {
+      name: manualName.value.trim(),
+      featureWeights: fw,
+      threshold: manualThreshold.value === '' || manualThreshold.value === null ? 0 : Number(manualThreshold.value),
+      rule: manualRule.value.trim(),
+    })
+    toast(`人造模型已创建：${meta.id}`)
+    await loadModels()
+    manualName.value = ''
+  } catch (e) { toast(e.message) }
+  finally { creatingManual.value = false }
+}
+
+// 外部模型导入引导：查看特征模板
+const templateVisible = ref(false)
+const importTemplate = ref(null)
+async function showImportTemplate() {
+  try {
+    importTemplate.value = await api.get('/ml/models/import-template')
+    templateVisible.value = true
+  } catch (e) { toast(e.message) }
+}
+
 // ML 回测结果导出（复用主回测页的 /reports/backtest，旧版 ML 回测无导出能力）
 async function exportMLBacktest(fmt) {
   if (!btResult.value) return
@@ -205,7 +258,8 @@ async function exportMLBacktest(fmt) {
       benchmark: btResult.value.benchmark, groupSummary: btResult.value.groupSummary,
       longShort: btResult.value.longShort, icSeries: btResult.value.icSeries,
     }
-    await downloadFile('/reports/backtest', payload, `ml_backtest.${fmt === 'html' ? 'html' : 'xlsx'}`)
+    const ext = fmt === 'html' ? 'html' : fmt === 'pdf' ? 'pdf' : 'xlsx'
+    await downloadFile('/reports/backtest', payload, `ml_backtest.${ext}`)
   } catch (e) { toast(e.message) }
 }
 
@@ -240,7 +294,7 @@ const lsOption = computed(() => {
   }
 })
 
-onMounted(() => { loadModels(); loadSectors() })
+onMounted(() => { loadModels(); loadSectors(); loadManualFeatures() })
 onUnmounted(() => { pollActive = false })
 </script>
 
@@ -273,6 +327,11 @@ onUnmounted(() => { pollActive = false })
         <div class="field"><label>历史长度</label><input v-model="hist" type="number" /></div>
         <div class="field"><label>CV折数</label><input v-model="nSplits" type="number" /></div>
         <div class="field"><label>Gap</label><input v-model="gap" type="number" /></div>
+      </div>
+      <div class="panel-toolbar" style="margin-top:10px">
+        <div class="field"><label>训练起始日</label><input v-model="trainStart" type="date" /></div>
+        <div class="field"><label>训练结束日</label><input v-model="trainEnd" type="date" /></div>
+        <span class="hint">留空=用最近 hist 天全部样本；限定后仅用该区间样本训练/评估</span>
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-ghost" :disabled="loading" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
@@ -308,13 +367,44 @@ onUnmounted(() => { pollActive = false })
     </div>
 
     <div class="card">
+      <div class="card-head"><h3>新建人造模型（手搓模型）</h3><span class="hint">手动为每个因子设定权重合成预测分，保存后与训练模型同等可用（打分/回测/盯盘）</span></div>
+      <div class="panel-toolbar" style="margin-top:10px">
+        <div class="field"><label>模型名称</label><input v-model="manualName" placeholder="如：动量+低波 组合" /></div>
+        <div class="field"><label>阈值偏移</label><input v-model="manualThreshold" type="number" step="0.01" placeholder="0" /></div>
+        <div class="field grow"><label>规则说明（可选）</label><input v-model="manualRule" placeholder="如：动量>0.1 且 RSI<30 买入" /></div>
+        <button class="btn-primary" :disabled="creatingManual" @click="saveManualModel">{{ creatingManual ? '创建中…' : '创建人造模型' }}</button>
+      </div>
+      <div class="manual-features">
+        <div class="mf-row" v-for="f in manualFeatures" :key="f.key">
+          <span class="mf-name" :title="f.key">{{ f.label }}</span>
+          <span class="mf-key">{{ f.key }}</span>
+          <input class="mf-weight" v-model="manualWeights[f.key]" type="number" step="0.1" placeholder="权重(0=不参与)" />
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-head"><h3>已训练模型</h3><span class="hint">joblib 落盘，可用 joblib.load 复用</span></div>
       <div class="panel-toolbar" style="margin-top:10px">
         <input ref="importInput" type="file" accept=".joblib,.pkl,.pickle" class="file-input" />
         <button class="btn-ghost sm" :disabled="importing" @click="importModel">{{ importing ? '导入中…' : '导入模型文件' }}</button>
+        <button class="btn-ghost sm" @click="showImportTemplate">查看特征模板/示例</button>
         <span class="hint">支持本平台训练产物或同构 joblib（须含 model + feature_names，缺失预处理参数时按恒等变换兜底）</span>
       </div>
-      <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」或导入模型文件</div>
+      <div v-if="templateVisible && importTemplate" class="tpl-box">
+        <div class="card-head"><h4>外部模型导入模板</h4>
+          <button class="btn-ghost sm" @click="templateVisible = false">收起</button>
+        </div>
+        <p class="hint">{{ importTemplate.note }}</p>
+        <p class="hint">平台特征共 {{ importTemplate.featureNames.length }} 个，须与模型 feature_names 完全一致。</p>
+        <pre class="tpl-code">{{ importTemplate.sampleCode }}</pre>
+      </div>
+      <div class="panel-toolbar" style="margin-top:10px">
+        <div class="field"><label>回测起始日</label><input v-model="btStart" type="date" /></div>
+        <div class="field"><label>回测结束日</label><input v-model="btEnd" type="date" /></div>
+        <span class="hint">「ML回测」的验证区间（分时段验证），留空=整个历史</span>
+      </div>
+      <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」「创建人造模型」或导入模型文件</div>
       <table v-else class="data-table">
         <thead><tr><th>模型ID</th><th>文件</th><th>操作</th></tr></thead>
         <tbody>
@@ -370,6 +460,7 @@ onUnmounted(() => { pollActive = false })
         调仓 {{ btResult.rebalanceCount }} 次 · 有效股票 {{ btResult.effectiveStocks }}
         <button class="btn-ghost sm" style="margin-left:12px" @click="exportMLBacktest('html')">导出HTML</button>
         <button class="btn-ghost sm" style="margin-left:6px" @click="exportMLBacktest('excel')">导出Excel</button>
+        <button class="btn-ghost sm" style="margin-left:6px" @click="exportMLBacktest('pdf')">导出PDF</button>
       </span></div>
       <div class="kpi-row">
         <div class="kpi"><div class="n">{{ fmtPct(btResult.metrics.cumulativeReturn) }}</div><div class="l">累计收益</div></div>
@@ -405,4 +496,11 @@ onUnmounted(() => { pollActive = false })
 .adj-weight { width: 70px; }
 .panel-toolbar { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
 .file-input { font-size: 12px; color: var(--text-dim); max-width: 320px; }
+.manual-features { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; margin-top: 12px; max-height: 300px; overflow: auto; }
+.mf-row { display: flex; align-items: center; gap: 8px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.mf-name { flex: 1; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mf-key { font-size: 11px; color: var(--text-mute); font-family: monospace; }
+.mf-weight { width: 84px; }
+.tpl-box { border-top: 1px solid var(--border); padding: 14px 20px; }
+.tpl-code { background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 12px; overflow-x: auto; color: var(--text-dim); }
 </style>

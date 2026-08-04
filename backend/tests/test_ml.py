@@ -78,6 +78,60 @@ def test_purged_walk_forward_split_ordering():
         assert train_idx.max() + 5 <= test_idx.min()
 
 
+def _mk_klines(days: int = 120, start: str = "2024-01-01"):
+    """构造确定性日期序列 K 线（每天一根，日期递增）。"""
+    out = []
+    base = [2024, 1, 1]
+    for i in range(days):
+        c = 10.0 * (1.001 ** i)
+        d = base[2] + i
+        m, day = base[1], d
+        while day > 28:
+            day -= 28
+            m += 1
+        out.append({
+            "date": f"2024-{m:02d}-{day:02d}",
+            "open": c - 0.01, "close": c, "high": c + 0.02, "low": c - 0.03,
+            "volume": 1000 + i * 10,
+        })
+    return out
+
+
+def test_build_dataset_date_filter(monkeypatch):
+    """P6 扩展：start_date/end_date 按样本日期过滤（分时段训练）。"""
+    import asyncio
+    from app import adapters
+
+    klines = _mk_klines(150)
+
+    async def fake_market_list(board, limit, sort_field="amount"):
+        return [{"code": "sh600000", "name": "测试股", "price": 10.0, "pctChg": 0.0,
+                 "volume": 1e6, "amount": 1e7, "turnover": 1.0, "pe": 10.0, "pb": 1.0,
+                 "mktCap": 100.0, "circMktCap": 80.0}]
+
+    async def fake_kline(code, days):
+        return klines
+
+    monkeypatch.setattr(adapters, "fetch_market_list", fake_market_list)
+    monkeypatch.setattr(adapters, "fetch_kline", fake_kline)
+
+    ds = asyncio.run(ml.build_dataset("all", 10, 5, 150,
+                                      start_date="2024-05-01", end_date="2024-06-30"))
+    dates = ds["dates"]
+    assert dates, "时间段内样本不应为空"
+    assert all("2024-05-01" <= d <= "2024-06-30" for d in dates)
+    assert len(dates) < len(klines)  # 确实被过滤而非全量
+
+    # 起始日调晚 → 保留更少的样本（过滤真正生效）
+    ds_late = asyncio.run(ml.build_dataset("all", 10, 5, 150, start_date="2024-06-01"))
+    assert len(ds_late["dates"]) < len(dates)
+
+    # 时间段内无样本 → 结构化报错
+    with pytest.raises(ValueError, match="时间段"):
+        asyncio.run(ml.build_dataset("all", 10, 5, 150,
+                                     start_date="2023-01-01", end_date="2023-01-31"))
+
+
 def test_purged_walk_forward_split_too_short():
     """样本不足返回空列表（不崩）。"""
     splits = ml.purged_walk_forward_split(5, n_splits=5, gap=5)

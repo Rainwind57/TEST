@@ -87,7 +87,9 @@ async def _enrich_pool_extra(pool: list[dict], snap_keys: list[str]) -> None:
 async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                         hist: int = 240, progress_cb=None,
                         use_snapshot: bool = False,
-                        asset_class: str = "a-share") -> dict:
+                        asset_class: str = "a-share",
+                        start_date: str | None = None,
+                        end_date: str | None = None) -> dict:
     """构建 ML 数据集：候选池每只股票算全部量价因子 + 未来 N 日收益。
 
     返回 {features, target, codes, dates, feature_names}。
@@ -117,6 +119,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     labels = []
     meta_codes = []
     meta_dates = []
+    stat = {"total": total, "kline_ok": 0, "kline_short": 0, "factor_missing": 0}
     for idx, code in enumerate(codes):
         if progress_cb:
             progress_cb(idx + 1, total)
@@ -126,7 +129,9 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
             logger.warning("ML数据集拉取K线失败 code=%s: %s", code, e)
             continue
         if len(kline) < 60 + n:
+            stat["kline_short"] += 1
             continue
+        stat["kline_ok"] += 1
         arr = kline_to_arrays(kline)
         series_map = {k: compute_factor_series(k, arr) for k in sem_factor_keys}
         closes = arr["close"]
@@ -141,6 +146,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                     break
                 fvals.append(v)
             if not ok or closes[i] == 0:
+                stat["factor_missing"] += 1
                 continue
             # 快照特征（最新值作静态特征，含前视风险，仅探索用）
             if use_snapshot:
@@ -149,6 +155,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                     continue
                 sv = [snapshot_factor_value(r, k) for k in snapshot_keys]
                 if any(v is None for v in sv):
+                    stat["factor_missing"] += 1
                     continue
                 fvals.extend(sv)
             fret = closes[i + n] / closes[i] - 1.0
@@ -158,7 +165,11 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
             meta_dates.append(arr["date"][i])
 
     if not rows:
-        raise ValueError("有效样本不足，无法构建数据集（请增大候选池或历史长度）")
+        raise ValueError(
+            f"有效样本不足，无法构建数据集：候选池 {stat['total']} 只，K线历史不足 {60 + n} 日被剔除 "
+            f"{stat['kline_short']} 只，因子缺失切片 {stat['factor_missing']} 个。"
+            f"请增大候选池规模(poolSize)、加长历史(hist)或放宽板块范围后再试。"
+        )
 
     # 按 (date, code) 排序后再切分，杜绝时序 CV 训练集混入晚于测试集的日期样本。
     order = sorted(range(len(rows)), key=lambda k: (meta_dates[k], meta_codes[k]))
@@ -166,6 +177,20 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     labels = [labels[k] for k in order]
     meta_codes = [meta_codes[k] for k in order]
     meta_dates = [meta_dates[k] for k in order]
+
+    # 训练/验证时间段过滤（分时段训练：只保留落在 [start_date, end_date] 内的样本）
+    if start_date or end_date:
+        keep = [k for k, d in enumerate(meta_dates)
+                if (not start_date or d >= start_date) and (not end_date or d <= end_date)]
+        if not keep:
+            raise ValueError(
+                f"指定时间段（{start_date or '不限'} ~ {end_date or '不限'}）内有效样本为 0。"
+                f"请调整时间段范围，或增大候选池/加长历史(hist)后再试。"
+            )
+        rows = [rows[k] for k in keep]
+        labels = [labels[k] for k in keep]
+        meta_codes = [meta_codes[k] for k in keep]
+        meta_dates = [meta_dates[k] for k in keep]
 
     return {
         "features": np.array(rows, dtype=np.float64),
@@ -238,6 +263,18 @@ def purged_walk_forward_split(n_samples: int, n_splits: int = 5, test_ratio: flo
     return splits
 
 
+def _find_cv_splits(n_samples: int, n_splits: int, gap: int):
+    """时序 CV 折自动降级（P9 友好处理）：请求折数分不出（训练≥50 & 测试≥10）的有效折时，
+    逐档下调折数重试，返回首个满足条件的折列表；全部失败返回 []（由调用方报结构化错误）。"""
+    for ns in (n_splits, *range(max(2, n_splits - 1), 1, -1)):
+        splits = purged_walk_forward_split(n_samples, n_splits=ns, gap=gap)
+        if any(len(tr) >= 50 and len(te) >= 10 for tr, te in splits):
+            if ns != n_splits:
+                logger.info("CV 折数从 %s 自动降级为 %s（样本 %s）", n_splits, ns, n_samples)
+            return splits
+    return []
+
+
 def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
                      gap: int = 5, progress_cb=None) -> dict:
     """时序 CV 评估：每折在训练折内 fit 预处理（缩尾+标准化）再 apply 到测试折，
@@ -248,9 +285,12 @@ def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
     feature_names = dataset["feature_names"]
     n = len(y)
 
-    splits = purged_walk_forward_split(n, n_splits=n_splits, gap=gap)
+    splits = _find_cv_splits(n, n_splits, gap)
     if not splits:
-        raise ValueError("样本不足以做时序交叉验证")
+        raise ValueError(
+            f"样本不足以做时序交叉验证：当前样本 {n} 条，分不出（训练≥50 & 测试≥10）的有效折。"
+            f"建议增大候选池/历史长度，或将 CV 折数调小（当前 {n_splits}）、缩小 gap（当前 {gap}）。"
+        )
 
     fold_results = []
     all_pred = np.full(n, np.nan)
@@ -288,7 +328,10 @@ def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
         })
 
     if not fold_results:
-        raise ValueError("样本不足以完成任何一折训练（需更多数据或减小 gap/CV 折数）")
+        raise ValueError(
+            f"样本不足以完成任何一折训练：总样本 {n} 条、折数 {len(splits)}，每折训练<50 或测试<10。"
+            f"建议增大候选池/历史长度，或减小 CV 折数/gap（当前 n_splits={n_splits}, gap={gap}）。"
+        )
 
     valid_mask = ~np.isnan(all_pred)
     valid_pred = all_pred[valid_mask]
@@ -761,7 +804,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                          stamp_duty: float = 0.001, slippage: float = 0.001,
                          benchmark: str = "none", apply_cost: bool = True,
                          progress_cb=None, adjust: dict | None = None,
-                         asset_class: str = "a-share") -> dict:
+                         asset_class: str = "a-share",
+                         start_date: str | None = None,
+                         end_date: str | None = None,
+                         config: dict | None = None) -> dict:
     """用落盘模型预测分作为截面信号做分层回测，响应结构与 /api/select/backtest 一致，
     前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。"""
     bundle = _load_model(mid)
@@ -810,7 +856,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
     fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
     series = {code: kl for code, kl in fetched if len(kl) >= 40}
     if len(series) < groups * 3:
-        raise ValueError("有效股票样本不足，请增大候选池规模")
+        raise ValueError(
+            f"有效股票样本不足：候选池 {len(pool)} 只，K线≥40日的仅 {len(series)} 只（需 ≥{groups * 3}）。"
+            f"请增大候选池规模或放宽板块范围。"
+        )
 
     bench_series = None
     if bench_code:
@@ -858,6 +907,11 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
 
     for t in range(60, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
+        # 验证区间过滤（分时段验证：调仓日只落在 [start_date, end_date] 内）
+        if start_date and date_t < start_date:
+            continue
+        if end_date and date_t > end_date:
+            continue
         cross_feats, cross_codes, cross_rets = [], [], []
         for code in series:
             i = date_maps[code].get(date_t)
@@ -938,7 +992,11 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                     bench_by_date[date_t] = bc[bi + n] / bc[bi] - 1
 
     if not ic_series:
-        raise ValueError("有效截面样本不足，无法完成 ML 信号分层回测")
+        raise ValueError(
+            f"有效截面样本不足，无法完成 ML 信号分层回测：候选池 {len(pool)} 只、有效 {len(series)} 只，"
+            f"但所有调仓日截面均未凑够 {groups * 2} 只（多因停牌/涨跌停/因子缺失被跳过）。"
+            f"请增大候选池规模、缩短持有期(n)或放宽板块范围。"
+        )
 
     group_summary = [
         {"group": idx + 1, "avgReturn": mean(rets) if rets else 0.0, "sample": len(rets)}
@@ -994,7 +1052,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
     ic_stats = information_coefficient_stats([p["ic"] for p in ic_series], ppy)
     mean_rank_ic = mean([p["rankIc"] for p in ic_series])
 
-    return {
+    result = {
         "factorLabel": f"ML模型({mid})", "groups": groups, "n": n, "modelId": mid,
         "meanIc": ic_stats["meanIc"], "meanRankIc": mean_rank_ic,
         "icWinRate": ic_stats["icWinRate"], "icIr": ic_stats["icIr"],
@@ -1003,6 +1061,15 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
     }
+    if config is not None:
+        result["config"] = config
+    # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
+    try:
+        from . import reporting
+        reporting.store_backtest_report(result, config=config)
+    except Exception:
+        pass
+    return result
 
 
 def _equity_curve(returns: list[float]) -> list[float]:
@@ -1124,3 +1191,99 @@ def _alpha_beta(bench: list[float], strat: list[float]) -> dict:
     den = sum((b - mx) ** 2 for b in bench)
     b = 0.0 if den == 0 else num / den
     return {"alpha": my - b * mx, "beta": b}
+
+
+# ---------------- 人造/手动模型（P4） ----------------
+
+MANUAL_FEATURES = list(FACTORS.keys())
+
+
+def manual_feature_options() -> list[dict]:
+    """可选手工构建模型的因子（与平台 build_dataset 的技术因子同构，可直接推理）。"""
+    return [{"key": k, "label": FACTORS[k]["label"], "group": FACTORS[k]["group"]}
+            for k in MANUAL_FEATURES]
+
+
+class _ManualModel:
+    """手动加权线性模型：predict 时对截面特征做 z-score 后再按权重线性合成 + 阈值偏移。
+
+    与训练模型同构（实现 .predict + feature_importances_），可零改动接入
+    score_latest / backtest_model / 盯盘调度（score_codes）。
+    """
+
+    def __init__(self, feature_names: list[str], weights: dict, threshold: float = 0.0,
+                 rule: str = ""):
+        self.feature_names = list(feature_names)
+        self.weights = [float(weights.get(n, 1.0)) for n in self.feature_names]
+        self.threshold = float(threshold or 0.0)
+        self.rule = rule or ""
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        mu = np.nanmean(X, axis=0)
+        sd = np.nanstd(X, axis=0)
+        sd[sd == 0] = 1.0
+        Z = (X - mu) / sd
+        return Z @ np.array(self.weights) + self.threshold
+
+    def feature_importances_(self):
+        return np.abs(np.array(self.weights))
+
+
+def create_manual_model(name: str, weights: dict, threshold: float | None = None,
+                        rule: str = "") -> dict:
+    """创建并落盘一个人造/手动模型（不依赖任何自动训练）。
+
+    feature_names 固定为全部技术因子（FACTORS），落盘结构与自动训练产物完全同构，
+    之后即可用于打分、回测、盯盘调度。返回模型元数据。
+    """
+    feature_names = MANUAL_FEATURES
+    valid = {k: v for k, v in (weights or {}).items() if k in feature_names}
+    if not valid:
+        raise ValueError("请至少为一个有效因子设置权重")
+    model = _ManualModel(feature_names, valid, threshold, rule)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    mid = f"manual_{ts}"
+    path = os.path.join(ML_DIR, f"{mid}.joblib")
+    joblib.dump({
+        "model": model,
+        "feature_names": feature_names,
+        "model_type": "manual",
+        # 恒等预处理：手动模型在 predict 内部自行做截面标准化
+        "preprocess": {
+            "lo": float("-inf"), "hi": float("inf"),
+            "mean": 0.0, "std": 1.0,
+        },
+    }, path)
+    meta = {
+        "id": mid, "path": path, "modelType": "manual",
+        "name": (name or mid).strip(), "featureNames": feature_names,
+        "featureWeights": valid, "threshold": float(threshold or 0.0),
+        "rule": rule or "", "manual": True,
+        "trainedAt": datetime.datetime.now().isoformat(),
+    }
+    try:
+        with open(os.path.join(ML_DIR, f"{mid}.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return meta
+
+
+def model_import_template() -> dict:
+    """外部模型导入引导：返回平台特征清单与示例打包代码（P8 降低导入门槛）。"""
+    sample = (
+        "import joblib, numpy as np\n"
+        "from sklearn.ensemble import GradientBoostingRegressor\n"
+        f"feature_names = {MANUAL_FEATURES!r}\n"
+        "model = GradientBoostingRegressor(n_estimators=100)\n"
+        "X = np.random.rand(200, len(feature_names)); y = X[:, 0] * 0.01\n"
+        "model.fit(X, y)\n"
+        "joblib.dump({'model': model, 'feature_names': feature_names}, 'my_model.joblib')\n"
+    )
+    return {
+        "featureNames": MANUAL_FEATURES,
+        "featureLabels": [{"key": k, "label": FACTORS[k]["label"]} for k in MANUAL_FEATURES],
+        "sampleCode": sample,
+        "note": "模型包需包含 model(实现.predict) 与 feature_names(与本清单一致)；preprocess 缺失时按恒等变换兜底。",
+    }

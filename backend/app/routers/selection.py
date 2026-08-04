@@ -374,6 +374,8 @@ async def run_backtest(body: BacktestBody):
                 body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
                 body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
                 asset_class=body.assetClass,
+                start_date=body.startDate, end_date=body.endDate,
+                config=body.model_dump(),
             )
             res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
             if body.saveArtifact:
@@ -610,6 +612,12 @@ async def run_backtest(body: BacktestBody):
         from .. import artifacts
         meta = artifacts.save_artifact("backtest", result, name=f"回测-{body.factor}")
         result["artifact"] = meta
+    # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
+    try:
+        from .. import reporting
+        reporting.store_backtest_report(result, config=body.model_dump())
+    except Exception:
+        pass
     return result
 
 

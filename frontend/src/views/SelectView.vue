@@ -1,7 +1,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import api from '../api/client'
+import api, { downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
 import { useWatchlistStore } from '../stores/watchlist'
 import { useResearchStore } from '../stores/research'
@@ -190,6 +190,25 @@ async function saveArtifact() {
   finally { savingArtifact.value = false }
 }
 
+// P10：选股结果报告导出（html/excel/pdf）
+const exportingSel = ref(false)
+async function exportSelectReport(fmt) {
+  if (!result.value) return
+  exportingSel.value = true
+  try {
+    const payload = {
+      format: fmt,
+      board: board.value,
+      poolSize: Number(poolSize.value),
+      topN: Number(topN.value),
+      rows: result.value.rows,
+      config: { board: board.value, poolSize: Number(poolSize.value), topN: Number(topN.value) },
+    }
+    await downloadFile('/reports/select', payload, `select.${fmt}`)
+  } catch (e) { toast(e.message) }
+  finally { exportingSel.value = false }
+}
+
 onMounted(() => { loadCatalog(); loadSectors() })
 </script>
 
@@ -270,6 +289,11 @@ onMounted(() => { loadCatalog(); loadSectors() })
         <button class="btn-ghost" @click="gotoBacktest">用该股池回测</button>
         <button class="btn-ghost" :disabled="savingArtifact" @click="saveArtifact">{{ savingArtifact ? '保存中…' : '保存为中间结果' }}</button>
         <span v-if="savedArtifactId" class="hint">{{ savedArtifactId }}</span>
+        <span class="sep"></span>
+        <span class="hint">报告：</span>
+        <button class="btn-ghost sm" :disabled="exportingSel" @click="exportSelectReport('html')">HTML</button>
+        <button class="btn-ghost sm" :disabled="exportingSel" @click="exportSelectReport('excel')">Excel</button>
+        <button class="btn-ghost sm" :disabled="exportingSel" @click="exportSelectReport('pdf')">PDF</button>
       </div>
       <table>
         <thead>
@@ -320,4 +344,6 @@ onMounted(() => { loadCatalog(); loadSectors() })
 
 .apply-row { display: flex; align-items: center; gap: 12px; padding: 16px 22px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .cash-input { width: 140px; }
+.btn-ghost.sm { padding: 4px 10px; font-size: 12px; }
+.sep { width: 1px; height: 22px; background: var(--border); }
 </style>

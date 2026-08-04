@@ -79,6 +79,8 @@ def init_db():
         report_path TEXT,
         created_at TEXT NOT NULL
     )""")
+    # P10：回测结果全量落盘（含 longShort/groupSummary/icSeries），供报告历史页"一键重生成"
+    _ensure_column(cur, "backtest_runs", "result_json", "TEXT")
     cur.execute("""CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
@@ -259,23 +261,32 @@ def get_user_factor(factor_id: int):
     return _parse_user_factor(row) if row else None
 
 
-def list_backtest_runs(limit: int = 50, user_id: int = 0) -> list[dict]:
+def list_backtest_runs(limit: int = 50, user_id: int | None = 0) -> list[dict]:
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM backtest_runs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, limit)
-    ).fetchall()
+    if user_id is None:
+        # 报告历史不按用户过滤（单机 SQLite，回测路由未强制登录时存档为 user_id=0）
+        rows = conn.execute(
+            "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?",
+            (max(1, min(limit, 200)),)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM backtest_runs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, max(1, min(limit, 200)))
+        ).fetchall()
     conn.close()
     return [_parse_backtest_run(r) for r in rows]
 
 
-def create_backtest_run(strategy_id, config: dict, metrics: dict, report_path=None, user_id: int = 0) -> dict:
+def create_backtest_run(strategy_id, config: dict, metrics: dict, report_path=None,
+                        user_id: int = 0, result=None) -> dict:
     conn = get_conn()
     now = datetime.datetime.now().isoformat()
     cur = conn.execute(
-        "INSERT INTO backtest_runs (strategy_id, config, metrics, report_path, created_at, user_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (strategy_id, _json_dumps(config), _json_dumps(metrics), report_path, now, user_id)
+        "INSERT INTO backtest_runs (strategy_id, config, metrics, report_path, result_json, created_at, user_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (strategy_id, _json_dumps(config), _json_dumps(metrics), report_path,
+         _json_dumps(result) if result is not None else None, now, user_id)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM backtest_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -345,6 +356,10 @@ def _parse_backtest_run(row):
         d["metrics"] = json.loads(d["metrics"]) if d.get("metrics") else {}
     except (json.JSONDecodeError, TypeError):
         pass
+    try:
+        d["result"] = json.loads(d.get("result_json")) if d.get("result_json") else None
+    except (json.JSONDecodeError, TypeError):
+        d["result"] = None
     return d
 
 

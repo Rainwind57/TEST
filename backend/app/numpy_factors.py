@@ -273,6 +273,173 @@ def dist_high_series(close: np.ndarray, n: int = 240) -> np.ndarray:
     return out
 
 
+def dist_low_series(close: np.ndarray, n: int = 240) -> np.ndarray:
+    """距 N 日低点涨幅序列（窗口随短历史收缩）。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    for i in range(m):
+        w = min(n, i + 1)
+        if w < 20:
+            continue
+        ll = np.min(close[i - w + 1: i + 1])
+        if ll == 0:
+            out[i] = np.nan
+        else:
+            out[i] = close[i] / ll - 1.0
+    return out
+
+
+def skew_series(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """N 日收益率偏度序列（>0 右尾风险，方向 -1）。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m <= n:
+        return out
+    rets = _daily_returns(close)
+    for i in range(n, m):
+        w = rets[i - n: i]
+        s = np.std(w, ddof=0)
+        if s == 0:
+            out[i] = 0.0
+            continue
+        mu = np.mean(w)
+        out[i] = np.mean((w - mu) ** 3) / s ** 3
+    return out
+
+
+def kurt_series(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """N 日收益率超额峰度序列（>0 肥尾，方向 -1）。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m <= n:
+        return out
+    rets = _daily_returns(close)
+    for i in range(n, m):
+        w = rets[i - n: i]
+        s = np.std(w, ddof=0)
+        if s == 0:
+            out[i] = 0.0
+            continue
+        mu = np.mean(w)
+        out[i] = np.mean((w - mu) ** 4) / s ** 4 - 3.0
+    return out
+
+
+def down_vol_series(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """N 日下行波动率序列：只统计负收益的标准差。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m <= n:
+        return out
+    rets = _daily_returns(close)
+    for i in range(n, m):
+        neg = rets[i - n: i]
+        neg = neg[neg < 0]
+        out[i] = np.std(neg, ddof=0) if len(neg) else 0.0
+    return out
+
+
+def max_drawdown_series(close: np.ndarray, n: int = 60) -> np.ndarray:
+    """N 日最大回撤序列（负值，越深风险越大，方向 -1）。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m < n:
+        return out
+    for i in range(n - 1, m):
+        window = close[i - n + 1: i + 1]
+        peak, mdd = window[0], 0.0
+        for c in window:
+            if c > peak:
+                peak = c
+            if peak != 0:
+                dd = c / peak - 1.0
+                if dd < mdd:
+                    mdd = dd
+        out[i] = mdd
+    return out
+
+
+def ma_align_series(close: np.ndarray, n1: int = 5, n2: int = 20, n3: int = 60) -> np.ndarray:
+    """均线排列强度序列：(MA5-MA20)/MA20 × (MA20-MA60)/MA60。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m < n3:
+        return out
+    ma5 = _rolling_mean(close, n1)
+    ma20 = _rolling_mean(close, n2)
+    ma60 = _rolling_mean(close, n3)
+    for i in range(n3 - 1, m):
+        a20, a60 = ma20[i], ma60[i]
+        if a20 == 0 or a60 == 0:
+            continue
+        out[i] = (ma5[i] - a20) / a20 * (a20 - a60) / a60
+    return out
+
+
+def ema_slope_series(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """EMA(n) 斜率序列：(EMA_t/EMA_{t-1})-1。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m <= n:
+        return out
+    e = _ema(close, n)
+    for i in range(1, m):
+        prev, cur = e[i - 1], e[i]
+        if np.isnan(prev) or np.isnan(cur) or prev == 0:
+            continue
+        out[i] = cur / prev - 1.0
+    return out
+
+
+def donchian_break_series(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """唐奇安通道突破序列：close / 前 n 日最高 - 1（含当日，>0 突破）。"""
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m < n:
+        return out
+    for i in range(n - 1, m):
+        hh = np.max(close[i - n + 1: i + 1])
+        out[i] = np.nan if hh == 0 else close[i] / hh - 1.0
+    return out
+
+
+def vol_corr_series(kline_arr: dict, n: int = 20) -> np.ndarray:
+    """N 日量价相关序列：收盘价与成交量的 Pearson 相关。"""
+    close = kline_arr["close"]
+    vol = kline_arr["volume"]
+    m = len(close)
+    out = np.full(m, np.nan)
+    if m <= n:
+        return out
+    for i in range(n, m):
+        x = close[i - n: i]
+        y = vol[i - n: i]
+        sx, sy = np.std(x, ddof=0), np.std(y, ddof=0)
+        if sx == 0 or sy == 0:
+            out[i] = 0.0
+        else:
+            out[i] = np.corrcoef(x, y)[0, 1]
+    return out
+
+
+def vol_change_series(kline_arr: dict, n: int = 5) -> np.ndarray:
+    """量能突增序列：今日量 / N 日均量 - 1。"""
+    vol = kline_arr["volume"]
+    m = len(vol)
+    out = np.full(m, np.nan)
+    if m <= n:
+        return out
+    for i in range(n, m):
+        base = np.mean(vol[i - n: i])
+        out[i] = np.nan if base == 0 else vol[i] / base - 1.0
+    return out
+
+
+def mom_accel_series(close: np.ndarray) -> np.ndarray:
+    """动量加速度序列：20 日动量 - 10 日动量。"""
+    return momentum_series(close, 20) - momentum_series(close, 10)
+
+
 # ---------------- 因子 key → 向量化计算函数映射 ----------------
 # 与 factors.py FACTORS 字典的 key 对齐
 
@@ -299,6 +466,20 @@ _FACTOR_SERIES_FN = {
     "obv_trend": lambda a: obv_trend_series(a, 20),
     "high_low_pos": lambda a: high_low_pos_series(a, 20),
     "dist_52w_high": lambda a: dist_high_series(a["close"], 240),
+    "momentum30": lambda a: momentum_series(a["close"], 30),
+    "momentum90": lambda a: momentum_series(a["close"], 90),
+    "mom_accel": lambda a: mom_accel_series(a["close"]),
+    "ma_align": lambda a: ma_align_series(a["close"]),
+    "ema_slope20": lambda a: ema_slope_series(a["close"], 20),
+    "bias60": lambda a: ma_dev_series(a["close"], 60),
+    "donchian_break20": lambda a: donchian_break_series(a["close"], 20),
+    "dist_52w_low": lambda a: dist_low_series(a["close"], 240),
+    "skew20": lambda a: skew_series(a["close"], 20),
+    "kurt20": lambda a: kurt_series(a["close"], 20),
+    "down_vol20": lambda a: down_vol_series(a["close"], 20),
+    "max_drawdown60": lambda a: max_drawdown_series(a["close"], 60),
+    "vol_corr20": lambda a: vol_corr_series(a, 20),
+    "vol_change5": lambda a: vol_change_series(a, 5),
 }
 
 

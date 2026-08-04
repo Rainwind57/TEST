@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import api, { longTask, downloadFile } from '../api/client'
+import api, { longTask, downloadFile, downloadGet } from '../api/client'
 import { useToast } from '../stores/toast'
 import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
@@ -148,9 +148,36 @@ async function exportReport(fmt) {
       groupSummary: result.value.groupSummary, longShort: result.value.longShort,
       icSeries: result.value.icSeries
     }
-    await downloadFile('/reports/backtest', payload, `backtest.${fmt === 'html' ? 'html' : 'xlsx'}`)
+    const ext = fmt === 'html' ? 'html' : fmt === 'pdf' ? 'pdf' : 'xlsx'
+    await downloadFile('/reports/backtest', payload, `backtest.${ext}`)
   } catch (e) { toast(e.message) }
   finally { exporting.value = false }
+}
+
+// P10：报告历史（回测完成自动存档，可下载/删除）
+const reportRuns = ref([])
+const loadingRuns = ref(false)
+async function loadReportRuns() {
+  loadingRuns.value = true
+  try { reportRuns.value = await api.get('/reports/runs?limit=50') }
+  catch (e) { /* 静默 */ }
+  finally { loadingRuns.value = false }
+}
+async function downloadRun(run, fmt) {
+  try {
+    if (fmt === 'html') {
+      await downloadGet(`/reports/runs/${run.id}`, `report_${run.id}.html`)
+    } else {
+      await downloadFile(`/reports/runs/${run.id}/regenerate?fmt=${fmt}`, {}, `report_${run.id}.${fmt}`)
+    }
+  } catch (e) { toast(e.message) }
+}
+async function deleteRun(run) {
+  if (!confirm(`删除报告记录 #${run.id}？`)) return
+  try {
+    await api.delete(`/reports/runs/${run.id}`)
+    reportRuns.value = reportRuns.value.filter(r => r.id !== run.id)
+  } catch (e) { toast(e.message) }
 }
 
 const m = computed(() => result.value?.metrics || {})
@@ -292,6 +319,29 @@ onMounted(async () => {
       <button class="btn-ghost" @click="showSave = !showSave" :disabled="!result">保存为策略</button>
       <button class="btn-ghost" @click="exportReport('html')" :disabled="!result || exporting">导出HTML</button>
       <button class="btn-ghost" @click="exportReport('excel')" :disabled="!result || exporting">导出Excel</button>
+      <button class="btn-ghost" @click="exportReport('pdf')" :disabled="!result || exporting">导出PDF</button>
+      <button class="btn-ghost" @click="loadReportRuns" :disabled="loadingRuns">{{ loadingRuns ? '加载中…' : '报告历史' }}</button>
+    </div>
+    <div v-if="reportRuns.length" class="card" style="margin-top:12px">
+      <div class="card-head"><h3>报告历史（回测完成自动存档）</h3><span class="hint">共 {{ reportRuns.length }} 条</span></div>
+      <table class="data-table">
+        <thead><tr><th>ID</th><th>创建时间</th><th>累计收益</th><th>Sharpe</th><th>报告文件</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="r in reportRuns" :key="r.id">
+            <td>{{ r.id }}</td>
+            <td>{{ (r.created_at || '').slice(0, 19).replace('T', ' ') }}</td>
+            <td>{{ pct(r.metrics?.cumulativeReturn) }}</td>
+            <td>{{ num(r.metrics?.sharpe) }}</td>
+            <td class="muted">{{ r.report_path || '已删除' }}</td>
+            <td>
+              <button class="btn-ghost sm" @click="downloadRun(r, 'html')">HTML</button>
+              <button class="btn-ghost sm" @click="downloadRun(r, 'excel')">Excel</button>
+              <button class="btn-ghost sm" @click="downloadRun(r, 'pdf')">PDF</button>
+              <button class="btn-ghost sm danger" @click="deleteRun(r)">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
     <div v-if="showSave" class="panel-toolbar" style="margin-top:8px">
       <div class="field"><label>策略名称</label><input v-model="strategyName" placeholder="如：动量分层_v1" /></div>
@@ -327,3 +377,12 @@ onMounted(async () => {
     </template>
   </div>
 </template>
+
+<style scoped>
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+.data-table th, .data-table td { border: 1px solid var(--border); padding: 9px 11px; text-align: left; }
+.data-table th { background: var(--card-2); color: var(--text-dim); font-weight: 600; }
+.btn-ghost.sm { padding: 4px 10px; font-size: 12px; margin-right: 4px; }
+.btn-ghost.sm.danger { color: #ff6b6b; }
+.muted { color: var(--text-mute); font-size: 12px; }
+</style>

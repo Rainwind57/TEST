@@ -89,7 +89,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
     if kind == "ml-evaluate":
         async def _run():
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist,
-                                             use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass)
+                                             use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass,
+                                             start_date=cfg.startDate, end_date=cfg.endDate)
             # evaluate_dataset 为 CPU 密集同步函数，放线程池避免阻塞事件循环（旧版直接调致全站卡死）
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
@@ -97,7 +98,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
     elif kind == "ml-train":
         async def _run():
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist,
-                                             use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass)
+                                             use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass,
+                                             start_date=cfg.startDate, end_date=cfg.endDate)
             loop = asyncio.get_running_loop()
             ev = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
             meta = await loop.run_in_executor(None, ml.train_final_model, dataset, cfg.modelType)
@@ -106,7 +108,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
     elif kind == "ml-optimize":
         async def _run():
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist,
-                                             use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass)
+                                             use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass,
+                                             start_date=cfg.startDate, end_date=cfg.endDate)
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)
@@ -120,7 +123,9 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
         jobs.submit(jid, ml.backtest_model(
             bt_cfg.modelId, bt_cfg.board, bt_cfg.poolSize, bt_cfg.groups, bt_cfg.n,
             bt_cfg.hist, bt_cfg.commissionRate, bt_cfg.stampDuty, bt_cfg.slippage,
-            bt_cfg.benchmark, bt_cfg.applyCost, asset_class=bt_cfg.assetClass))
+            bt_cfg.benchmark, bt_cfg.applyCost, asset_class=bt_cfg.assetClass,
+            start_date=bt_cfg.startDate, end_date=bt_cfg.endDate,
+            config=bt_cfg.model_dump()))
     return {"jobId": jid, "status": "pending"}
 
 

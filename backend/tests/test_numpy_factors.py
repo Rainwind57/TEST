@@ -141,3 +141,89 @@ def test_macd_consistency(kline_long):
         assert py_val is None and (np_val is None or np.isnan(np_val))
     else:
         assert abs(py_val - np_val) < 1e-6, f"MACD diff={abs(py_val-np_val):.2e}"
+
+
+# ---------------- 扩充因子一致性（逐点版 vs 序列版） ----------------
+
+def test_momentum30_consistency(kline_long):
+    """30 日动量：逐点 factor_momentum(30) vs numpy momentum_series(30)。"""
+    import app.factors as F
+    close = nf.kline_to_arrays(kline_long)["close"]
+    np_series = nf.momentum_series(close, 30)
+    for i in range(30, len(kline_long)):
+        py = F.factor_momentum(kline_long, i, 30)
+        npv = nf.series_at(np_series, i)
+        if py is None or npv is None:
+            continue
+        assert abs(py - npv) < 1e-9, (i, py, npv)
+
+
+def test_momentum90_consistency(kline_long):
+    """90 日动量：逐点 factor_momentum(90) vs numpy momentum_series(90)。"""
+    import app.factors as F
+    close = nf.kline_to_arrays(kline_long)["close"]
+    np_series = nf.momentum_series(close, 90)
+    for i in range(90, len(kline_long)):
+        py = F.factor_momentum(kline_long, i, 90)
+        npv = nf.series_at(np_series, i)
+        if py is None or npv is None:
+            continue
+        assert abs(py - npv) < 1e-9, (i, py, npv)
+
+
+def test_mom_accel_consistency(kline_long):
+    _assert_consistent("mom_accel", kline_long, n=20)
+
+
+def test_ma_align_consistency(kline_long):
+    _assert_consistent("ma_align", kline_long, n=60)
+
+
+def test_ema_slope_consistency(kline_long):
+    _assert_consistent("ema_slope", kline_long, n=20)
+
+
+def test_bias_consistency(kline_long):
+    _assert_consistent("bias", kline_long, n=60)
+
+
+def test_donchian_break_consistency(kline_long):
+    _assert_consistent("donchian_break", kline_long, n=20)
+
+
+def test_dist_low_consistency(kline_long):
+    _assert_consistent("dist_low", kline_long, n=60)
+
+
+def test_skew_consistency(kline_long):
+    _assert_consistent("skew", kline_long, n=20)
+
+
+def test_kurt_consistency(kline_long):
+    _assert_consistent("kurt", kline_long, n=20)
+
+
+def test_down_vol_consistency(kline_long):
+    _assert_consistent("down_vol", kline_long, n=20)
+
+
+def test_max_drawdown_consistency(kline_long):
+    _assert_consistent("max_drawdown", kline_long, n=60)
+
+
+def test_vol_corr_consistency(kline_long):
+    _assert_consistent("vol_corr", kline_long, n=20)
+
+
+def test_vol_change_consistency(kline_long):
+    _assert_consistent("vol_change", kline_long, n=5)
+
+
+def test_catalog_factor_has_numpy_impl():
+    """FACTORS 全部技术因子都必须有向量化序列实现（缺失会导致 ML 数据集全空）。"""
+    import app.factors as F
+    rng = np.random.default_rng(1)
+    arr = {"close": rng.random(10) + 1, "high": rng.random(10) + 1,
+           "low": rng.random(10) + 1, "volume": rng.random(10) + 1}
+    missing = [k for k in F.FACTORS if nf.compute_factor_series(k, arr) is None]
+    assert not missing, f"缺少 numpy 序列实现的因子: {missing}"

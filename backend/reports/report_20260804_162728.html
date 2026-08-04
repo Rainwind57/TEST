@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<title>ML模型(mlmodel_20260803_164048) · 回测报告</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+body{font-family:-apple-system,"Segoe UI","PingFang SC",sans-serif;background:#0b1020;color:#e6ebf5;margin:0;padding:32px}
+h1{font-size:24px;border-left:4px solid #4f8cff;padding-left:10px}
+h3{color:#cfe0ff;margin-top:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0}
+.kpi{background:#121a30;border:1px solid #23304f;border-radius:10px;padding:14px}
+.kpi .n{font-size:22px;font-weight:700;color:#4f8cff}
+.kpi .l{color:#8e9bbd;font-size:12px;margin-top:4px}
+.card{background:#121a30;border:1px solid #23304f;border-radius:10px;padding:16px;margin:14px 0}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{border:1px solid #23304f;padding:8px;text-align:left}
+th{background:#16213c;color:#cfe0ff}
+.chart{width:100%;height:340px}
+.sub{color:#8e9bbd;font-size:13px}
+@media print{.chart{height:300px} body{background:#fff;color:#000} .kpi,.card{border-color:#ccc;background:#fff} th{background:#f0f0f0;color:#000} h1,h3{color:#000}}
+</style></head><body>
+<h1>ML模型(mlmodel_20260803_164048)</h1>
+<div class="sub">生成时间 2026-08-04 16:27 · 调仓次数 29 · 成本率 0.0035</div>
+<div class="grid"><div class="kpi"><div class="n">1973.35%</div><div class="l">累计收益</div></div><div class="kpi"><div class="n">19321.64%</div><div class="l">年化收益</div></div><div class="kpi"><div class="n">53.11%</div><div class="l">年化波动</div></div><div class="kpi"><div class="n">10.6958</div><div class="l">Sharpe</div></div><div class="kpi"><div class="n">31.6481</div><div class="l">Sortino</div></div><div class="kpi"><div class="n">-4.96%</div><div class="l">最大回撤</div></div><div class="kpi"><div class="n">3891.6492</div><div class="l">Calmar</div></div><div class="kpi"><div class="n">89.66%</div><div class="l">胜率</div></div></div>
+
+<div class="card"><h3>分组收益</h3><table>
+<tr><th>分组</th><th>平均收益</th><th>样本数</th></tr><tr><td>第1组</td><td>-2.91%</td><td>406</td></tr><tr><td>第2组</td><td>-0.45%</td><td>420</td></tr><tr><td>第3组</td><td>1.10%</td><td>427</td></tr><tr><td>第4组</td><td>3.97%</td><td>420</td></tr><tr><td>第5组</td><td>8.94%</td><td>439</td></tr></table></div>
+<div class="card"><h3>IC 统计</h3><p>平均 IC：0.4566 · IC 胜率：93.1% · 截面数：29</p></div>
+<div class="card"><h3>多空累计收益与回撤</h3><div id="chartLS" class="chart"></div></div>
+<div class="card"><h3>分组平均收益</h3><div id="chartGroup" class="chart"></div></div>
+<div class="card"><h3>IC / RankIC 时序列</h3><div id="chartIC" class="chart"></div></div>
+<script>
+const LS=[{"date": "2025-12-18", "longShort": 0.05428421519528253, "cum": 0.05428421519528248, "topCum": 0.09706098924318063, "gross": 0.06128421519528253}, {"date": "2025-12-25", "longShort": -0.042958337438791086, "cum": 0.008993918122532474, "topCum": 0.09834344840714215, "gross": -0.03595833743879109}, {"date": "2026-01-05", "longShort": -0.006990946257250851, "cum": 0.0019400958670447999, "topCum": 0.13686942345667363, "gross": 9.05374274914883e-06}, {"date": "2026-01-12", "longShort": 0.09532583661016329, "cum": 0.09745087373883798, "topCum": 0.2358805778879569, "gross": 0.1023258366101633}, {"date": "2026-01-19", "longShort": 0.028444927328243573, "cum": 0.12866778408865676, "topCum": 0.2556535851323687, "gross": 0.03544492732824357}, {"date": "2026-01-26", "longShort": -0.004858807064399031, "cum": 0.12318380508596727, "topCum": 0.2590170417457971, "gross": 0.002141192935600969}, {"date": "2026-02-02", "longShort": 0.06458289884743712, "cum": 0.19572227115691376, "topCum": 0.3273852538329258, "gross": 0.07158289884743713}, {"date": "2026-02-09", "longShort": 0.08533937924104745, "cum": 0.29776446752214025, "topCum": 0.4364360361238624, "gross": 0.09233937924104746}, {"date": "2026-02-24", "longShort": 0.10751036963602825, "cum": 0.4372876051259489, "topCum": 0.4792205619062955, "gross": 0.11451036963602826}, {"date": "2026-03-03", "longShort": 0.1485741987604272, "cum": 0.65083145944583, "topCum": 0.7114121631224954, "gross": 0.15557419876042722}, {"date": "2026-03-10", "longShort": 0.11346189539224602, "cum": 0.8381379258077015, "topCum": 0.7515775962023055, "gross": 0.12046189539224603}, {"date": "2026-03-17", "longShort": 0.07351063380516817, "cum": 0.9732606097551426, "topCum": 0.8095529584629737, "gross": 0.08051063380516818}, {"date": "2026-03-24", "longShort": 0.05220413397831396, "cum": 1.0762729710009293, "topCum": 0.8503792933198031, "gross": 0.05920413397831396}, {"date": "2026-03-31", "longShort": 0.10089275459229202, "cum": 1.2857538703307352, "topCum": 1.1215335037319027, "gross": 0.10789275459229203}, {"date": "2026-04-08", "longShort": 0.08962325521673618, "cum": 1.4906105728140293, "topCum": 1.3724793974024112, "gross": 0.09662325521673619}, {"date": "2026-04-15", "longShort": 0.12011885682601858, "cum": 1.7897798676192456, "topCum": 1.7174538529173704, "gross": 0.1271188568260186}, {"date": "2026-04-22", "longShort": 0.07071551794012779, "cum": 1.9870605958968817, "topCum": 1.873593292707266, "gross": 0.07771551794012779}, {"date": "2026-04-29", "longShort": 0.2184906965101381, "cum": 2.6397055460123795, "topCum": 2.588842412096241, "gross": 0.22549069651013812}, {"date": "2026-05-11", "longShort": 0.12064187532754733, "cum": 3.0788064487233875, "topCum": 2.846981944341166, "gross": 0.12764187532754734}, {"date": "2026-05-18", "longShort": 0.23143666544740316, "cum": 4.022791812221293, "topCum": 3.687088027767625, "gross": 0.23843666544740316}, {"date": "2026-05-25", "longShort": 0.11193320180903667, "cum": 4.585008981783435, "topCum": 3.746676802730363, "gross": 0.11893320180903667}, {"date": "2026-06-01", "longShort": 0.1610942137679591, "cum": 5.484721612590828, "topCum": 4.339166588916039, "gross": 0.1680942137679591}, {"date": "2026-06-08", "longShort": 0.1458670147283176, "cum": 6.430628595563654, "topCum": 5.235993902340595, "gross": 0.1528670147283176}, {"date": "2026-06-15", "longShort": 0.23521981266676706, "cum": 8.178459661808459, "topCum": 6.725460941175895, "gross": 0.24221981266676706}, {"date": "2026-06-23", "longShort": 0.22972279250755873, "cum": 10.28696104623708, "topCum": 8.399188935972775, "gross": 0.23672279250755873}, {"date": "2026-06-30", "longShort": 0.08466221298840709, "cum": 11.242540146325458, "topCum": 7.954970855332704, "gross": 0.0916622129884071}, {"date": "2026-07-07", "longShort": 0.11464392028629054, "cum": 12.646072942962507, "topCum": 8.49174402949181, "gross": 0.12164392028629055}, {"date": "2026-07-14", "longShort": 0.2347862157667632, "cum": 15.849982769317894, "topCum": 8.710312054891624, "gross": 0.2417862157667632}, {"date": "2026-07-21", "longShort": 0.23047535356820611, "cum": 19.733488505694616, "topCum": 9.165690053039032, "gross": 0.23747535356820612}], GS=[{"group": 1, "avgReturn": -0.02913843166396502, "sample": 406}, {"group": 2, "avgReturn": -0.0045286566430649865, "sample": 420}, {"group": 3, "avgReturn": 0.011019619973518203, "sample": 427}, {"group": 4, "avgReturn": 0.03971781383737816, "sample": 420}, {"group": 5, "avgReturn": 0.0894039404328405, "sample": 439}], IC=[{"date": "2025-12-18", "ic": 0.38296005619279105, "rankIc": 0.37076424623594434, "sample": 54}, {"date": "2025-12-25", "ic": -0.1801515216669144, "rankIc": -0.23773069036226932, "sample": 76}, {"date": "2026-01-05", "ic": -0.03571929333433927, "rankIc": -0.14890469416785207, "sample": 75}, {"date": "2026-01-12", "ic": 0.3854198008475397, "rankIc": 0.37766876465506605, "sample": 73}, {"date": "2026-01-19", "ic": 0.1956212199105123, "rankIc": 0.21584598296927063, "sample": 74}, {"date": "2026-01-26", "ic": 0.04138413664503056, "rankIc": 0.01113785017894607, "sample": 73}, {"date": "2026-02-02", "ic": 0.43218848974880536, "rankIc": 0.3004101161995899, "sample": 77}, {"date": "2026-02-09", "ic": 0.5308555762893539, "rankIc": 0.3743624796256375, "sample": 77}, {"date": "2026-02-24", "ic": 0.3497834352769317, "rankIc": 0.35409724793286435, "sample": 73}, {"date": "2026-03-03", "ic": 0.584807389443507, "rankIc": 0.44860402755139595, "sample": 77}, {"date": "2026-03-10", "ic": 0.5719444139618427, "rankIc": 0.3970233246945576, "sample": 74}, {"date": "2026-03-17", "ic": 0.3718962098351179, "rankIc": 0.3111961722488038, "sample": 76}, {"date": "2026-03-24", "ic": 0.2987734457421709, "rankIc": 0.16637047163362953, "sample": 76}, {"date": "2026-03-31", "ic": 0.4883662306449515, "rankIc": 0.5143277774856723, "sample": 77}, {"date": "2026-04-08", "ic": 0.4395903389167307, "rankIc": 0.3525027402265254, "sample": 69}, {"date": "2026-04-15", "ic": 0.5799261482165401, "rankIc": 0.5199011514800989, "sample": 77}, {"date": "2026-04-22", "ic": 0.42814281727376674, "rankIc": 0.33014984886487875, "sample": 72}, {"date": "2026-04-29", "ic": 0.6186291437607025, "rankIc": 0.6448648648648648, "sample": 75}, {"date": "2026-05-11", "ic": 0.49916687510190777, "rankIc": 0.46825299623829936, "sample": 70}, {"date": "2026-05-18", "ic": 0.6721326170120653, "rankIc": 0.67816364309515, "sample": 74}, {"date": "2026-05-25", "ic": 0.5419803273512139, "rankIc": 0.42138239284859125, "sample": 67}, {"date": "2026-06-01", "ic": 0.6525903108946912, "rankIc": 0.37415216362584786, "sample": 77}, {"date": "2026-06-08", "ic": 0.5124664742274957, "rankIc": 0.5584678479415321, "sample": 77}, {"date": "2026-06-15", "ic": 0.7727812895342557, "rankIc": 0.6766302178944847, "sample": 67}, {"date": "2026-06-23", "ic": 0.6168214361276182, "rankIc": 0.6885005553498704, "sample": 74}, {"date": "2026-06-30", "ic": 0.4249551854001378, "rankIc": 0.41860597439544805, "sample": 75}, {"date": "2026-07-07", "ic": 0.5580858860839, "rankIc": 0.5298154477101845, "sample": 76}, {"date": "2026-07-14", "ic": 0.7330432707735954, "rankIc": 0.743166763135893, "sample": 72}, {"date": "2026-07-21", "ic": 0.7739686922124513, "rankIc": 0.7377341659232828, "sample": 58}];
+const dates=LS.map(p=>p.date);
+const cum=LS.map(p=>Number((p.cum*100).toFixed(2)));
+const top=LS.map(p=>Number(((p.topCum??p.cum)*100).toFixed(2)));
+let peak=-Infinity, dd=[];
+for(const c of cum){peak=Math.max(peak,c); dd.push(Number(((c-peak)/100*100).toFixed(2)));}
+echarts.init(document.getElementById('chartLS')).setOption({
+  tooltip:{trigger:'axis'}, legend:{textStyle:{color:'#8e9bbd'},top:0},
+  grid:{left:60,right:40,top:40,bottom:60},
+  xAxis:{type:'category',data:dates,axisLabel:{color:'#8e9bbd',rotate:45}},
+  yAxis:[{type:'value',axisLabel:{color:'#8e9bbd',formatter:v=>v+'%'}},
+         {type:'value',name:'回撤%',axisLabel:{color:'#8e9bbd'},splitLine:{show:false}}],
+  series:[
+    {name:'多空累计',type:'line',data:cum,smooth:true,itemStyle:{color:'#ff4d4f'},areaStyle:{color:'rgba(255,77,79,.12)'}},
+    {name:'最高组累计',type:'line',data:top,smooth:true,itemStyle:{color:'#21c08b'}},
+    {name:'回撤',type:'line',yAxisIndex:1,data:dd,itemStyle:{color:'#f39c12'}}
+  ]
+});
+echarts.init(document.getElementById('chartGroup')).setOption({
+  tooltip:{trigger:'axis'}, grid:{left:60,right:30,top:30,bottom:40},
+  xAxis:{type:'category',data:GS.map(d=>'G'+d.group),axisLabel:{color:'#8e9bbd'}},
+  yAxis:{type:'value',axisLabel:{color:'#8e9bbd',formatter:v=>(v*100).toFixed(1)+'%'}},
+  series:[{type:'bar',data:GS.map(d=>d.avgReturn),itemStyle:{color:p=>p.value>=0?'#ff4d4f':'#21c08b'}}]
+});
+echarts.init(document.getElementById('chartIC')).setOption({
+  tooltip:{trigger:'axis'}, legend:{textStyle:{color:'#8e9bbd'},top:0},
+  grid:{left:60,right:30,top:40,bottom:60},
+  xAxis:{type:'category',data:IC.map(p=>p.date),axisLabel:{color:'#8e9bbd',rotate:45}},
+  yAxis:{type:'value',axisLabel:{color:'#8e9bbd'}},
+  series:[
+    {name:'IC',type:'line',data:IC.map(p=>p.ic),showSymbol:false,itemStyle:{color:'#4f8cff'}},
+    {name:'RankIC',type:'line',data:IC.map(p=>p.rankIc),showSymbol:false,itemStyle:{color:'#6c5ce7'}}
+  ]
+});
+</script>
+</body></html>

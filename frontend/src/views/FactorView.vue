@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useWatchlistStore } from '../stores/watchlist'
 import { useToast } from '../stores/toast'
@@ -43,7 +43,28 @@ async function deleteExpressionFactor(id) {
   } catch (e) { toast(e.message) }
 }
 
-const GROUP_LABELS = { all: '全部因子', technical: '量价技术', fundamental: '基本面', quant: '量能行情' }
+// P3：加权组合因子（勾选基础因子 + 填权重 → 落 user_factors，与内置因子同等参与选股/回测/ML）
+const cfName = ref('')
+const cfWeights = reactive({})
+async function saveCompositeFactor() {
+  if (!cfName.value.trim()) { toast('请输入因子名称'); return }
+  const factors = []
+  for (const f of catalog.value) {
+    const w = Number(cfWeights[f.key])
+    if (w && isFinite(w) && w !== 0) factors.push({ key: f.key, weight: w, direction: Number(f.direction) })
+  }
+  if (!factors.length) { toast('请至少为一个基础因子设置非零权重'); return }
+  try {
+    const created = await api.post('/user-factors', {
+      name: cfName.value.trim(), kind: 'composite', definition: { factors }
+    })
+    userFactors.value.unshift(created)
+    cfName.value = ''
+    toast('组合因子已保存，选股页以 uf:ID 引用')
+  } catch (e) { toast(e.message) }
+}
+
+const GROUP_LABELS = { all: '全部因子', technical: '量价技术', fundamental: '基本面', quant: '量能行情', moneyflow: '资金流', sector: '行业' }
 
 const groupTabs = computed(() => {
   const groups = ['all', ...new Set(catalog.value.map(c => c.group))]
@@ -99,14 +120,14 @@ onMounted(async () => {
     <div class="panel-toolbar">
       <button class="btn-primary" :disabled="loading" @click="runFactorTable">{{ loading ? '计算中…' : '计算自选股因子' }}</button>
       <button class="btn-ghost" @click="router.push('/backtest')">去回测</button>
-      <span class="hint">技术因子基于腾讯历史K线（近260个交易日，前复权）计算；量能/基本面因子来自新浪实时行情快照，共 {{ catalog.length }} 个因子</span>
+      <span class="hint">技术因子基于腾讯历史K线（近260个交易日，前复权）计算，共 {{ catalog.length }} 个（36 技术 + 21 快照）</span>
     </div>
 
     <div class="card">
       <div class="card-head"><h3>新建因子（表达式）</h3><span class="hint">用安全表达式对已有因子列合成新因子，保存后参与选股打分（选股页勾选 uf:ID）</span></div>
       <div class="panel-toolbar">
         <div class="field"><label>因子名称</label><input v-model="ufName" placeholder="如：动量增强" /></div>
-        <div class="field grow"><label>表达式</label><input v-model="ufExpr" placeholder="momentum - volatility*0.5 ｜ 可用列：momentum/rsi/pe/turnover/mkt_cap… ｜ 函数：abs/log/sqrt/rank/zscore/clip" /></div>
+        <div class="field grow"><label>表达式</label><input v-model="ufExpr" placeholder="momentum - volatility*0.5 ｜ 可用列：momentum/momentum5/rsi/pe/pb/turnover/mkt_cap/volatility/macd… ｜ 函数：abs/log/sqrt/rank/zscore/clip" /></div>
         <button class="btn-primary" @click="saveExpressionFactor">保存因子</button>
       </div>
       <div v-if="userFactors.length" class="uf-list">
@@ -117,6 +138,21 @@ onMounted(async () => {
         </div>
       </div>
       <div v-else class="empty-hint">暂无自定义因子</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>新建因子（加权组合）</h3><span class="hint">勾选基础因子并设权重，合成加权组合因子，与内置因子同等参与选股/回测/ML</span></div>
+      <div class="panel-toolbar">
+        <div class="field"><label>因子名称</label><input v-model="cfName" placeholder="如：价值动量" /></div>
+        <button class="btn-primary" @click="saveCompositeFactor">保存组合因子</button>
+      </div>
+      <div class="cf-list">
+        <div class="cf-row" v-for="f in catalog" :key="f.key">
+          <span class="cf-name" :title="f.key">{{ f.label }}</span>
+          <span class="cf-key">{{ f.key }}</span>
+          <input class="cf-weight" v-model="cfWeights[f.key]" type="number" step="0.1" placeholder="权重(0=不参与)" />
+        </div>
+      </div>
     </div>
 
     <div class="tabs">
@@ -172,4 +208,9 @@ onMounted(async () => {
 .uf-name { font-weight: 600; white-space: nowrap; }
 .uf-detail { flex: 1; color: var(--text-mute); font-family: monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .btn-ghost.sm.danger { color: #ff6b6b; }
+.cf-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; margin-top: 12px; max-height: 320px; overflow: auto; }
+.cf-row { display: flex; align-items: center; gap: 8px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.cf-name { flex: 1; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cf-key { font-size: 11px; color: var(--text-mute); font-family: monospace; }
+.cf-weight { width: 84px; }
 </style>

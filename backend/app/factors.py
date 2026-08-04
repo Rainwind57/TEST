@@ -363,6 +363,145 @@ def factor_dist_high(kline, i: int, n: int = 240):
     return None if hh == 0 else closes[i] / hh - 1
 
 
+def factor_dist_low(kline, i: int, n: int = 240):
+    """距 N 日低点涨幅：close / 窗口内最低 - 1（窗口随短历史收缩）。"""
+    closes = _closes(kline)
+    n = min(n, i + 1)
+    if n < 20:
+        return None
+    ll = min(closes[i - n + 1: i + 1])
+    return None if ll == 0 else closes[i] / ll - 1
+
+
+def factor_skew(kline, i: int, n: int = 20):
+    """N 日收益率偏度（>0 右尾风险，方向 -1）。"""
+    closes = _closes(kline)
+    if i < n:
+        return None
+    rets = []
+    for k in range(i - n + 1, i + 1):
+        prev = closes[k - 1]
+        rets.append(0.0 if prev == 0 else closes[k] / prev - 1)
+    s = std(rets)
+    if s == 0:
+        return 0.0
+    m = mean(rets)
+    return mean([(r - m) ** 3 for r in rets]) / s ** 3
+
+
+def factor_kurt(kline, i: int, n: int = 20):
+    """N 日收益率超额峰度（>0 肥尾，方向 -1）。"""
+    closes = _closes(kline)
+    if i < n:
+        return None
+    rets = []
+    for k in range(i - n + 1, i + 1):
+        prev = closes[k - 1]
+        rets.append(0.0 if prev == 0 else closes[k] / prev - 1)
+    s = std(rets)
+    if s == 0:
+        return 0.0
+    m = mean(rets)
+    return mean([(r - m) ** 4 for r in rets]) / s ** 4 - 3.0
+
+
+def factor_down_vol(kline, i: int, n: int = 20):
+    """N 日下行波动率：只统计负收益的标准差。"""
+    closes = _closes(kline)
+    if i < n:
+        return None
+    neg = []
+    for k in range(i - n + 1, i + 1):
+        prev = closes[k - 1]
+        r = 0.0 if prev == 0 else closes[k] / prev - 1
+        if r < 0:
+            neg.append(r)
+    return std(neg) if neg else 0.0
+
+
+def factor_max_drawdown(kline, i: int, n: int = 60):
+    """N 日最大回撤（负值，越深风险越大，方向 -1）。"""
+    closes = _closes(kline)
+    if i < n - 1:
+        return None
+    window = closes[i - n + 1: i + 1]
+    peak, mdd = window[0], 0.0
+    for c in window:
+        if c > peak:
+            peak = c
+        dd = c / peak - 1.0 if peak else 0.0
+        if dd < mdd:
+            mdd = dd
+    return mdd
+
+
+def factor_ma_align(kline, i: int, n1: int = 5, n2: int = 20, n3: int = 60):
+    """均线排列强度：(MA5-MA20)/MA20 × (MA20-MA60)/MA60，多头排列为正。"""
+    closes = _closes(kline)
+    if i < n3 - 1:
+        return None
+    ma5 = mean(closes[i - n1 + 1: i + 1])
+    ma20 = mean(closes[i - n2 + 1: i + 1])
+    ma60 = mean(closes[i - n3 + 1: i + 1])
+    if ma20 == 0 or ma60 == 0:
+        return None
+    return (ma5 - ma20) / ma20 * (ma20 - ma60) / ma60
+
+
+def factor_ema_slope(kline, i: int, n: int = 20):
+    """EMA(n) 斜率：(EMA_t/EMA_{t-1})-1。"""
+    closes = _closes(kline)
+    if i < n:
+        return None
+    e = ema_series(closes[: i + 1], n)
+    cur, prev = e[-1], e[-2]
+    if cur is None or prev is None or prev == 0:
+        return None
+    return cur / prev - 1
+
+
+def factor_bias(kline, i: int, n: int = 60):
+    """BIAS(n) 乖离率：(close-MA)/MA。"""
+    closes = _closes(kline)
+    if i < n - 1:
+        return None
+    ma = mean(closes[i - n + 1: i + 1])
+    return None if ma == 0 else closes[i] / ma - 1
+
+
+def factor_donchian_break(kline, i: int, n: int = 20):
+    """唐奇安通道突破：close / 前 n 日最高 - 1（含当日，>0 突破）。"""
+    closes = _closes(kline)
+    if i < n - 1:
+        return None
+    hh = max(closes[i - n + 1: i + 1])
+    return None if hh == 0 else closes[i] / hh - 1
+
+
+def factor_vol_corr(kline, i: int, n: int = 20):
+    """N 日量价相关：收盘价与成交量的 Pearson 相关。"""
+    closes, volumes = _closes(kline), _volumes(kline)
+    if i < n:
+        return None
+    return pearson(closes[i - n: i], volumes[i - n: i])
+
+
+def factor_vol_change(kline, i: int, n: int = 5):
+    """量能突增：今日量 / N 日均量 - 1。"""
+    volumes = _volumes(kline)
+    if i < n:
+        return None
+    base = mean(volumes[i - n: i])
+    return None if base == 0 else volumes[i] / base - 1
+
+
+def factor_mom_accel(kline, i: int):
+    """动量加速度：20 日动量 - 10 日动量（短期动量增强/减弱）。"""
+    m20 = factor_momentum(kline, i, 20)
+    m10 = factor_momentum(kline, i, 10)
+    return None if m20 is None or m10 is None else m20 - m10
+
+
 FACTORS = {
     "momentum5": {"label": "5日动量", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_momentum(k, i, 5)},
     "momentum10": {"label": "10日动量", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_momentum(k, i, 10)},
@@ -386,6 +525,20 @@ FACTORS = {
     "obv_trend": {"label": "OBV趋势(20日)", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_obv_trend(k, i, 20)},
     "high_low_pos": {"label": "20日高低区间位置", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_high_low_pos(k, i, 20)},
     "dist_52w_high": {"label": "距52周新高回撤", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_dist_high(k, i, 240)},
+    "momentum30": {"label": "30日动量", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_momentum(k, i, 30)},
+    "momentum90": {"label": "90日动量", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_momentum(k, i, 90)},
+    "mom_accel": {"label": "动量加速度(20-10)", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_mom_accel(k, i)},
+    "ma_align": {"label": "均线排列强度", "group": "technical", "direction": 1, "format": "num", "calc": lambda k, i: factor_ma_align(k, i)},
+    "ema_slope20": {"label": "EMA20斜率", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_ema_slope(k, i, 20)},
+    "bias60": {"label": "BIAS60乖离率", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_bias(k, i, 60)},
+    "donchian_break20": {"label": "唐奇安20日突破", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_donchian_break(k, i, 20)},
+    "dist_52w_low": {"label": "距52周低点涨幅", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_dist_low(k, i, 240)},
+    "skew20": {"label": "20日收益偏度", "group": "technical", "direction": -1, "format": "num", "calc": lambda k, i: factor_skew(k, i, 20)},
+    "kurt20": {"label": "20日收益峰度", "group": "technical", "direction": -1, "format": "num", "calc": lambda k, i: factor_kurt(k, i, 20)},
+    "down_vol20": {"label": "20日下行波动率", "group": "technical", "direction": -1, "format": "pct", "calc": lambda k, i: factor_down_vol(k, i, 20)},
+    "max_drawdown60": {"label": "60日最大回撤", "group": "technical", "direction": -1, "format": "pct", "calc": lambda k, i: factor_max_drawdown(k, i, 60)},
+    "vol_corr20": {"label": "20日量价相关", "group": "technical", "direction": 1, "format": "num", "calc": lambda k, i: factor_vol_corr(k, i, 20)},
+    "vol_change5": {"label": "量能突增(5日)", "group": "technical", "direction": 1, "format": "pct", "calc": lambda k, i: factor_vol_change(k, i, 5)},
 }
 
 

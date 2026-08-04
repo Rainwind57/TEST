@@ -1,164 +1,198 @@
-"""回测报告导出：HTML（自包含）与 Excel（openpyxl）。"""
-import io
+"""回测报告导出：HTML（含图表）/ Excel / PDF + 报告历史存档管理 + 选股报告。"""
 import datetime
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import Response
+import os
+from fastapi import APIRouter, HTTPException, Depends, Response
 from pydantic import BaseModel
+
+from .. import db, reporting
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 
 class ExportBody(BaseModel):
-    format: str  # "html" | "excel"
+    format: str  # "html" | "excel" | "pdf"
     factorLabel: str
-    config: dict
-    metrics: dict
+    config: dict = {}
+    metrics: dict = {}
     benchmark: dict | None = None
     groupSummary: list[dict] = []
     longShort: list[dict] = []
     icSeries: list[dict] = []
 
 
-def _fmt(v, pct=False):
-    if v is None:
-        return "-"
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return str(v)
-    return f"{v*100:.2f}%" if pct else f"{v:.4f}"
+def _payload_from_body(body: ExportBody) -> dict:
+    return {
+        "factorLabel": body.factorLabel,
+        "config": body.config,
+        "metrics": body.metrics,
+        "benchmark": body.benchmark,
+        "groupSummary": body.groupSummary,
+        "longShort": body.longShort,
+        "icSeries": body.icSeries,
+    }
 
 
 @router.post("/backtest")
 def export_backtest(body: ExportBody):
-    if body.format == "html":
-        return _export_html(body)
-    if body.format == "excel":
-        return _export_excel(body)
-    raise HTTPException(400, "format 必须为 html 或 excel")
+    """回测报告导出：html（含图表）/ excel / pdf。"""
+    payload = _payload_from_body(body)
+    fmt = body.format
+    if fmt == "html":
+        content = reporting.render_html(payload)
+        return Response(content=content, media_type="text/html",
+                        headers={"Content-Disposition": f"attachment; filename=backtest_{int(datetime.datetime.now().timestamp())}.html"})
+    if fmt == "excel":
+        try:
+            data = reporting.render_excel(payload)
+        except ValueError as e:
+            raise HTTPException(500, str(e))
+        return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename=backtest_{int(datetime.datetime.now().timestamp())}.xlsx"})
+    if fmt == "pdf":
+        data = reporting.render_pdf(payload)
+        if data is None:
+            # reportlab 缺失降级：返回打印样式 HTML（浏览器打印→PDF）
+            content = reporting.render_html(payload)
+            return Response(content=content, media_type="text/html",
+                            headers={"Content-Disposition": f"attachment; filename=backtest_{int(datetime.datetime.now().timestamp())}.html"})
+        return Response(content=data, media_type="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename=backtest_{int(datetime.datetime.now().timestamp())}.pdf"})
+    raise HTTPException(400, "format 必须为 html / excel / pdf")
 
 
-def _export_html(body: ExportBody) -> Response:
-    m = body.metrics or {}
-    bench = body.benchmark
+# ---------------- 报告历史（回测完成自动存档） ----------------
+
+@router.get("/runs")
+def list_report_runs(limit: int = 50, uid: int = Depends(require_user_id)):
+    return db.list_backtest_runs(max(1, min(limit, 200)), user_id=None)
+
+
+@router.get("/runs/{run_id}")
+def download_report(run_id: int, uid: int = Depends(require_user_id)):
+    """下载历史报告文件（HTML），优先用存档文件，缺失时由 result 重新渲染。"""
+    run = _get_run(run_id, uid)
+    path = run.get("report_path")
+    if path and os.path.exists(os.path.join(reporting.REPORT_DIR, path)):
+        with open(os.path.join(reporting.REPORT_DIR, path), "r", encoding="utf-8") as f:
+            content = f.read()
+        return Response(content=content, media_type="text/html",
+                        headers={"Content-Disposition": f"attachment; filename={path}"})
+    result = run.get("result") or {}
+    if result:
+        payload = reporting.payload_from_result(result)
+        return Response(content=reporting.render_html(payload), media_type="text/html",
+                        headers={"Content-Disposition": f"attachment; filename=report_{run_id}.html"})
+    raise HTTPException(404, "该报告无存档数据，无法下载")
+
+
+@router.post("/runs/{run_id}/regenerate")
+def regenerate_report(run_id: int, fmt: str = "html", uid: int = Depends(require_user_id)):
+    """从历史 run 存储的 result 一键重生成 html/excel/pdf 报告。"""
+    run = _get_run(run_id, uid)
+    data, media_type = reporting.regenerate_report(run, fmt)
+    if data is None:
+        if fmt == "pdf":
+            data = reporting.render_html(reporting.payload_from_result(run.get("result") or {}))
+            media_type = "text/html"
+        else:
+            raise HTTPException(400, "该报告无存档数据，无法重新生成")
+    ext = "html" if media_type == "text/html" else "xlsx" if "excel" in media_type else "pdf"
+    return Response(content=data, media_type=media_type,
+                    headers={"Content-Disposition": f"attachment; filename=report_{run_id}.{ext}"})
+
+
+@router.delete("/runs/{run_id}")
+def delete_report(run_id: int, uid: int = Depends(require_user_id)):
+    run = _get_run(run_id, uid)
+    path = run.get("report_path")
+    if path:
+        try:
+            os.remove(os.path.join(reporting.REPORT_DIR, path))
+        except OSError:
+            pass
+    if not db.delete_backtest_run(run_id):
+        raise HTTPException(404, "报告记录不存在")
+    return {"ok": True}
+
+
+def _get_run(run_id: int, uid: int) -> dict:
+    rows = db.list_backtest_runs(200, user_id=None)
+    for r in rows:
+        if r["id"] == run_id:
+            return r
+    raise HTTPException(404, "报告记录不存在")
+
+
+# ---------------- 选股结果报告 ----------------
+
+class SelectReportBody(BaseModel):
+    format: str = "html"       # html | excel | pdf
+    board: str = ""
+    poolSize: int = 0
+    topN: int = 0
+    rows: list[dict] = []
+    config: dict = {}
+
+
+@router.post("/select")
+def export_select_report(body: SelectReportBody, uid: int = Depends(require_user_id)):
+    """选股结果报告：候选池参数 + TopN 榜单（代码/名称/得分/关键因子值）。"""
+    rows = body.rows or []
+    fmt = body.format
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    label = f"选股报告 · {body.board} · 前{body.topN or len(rows)}"
 
-    kpi = lambda label, val, pct=False: (
-        f'<div class="kpi"><div class="n">{_fmt(val, pct)}</div>'
-        f'<div class="l">{label}</div></div>'
-    )
-    kpis = "".join([
-        kpi("累计收益", m.get("cumulativeReturn"), True),
-        kpi("年化收益", m.get("annualizedReturn"), True),
-        kpi("年化波动", m.get("annualizedVolatility"), True),
-        kpi("Sharpe", m.get("sharpe")),
-        kpi("Sortino", m.get("sortino")),
-        kpi("最大回撤", m.get("maxDrawdown"), True),
-        kpi("Calmar", m.get("calmar")),
-        kpi("胜率", m.get("winRate"), True),
-    ])
+    if fmt == "excel":
+        try:
+            from openpyxl import Workbook
+            import io
+        except ImportError:
+            raise HTTPException(500, "服务器未安装 openpyxl，无法导出 Excel")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "选股结果"
+        ws.append(["排名", "代码", "名称", "现价", "涨跌幅", "综合得分"])
+        for r in rows:
+            ws.append([r.get("rank"), r.get("code"), r.get("name"),
+                       r.get("price"), r.get("pctChg"), r.get("score")])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return Response(content=buf.getvalue(),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename=select_{int(datetime.datetime.now().timestamp())}.xlsx"})
 
-    rows = ""
-    for g in body.groupSummary:
-        rows += (
-            f"<tr><td>第{g.get('group')}组</td>"
-            f"<td>{_fmt(g.get('avgReturn'), True)}</td>"
-            f"<td>{g.get('sample')}</td></tr>"
-        )
-
-    bench_html = ""
-    if bench:
-        bench_html = (
-            '<div class="card"><h3>基准对比</h3><table>'
-            "<tr><th>指标</th><th>策略</th><th>基准</th></tr>"
-            f"<tr><td>累计收益</td><td>{_fmt(m.get('cumulativeReturn'), True)}</td>"
-            f"<td>{_fmt(bench.get('cumulativeReturn'), True)}</td></tr>"
-            f"<tr><td>年化收益</td><td>{_fmt(m.get('annualizedReturn'), True)}</td>"
-            f"<td>{_fmt(bench.get('annualizedReturn'), True)}</td></tr>"
-            f"<tr><td>Sharpe</td><td>{_fmt(m.get('sharpe'))}</td>"
-            f"<td>{_fmt(bench.get('sharpe'))}</td></tr>"
-            f"<tr><td>Alpha</td><td>-</td><td>{_fmt(bench.get('alpha'))}</td></tr>"
-            f"<tr><td>Beta</td><td>-</td><td>{_fmt(bench.get('beta'))}</td></tr>"
-            "</table></div>"
-        )
-
+    rows_html = ""
+    for r in rows:
+        rows_html += (f"<tr><td>{r.get('rank')}</td><td>{r.get('code')}</td><td>{r.get('name')}</td>"
+                      f"<td>{r.get('price')}</td><td>{r.get('pctChg')}</td><td>{r.get('score')}</td></tr>")
     html = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8">
-<title>回测报告 · {body.factorLabel}</title>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>{label}</title>
 <style>
 body{{font-family:-apple-system,"Segoe UI","PingFang SC",sans-serif;background:#0b1020;color:#e6ebf5;margin:0;padding:32px}}
 h1{{font-size:24px;border-left:4px solid #4f8cff;padding-left:10px}}
-h3{{color:#cfe0ff;margin-top:24px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0}}
-.kpi{{background:#121a30;border:1px solid #23304f;border-radius:10px;padding:14px}}
-.kpi .n{{font-size:22px;font-weight:700;color:#4f8cff}}
-.kpi .l{{color:#8e9bbd;font-size:12px;margin-top:4px}}
 .card{{background:#121a30;border:1px solid #23304f;border-radius:10px;padding:16px;margin:14px 0}}
 table{{width:100%;border-collapse:collapse;font-size:13px}}
 th,td{{border:1px solid #23304f;padding:8px;text-align:left}}
 th{{background:#16213c;color:#cfe0ff}}
 .sub{{color:#8e9bbd;font-size:13px}}
 </style></head><body>
-<h1>分层回测报告 · {body.factorLabel}</h1>
-<div class="sub">生成时间 {now} · 调仓次数 {m.get('rebalanceCount','-')} · 成本率 {_fmt(m.get('costRate'))}</div>
-<div class="grid">{kpis}</div>
-{bench_html}
-<div class="card"><h3>分组收益</h3><table>
-<tr><th>分组</th><th>平均收益</th><th>样本数</th></tr>{rows}</table></div>
+<h1>{label}</h1>
+<div class="sub">生成时间 {now} · 候选池 {body.poolSize} · 榜单 {len(rows)} 只</div>
+<div class="card"><table><tr><th>排名</th><th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th><th>综合得分</th></tr>{rows_html}</table></div>
 </body></html>"""
-    return Response(content=html, media_type="text/html",
-                    headers={"Content-Disposition": f"attachment; filename=backtest_{int(datetime.datetime.now().timestamp())}.html"})
-
-
-def _export_excel(body: ExportBody) -> Response:
-    try:
-        from openpyxl import Workbook
-    except ImportError:
-        raise HTTPException(500, "服务器未安装 openpyxl，无法导出 Excel")
-
-    wb = Workbook()
-    m = body.metrics or {}
-
-    ws = wb.active
-    ws.title = "绩效指标"
-    rows = [
-        ("因子", body.factorLabel),
-        ("累计收益", m.get("cumulativeReturn")),
-        ("年化收益", m.get("annualizedReturn")),
-        ("年化波动", m.get("annualizedVolatility")),
-        ("Sharpe", m.get("sharpe")),
-        ("Sortino", m.get("sortino")),
-        ("最大回撤", m.get("maxDrawdown")),
-        ("Calmar", m.get("calmar")),
-        ("胜率", m.get("winRate")),
-        ("调仓次数", m.get("rebalanceCount")),
-        ("成本率", m.get("costRate")),
-    ]
-    for r in rows:
-        ws.append(r)
-
-    if body.groupSummary:
-        ws2 = wb.create_sheet("分组收益")
-        ws2.append(["分组", "平均收益", "样本数"])
-        for g in body.groupSummary:
-            ws2.append([g.get("group"), g.get("avgReturn"), g.get("sample")])
-
-    if body.longShort:
-        ws3 = wb.create_sheet("多空净值")
-        ws3.append(["日期", "多空收益", "累计收益", "毛收益"])
-        for p in body.longShort:
-            ws3.append([p.get("date"), p.get("longShort"), p.get("cum"), p.get("gross")])
-
-    if body.icSeries:
-        ws4 = wb.create_sheet("IC序列")
-        ws4.append(["日期", "IC", "RankIC", "样本数"])
-        for p in body.icSeries:
-            ws4.append([p.get("date"), p.get("ic"), p.get("rankIc"), p.get("sample")])
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    data = buf.getvalue()
-    return Response(
-        content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=backtest_{int(datetime.datetime.now().timestamp())}.xlsx"},
-    )
+    if fmt == "html":
+        return Response(content=html, media_type="text/html",
+                        headers={"Content-Disposition": f"attachment; filename=select_{int(datetime.datetime.now().timestamp())}.html"})
+    if fmt == "pdf":
+        data = reporting.render_pdf({
+            "factorLabel": label,
+            "metrics": {"rebalanceCount": len(rows)},
+            "benchmark": None, "groupSummary": [], "longShort": [], "icSeries": [],
+        })
+        if data is None:
+            return Response(content=html, media_type="text/html",
+                            headers={"Content-Disposition": f"attachment; filename=select_{int(datetime.datetime.now().timestamp())}.html"})
+        return Response(content=data, media_type="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename=select_{int(datetime.datetime.now().timestamp())}.pdf"})
+    raise HTTPException(400, "format 必须为 html / excel / pdf")
