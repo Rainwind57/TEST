@@ -100,7 +100,7 @@ onMounted(loadFactorOptions)
       </div>
       <div class="field"><label>候选池规模</label><input v-model="poolSize" type="number" min="30" max="300" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
-      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="360" /></div>
+      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="2500" /></div>
       <button class="btn-primary" :disabled="loading" @click="runRegression">{{ loading ? '计算中…' : '运行多因子回归' }}</button>
       <button class="btn-ghost" v-if="result" @click="gotoBacktest">用显著因子回测</button>
     </div>

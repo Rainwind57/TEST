@@ -298,7 +298,7 @@ onMounted(async () => {
       </div>
       <div class="field"><label>分组数</label><input v-model="groups" type="number" min="2" max="10" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
-      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="360" /></div>
+      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="2500" /></div>
       <div class="field"><label>回测起始日</label><input v-model="startDate" type="date" /></div>
       <div class="field"><label>回测结束日</label><input v-model="endDate" type="date" /></div>
       <div class="field"><label>基准</label>

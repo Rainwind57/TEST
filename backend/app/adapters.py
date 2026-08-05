@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+import threading
 import time
 import datetime
 import httpx
@@ -23,15 +24,42 @@ def _kline_cache_set(key: str, value: tuple[float, list]) -> None:
         _kline_cache.popitem(last=False)
 
 
-async def _http_get(url: str, timeout: int = 10, headers: dict | None = None,
+# 共享 HTTP 客户端（按事件循环隔离）：复用 TCP/TLS 连接池，避免每次请求重建握手。
+# 旧版 _http_get 每次调用都新建 AsyncClient，选股/回测/ML 对成百上千只股票各拉一次
+# K 线时握手开销被成倍放大，是"十分缓慢"的主因。httpx 客户端绑定创建时的 event loop，
+# 故按 loop id 隔离（optimize 用独立临时 loop 跑回测）。
+_http_clients: dict[int, httpx.AsyncClient] = {}
+_clients_lock = threading.Lock()
+
+
+async def _http_client() -> httpx.AsyncClient:
+    """返回当前事件循环上的共享 AsyncClient（懒创建）。"""
+    loop_id = id(asyncio.get_running_loop())
+    with _clients_lock:
+        client = _http_clients.get(loop_id)
+        if client is None:
+            client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+            _http_clients[loop_id] = client
+        return client
+
+
+async def close_http_client() -> None:
+    """关闭当前事件循环上注册的共享客户端（应用关停 / optimize 临时 loop 结束时调用）。"""
+    loop_id = id(asyncio.get_running_loop())
+    with _clients_lock:
+        client = _http_clients.pop(loop_id, None)
+    if client is not None:
+        await client.aclose()
+
+
+async def _http_get(url: str, timeout: int = 8, headers: dict | None = None,
                     retries: int = 2, base_delay: float = 0.5) -> httpx.Response:
-    """带指数退避重试的 HTTP GET（腾讯/东财接口偶发限流，旧版无重试静默丢样本）。"""
+    """带指数退避重试的 HTTP GET（复用共享连接池；单笔超时下调，失败快速退出）。"""
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=timeout, headers=headers or {},
-                                         follow_redirects=True) as client:
-                return await client.get(url)
+            client = await _http_client()
+            return await client.get(url, timeout=timeout, headers=headers or {})
         except Exception as e:
             last_exc = e
             if attempt < retries:
@@ -200,7 +228,7 @@ _SINA_PAGE_SIZE = 100
 _SINA_MAX_PAGES = 50  # 最多扫描 5000 只，覆盖全市场
 
 _market_cache: dict[str, tuple[float, list]] = {}
-MARKET_CACHE_TTL = 60  # 秒
+MARKET_CACHE_TTL = 300  # 秒（旧版 60s 太短，行情页频繁重复拉取）
 
 
 def _num(item: dict, key: str):
@@ -246,7 +274,7 @@ async def _fetch_sina_page(client: httpx.AsyncClient, page: int, sort_field: str
         "page": page, "num": _SINA_PAGE_SIZE, "sort": sort_field, "asc": 0,
         "node": "hs_a", "symbol": "", "_s_r_a": "page",
     }
-    resp = await client.get(_SINA_MARKET_URL, params=params)
+    resp = await client.get(_SINA_MARKET_URL, params=params, headers=_SINA_HEADERS, timeout=10)
     return _parse_sina_jsonp(resp.text)
 
 
@@ -385,26 +413,26 @@ async def _fetch_sina_market(board: str, limit: int, sort_field: str, matcher) -
     """新浪 Market_Center 分页拉取 + 板块过滤。失败抛异常由上层降级。"""
     matched: list[dict] = []
     seen_codes: set[str] = set()
-    async with httpx.AsyncClient(timeout=15, headers=_SINA_HEADERS) as client:
-        page = 1
-        batch_size = 5
-        while len(matched) < limit and page <= _SINA_MAX_PAGES:
-            pages = range(page, min(page + batch_size, _SINA_MAX_PAGES + 1))
-            results = await asyncio.gather(*(_fetch_sina_page(client, p, sort_field) for p in pages))
-            got_any = False
-            for rows in results:
-                if rows:
-                    got_any = True
-                for item in rows:
-                    row = _parse_sina_market_row(item)
-                    if not row["code"] or row["code"] in seen_codes:
-                        continue
-                    seen_codes.add(row["code"])
-                    if matcher(row["code"][2:]):
-                        matched.append(row)
-            page += batch_size
-            if not got_any:
-                break
+    client = await _http_client()
+    page = 1
+    batch_size = 10  # 每批并发页数（旧版 5，翻页更慢）
+    while len(matched) < limit and page <= _SINA_MAX_PAGES:
+        pages = range(page, min(page + batch_size, _SINA_MAX_PAGES + 1))
+        results = await asyncio.gather(*(_fetch_sina_page(client, p, sort_field) for p in pages))
+        got_any = False
+        for rows in results:
+            if rows:
+                got_any = True
+            for item in rows:
+                row = _parse_sina_market_row(item)
+                if not row["code"] or row["code"] in seen_codes:
+                    continue
+                seen_codes.add(row["code"])
+                if matcher(row["code"][2:]):
+                    matched.append(row)
+        page += batch_size
+        if not got_any:
+            break
     return matched[:limit]
 
 
@@ -465,7 +493,7 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
 async def _fetch_sina_kline(code: str, days: int) -> list[dict]:
     """新浪日K线（北交所主力源：920xxx 全历史，腾讯仅当日；8xxxxx 数据止于换码前）。"""
     url = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
-           f"?symbol={code}&scale=240&ma=no&datalen={max(1, min(days, 1023))}")
+           f"?symbol={code}&scale=240&ma=no&datalen={max(1, days)}")
     try:
         resp = await _http_get(url, 10)
         rows = json.loads(resp.text) if resp.text.strip().startswith("[") else []
@@ -492,7 +520,7 @@ async def _fetch_eastmoney_kline(code: str, days: int) -> list[dict]:
     url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
            f"?secid={market}.{pure}&fields1=f1,f2,f3"
            "&fields2=f51,f52,f53,f54,f55,f56,f57"
-           f"&klt=101&fqt=1&end=20500101&lmt={max(1, min(days, 500))}")
+           f"&klt=101&fqt=1&end=20500101&lmt={max(1, days)}")
     try:
         resp = await _http_get(url, 10)
         klines = (resp.json() or {}).get("data", {}).get("klines") or []
@@ -752,7 +780,7 @@ async def _eastmoney_clist(params: dict) -> dict:
     for host in hosts:
         try:
             url = f"https://{host}/api/qt/clist/get?{urlencode(params)}"
-            resp = await _http_get(url, 15)
+            resp = await _http_get(url, 10)
             _EASTMONEY_HOST_OK = host
             return resp.json() or {}
         except Exception as e:

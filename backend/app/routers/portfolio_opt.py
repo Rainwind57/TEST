@@ -110,7 +110,7 @@ async def estimate_mu_cov(body: EstimateBody):
     取消用户手工粘贴矩阵。mu=日收益均值×252，cov=日收益协方差×252。"""
     if len(body.codes) < 2:
         raise HTTPException(400, "至少需要 2 只股票")
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(body.codes))))
 
     async def fetch_one(code):
         async with sem:

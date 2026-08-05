@@ -52,8 +52,11 @@ def _objective(trial: optuna.Trial, base: dict, full_hist: int, is_end_date: str
         cfg["factor"] = base["factor"]
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(sel.run_backtest(sel.BacktestBody(**cfg)))
-        loop.close()
+        try:
+            result = loop.run_until_complete(sel.run_backtest(sel.BacktestBody(**cfg)))
+        finally:
+            loop.run_until_complete(adapters.close_http_client())
+            loop.close()
         return float(result.get("metrics", {}).get("sharpe", 0.0))
     except Exception:
         return -1e9
@@ -71,6 +74,7 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -
     try:
         mid_date = loop.run_until_complete(_mid_date(base_config["board"], full_hist))
     finally:
+        loop.run_until_complete(adapters.close_http_client())
         loop.close()
 
     study = optuna.create_study(direction="maximize",
@@ -125,8 +129,11 @@ def _run_with(base: dict, full_hist: int, params: dict,
         cfg["factor"] = base["factor"]
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(sel.run_backtest(sel.BacktestBody(**cfg)))
-        loop.close()
+        try:
+            result = loop.run_until_complete(sel.run_backtest(sel.BacktestBody(**cfg)))
+        finally:
+            loop.run_until_complete(adapters.close_http_client())
+            loop.close()
         m = result.get("metrics", {})
         return {
             "sharpe": m.get("sharpe"), "annualizedReturn": m.get("annualizedReturn"),

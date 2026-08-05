@@ -38,8 +38,9 @@ app.add_middleware(
 # 读接口限流：旧版 /api/quote、/api/select/backtest、/api/factor 等读接口完全开放，
 # 同网段任意客户端可调用算力与第三方接口被刷。按 IP 维护滑动窗口，登录用户宽松、
 # 匿名严格；写操作本就 require_user_id 强制登录，不限流。
-_ANON_LIMIT = int(os.environ.get("QUANT_RATE_ANON", "60"))   # 匿名每分钟
-_USER_LIMIT = int(os.environ.get("QUANT_RATE_USER", "600"))  # 登录每分钟
+# 限额放宽：行情页逐只拉 quote/kline，匿名 60/min 极易撞 429 表现为"卡/慢/偶发失败"。
+_ANON_LIMIT = int(os.environ.get("QUANT_RATE_ANON", "300"))   # 匿名每分钟
+_USER_LIMIT = int(os.environ.get("QUANT_RATE_USER", "2000"))  # 登录每分钟
 _WINDOW = 60.0
 _rate_buckets: dict[str, deque] = defaultdict(deque)
 _exempt_paths = {"/api/health", "/api/auth/login", "/api/auth/register"}
@@ -65,6 +66,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 content={"detail": f"请求过于频繁，每分钟上限 {limit} 次"},
             )
         dq.append(now)
+        # 定期清理过期桶，防止不同 IP 长期累积内存
+        if len(_rate_buckets) > 10000:
+            for k, bucket in list(_rate_buckets.items()):
+                if not bucket or now - bucket[-1] > _WINDOW:
+                    del _rate_buckets[k]
         return await call_next(request)
 
 
@@ -104,6 +110,13 @@ async def on_startup():
     from . import scheduler
     if db.get_scheduler_enabled():
         scheduler.start()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # 关闭共享 HTTP 连接池，避免进程退出时残留未关闭连接
+    from . import adapters
+    await adapters.close_http_client()
 
 
 app.include_router(quote.router)

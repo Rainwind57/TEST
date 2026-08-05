@@ -41,7 +41,7 @@ function selectCode(code) { store.activeCode = code }
 async function loadKline() {
   if (!store.activeCode) { klineData.value = []; return }
   try {
-    const res = await api.get('/kline', { params: { code: store.activeCode, days: 90 } })
+    const res = await api.get('/kline', { params: { code: store.activeCode, days: 500 } })
     klineData.value = res.data
   } catch (e) { klineData.value = [] }
 }

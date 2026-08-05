@@ -122,7 +122,7 @@ onMounted(async () => {
         </select>
       </div>
       <div class="field"><label>预测天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
-      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="300" /></div>
+      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="2500" /></div>
       <button class="btn-primary" :disabled="loading" @click="runRegression">{{ loading ? '计算中…' : '运行回归' }}</button>
       <button class="btn-ghost" v-if="result" @click="gotoBacktest">用该因子回测</button>
       <span class="hint">对自选股历史行情做滚动窗口取样：因子值(t) vs 未来N日收益率(t→t+N)，样本合并后按所选方法拟合</span>

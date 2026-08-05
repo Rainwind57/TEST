@@ -104,10 +104,11 @@ class SelectBody(BaseModel):
     saveArtifact: bool = False       # 选股结果落盘为中间结果，供下一环节（回测/组合/风险）复用
 
 
-async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int = 260,
+async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int = 500,
                                 end_date: str | None = None,
                                 start_date: str | None = None) -> dict:
-    sem = asyncio.Semaphore(15)
+    # 并发上限随池大小自适应：旧版固定 15，大池(500/1000/3000)下分批过多必超时
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
 
     async def one(code):
         async with sem:
@@ -416,7 +417,8 @@ async def run_backtest(body: BacktestBody):
         r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
         for r in pool
     }
-    sem = asyncio.Semaphore(15)
+    # 回测 K 线并发随池大小自适应（旧版固定 15）
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
 
     async def fetch_one(code):
         async with sem:
@@ -651,7 +653,7 @@ async def run_event_backtest(body: EventBacktestBody):
     except Exception as e:
         raise HTTPException(502, f"候选池获取失败: {e}")
     codes = [r["code"] for r in pool]
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
     kline_by_code = {}
 
     async def fetch_one(code):
@@ -759,7 +761,7 @@ async def run_factor_regression(body: FactorRegressionBody):
         raise HTTPException(502, f"候选池获取失败: {e}")
 
     codes = [row["code"] for row in pool]
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
 
     async def fetch_one(code):
         async with sem:

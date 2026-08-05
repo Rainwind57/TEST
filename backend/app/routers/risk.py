@@ -24,7 +24,7 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
         raise HTTPException(422, "codes 不能为空")
     quotes = await adapters.fetch_quotes(codes)
     stock_data = []
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
 
     async def one(code):
         async with sem:

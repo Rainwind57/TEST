@@ -6,7 +6,7 @@ export { baseURL }
 
 const api = axios.create({
   baseURL,
-  timeout: 60000
+  timeout: 300000  // 旧版 60s：选股/回测/ML 大池操作经常跑不完被误判超时，放宽到 5 分钟
 })
 
 api.interceptors.request.use((config) => {

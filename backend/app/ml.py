@@ -750,7 +750,7 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
         snap_keys = [k for k in feature_names if k in snap_set]
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(pool))))
     collected = []
 
     async def one(row):
@@ -842,7 +842,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
         for r in pool
     }
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
 
     async def fetch_one(code):
         async with sem:
@@ -1097,7 +1097,7 @@ async def score_codes(mid: str, codes: list[str]) -> list[dict]:
             quotes = await adapters.fetch_quotes(codes)
         except Exception:
             quotes = {}
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
     collected = []
 
     async def one(code):
