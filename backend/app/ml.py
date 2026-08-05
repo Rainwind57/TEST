@@ -34,6 +34,52 @@ os.makedirs(ML_DIR, exist_ok=True)
 
 TRADING_DAYS = 252
 
+# 内置技术因子的最长回看窗口：dist_52w_high/low 完整窗口 240 日（momentum120 次之，120 日）。
+# ML 训练/评估默认 hist 必须覆盖它，否则「开箱即用」必报有效样本不足。
+_MAX_FACTOR_LOOKBACK = 240
+# ML 训练/评估/寻优的默认历史长度：1024 覆盖全部内置长周期因子（新浪封顶 1023 可及）
+ML_DEFAULT_HIST = 1024
+
+
+def min_hist_for_ml(n: int = 5) -> int:
+    """ML 内置技术因子所需最小历史长度：最长因子窗口 + 持有期 + 1（样本起点）。"""
+    return _MAX_FACTOR_LOOKBACK + n + 1
+
+
+def _resolve_boards(board: str, boards: list[str] | None) -> list[str]:
+    """板块解析：优先用 boards（多选），否则回退单 board（向后兼容旧前端）。"""
+    bs = [b for b in (boards or []) if b]
+    return bs or [board or "all"]
+
+
+def _empty_pool_error(board: str, pool_size: int) -> ValueError:
+    """候选池为空时的结构化错误：区分「上游行情源故障」与「板块无匹配股票」。"""
+    health = adapters.market_list_health()
+    if health.get("degraded"):
+        return ValueError(
+            f"候选池为空：上游行情列表获取失败（{health.get('last_error', '网络故障/被限流')}）。"
+            f"这是数据源问题而非参数问题，请稍后重试，或先到行情页确认列表可加载。"
+        )
+    return ValueError(
+        f"候选池为空：板块「{board}」当前无匹配股票（poolSize={pool_size}）。"
+        f"请检查板块范围或候选池规模。"
+    )
+
+
+async def _kline_retry(kline_fn, code: str, days: int, attempts: int = 3) -> list[dict]:
+    """K 线拉取带重试：上游限流/超时返回空或抛错时快速重试，
+    避免回测/打分高并发场景下单次网络抖动静默丢票。"""
+    for attempt in range(attempts):
+        try:
+            kl = await kline_fn(code, days)
+            if kl:
+                return kl
+        except Exception:
+            pass
+        if attempt < attempts - 1:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    return []
+
 # 需要额外拉取的快照因子（行情快照 row 不自带，须调财务/资金流接口）
 _FINANCE_KEYS = {"roe", "net_margin", "revenue_yoy", "profit_yoy",
                  "gross_margin", "debt_ratio", "eps", "bps", "roa"}
@@ -89,7 +135,8 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                         use_snapshot: bool = False,
                         asset_class: str = "a-share",
                         start_date: str | None = None,
-                        end_date: str | None = None) -> dict:
+                        end_date: str | None = None,
+                        boards: list[str] | None = None) -> dict:
     """构建 ML 数据集：候选池每只股票算全部量价因子 + 未来 N 日收益。
 
     返回 {features, target, codes, dates, feature_names}。
@@ -103,11 +150,18 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         kline_fn = adapters.fetch_future_kline
         snapshot_keys = []
     else:
-        pool = await adapters.fetch_market_list(board, pool_size)
+        # 多板块 OR 合并取池（板块可组合；hs300/zz500 在 adapters 内走真实成分股）
+        pool = await adapters.fetch_market_list_multi(_resolve_boards(board, boards), pool_size)
         kline_fn = adapters.fetch_kline
         # sector 为类别因子（direction=0），不可作数值特征，否则 np.float64 转型崩溃
         snapshot_keys = [k for k in SNAPSHOT_FACTORS.keys()
                          if use_snapshot and SNAPSHOT_FACTORS[k].get("format") != "categorical"]
+    # 候选池为空：报「上游行情源故障」而非误导性的「样本不足」（P0 可观测性）
+    if not pool:
+        raise _empty_pool_error(board, pool_size)
+    # 历史长度钳制：内置长周期因子（如 momentum120/dist_52w_high 240 日窗口）需要足够历史，
+    # 用户传过小的 hist 时自动抬升，避免默认参数下「开箱即失败」
+    hist = max(int(hist), min_hist_for_ml(n))
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
     if snapshot_keys:
@@ -119,13 +173,14 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     labels = []
     meta_codes = []
     meta_dates = []
-    stat = {"total": total, "kline_ok": 0, "kline_short": 0, "factor_missing": 0}
+    stat = {"total": total, "kline_ok": 0, "kline_fail": 0, "kline_short": 0, "factor_missing": 0}
     for idx, code in enumerate(codes):
         if progress_cb:
             progress_cb(idx + 1, total)
         try:
             kline = await kline_fn(code, hist)
         except Exception as e:
+            stat["kline_fail"] += 1
             logger.warning("ML数据集拉取K线失败 code=%s: %s", code, e)
             continue
         if len(kline) < 60 + n:
@@ -166,8 +221,8 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
 
     if not rows:
         raise ValueError(
-            f"有效样本不足，无法构建数据集：候选池 {stat['total']} 只，K线历史不足 {60 + n} 日被剔除 "
-            f"{stat['kline_short']} 只，因子缺失切片 {stat['factor_missing']} 个。"
+            f"有效样本不足，无法构建数据集：候选池 {stat['total']} 只，K线拉取失败 {stat['kline_fail']} 只，"
+            f"历史不足 {60 + n} 日被剔除 {stat['kline_short']} 只，因子缺失切片 {stat['factor_missing']} 个。"
             f"请增大候选池规模(poolSize)、加长历史(hist)或放宽板块范围后再试。"
         )
 
@@ -399,6 +454,13 @@ def train_final_model(dataset: dict, model_type: str = "gbdt") -> dict:
         "featureNames": feature_names, "nSamples": len(y),
         "trainedAt": datetime.datetime.now().isoformat(),
     }
+    # 特征重要性随训练写入侧车 JSON：调参接口读 meta 无需再反序列化整包模型
+    if hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        meta["featureImportance"] = sorted(
+            [{"feature": feature_names[i], "importance": float(imp[i])}
+             for i in range(min(len(feature_names), len(imp)))],
+            key=lambda x: x["importance"], reverse=True)
     try:
         with open(os.path.join(ML_DIR, f"{mid}.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -536,39 +598,63 @@ def delete_model(mid: str) -> bool:
 
 
 def load_model_meta(mid: str) -> dict | None:
-    """读取模型元数据（特征名、重要性、超参），供前端可视化与人工调参。"""
+    """读取模型元数据（特征名、重要性、超参），供前端可视化与人工调参。
+
+    优先读 sidecar JSON（训练/导入/手动创建时已写入 featureImportance），
+    避免每次「调参」都 joblib.load 整包模型：重模型反序列化对 lightgbm 版本敏感，
+    跨版本反序列化可能段错误崩溃 worker，前端表现为 network error（P0）。
+    仅对无重要性的旧模型才回退加载 bundle，且失败时返回 JSON 已有信息而非崩溃。
+    """
     meta_path = os.path.join(ML_DIR, f"{mid}.json")
+    meta = None
     if os.path.exists(meta_path):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
         except Exception:
             meta = None
-    else:
-        meta = None
     path = os.path.join(ML_DIR, f"{mid}.joblib")
     if not os.path.exists(path):
         return None
+
+    # JSON 已含特征名 + 重要性：直接返回，不反序列化模型包（调参热路径）
+    if meta and meta.get("featureNames") and meta.get("featureImportance") is not None:
+        result = {
+            "id": mid,
+            "modelType": meta.get("modelType", "gbdt"),
+            "featureNames": meta["featureNames"],
+            "featureImportance": meta["featureImportance"],
+        }
+        for k in ("trainedAt", "nSamples", "name", "manual", "rule",
+                  "threshold", "imported", "sourceFile", "featureWeights"):
+            if k in meta:
+                result[k] = meta[k]
+        return result
+
+    # 旧模型（JSON 缺重要性）：回退加载 bundle 提取；失败返回 JSON 已有信息（不崩溃）
+    feature_names = (meta or {}).get("featureNames") or []
+    model_type = (meta or {}).get("modelType", "gbdt")
+    importances = []
     try:
         bundle = joblib.load(path)
+        feature_names = bundle.get("feature_names") or feature_names
+        model_type = bundle.get("model_type") or model_type
+        model = bundle.get("model")
+        if model is not None and hasattr(model, "feature_importances_"):
+            imp = model.feature_importances_
+            importances = [{"feature": feature_names[i], "importance": float(imp[i])}
+                           for i in range(min(len(feature_names), len(imp)))]
     except Exception:
-        return None
-    feature_names = bundle.get("feature_names", [])
-    model_type = bundle.get("model_type", "gbdt")
-    model = bundle.get("model")
-    # 提取特征重要性（GBDT/LightGBM 均有 feature_importances_）
-    importances = []
-    if model is not None and hasattr(model, "feature_importances_"):
-        imp = model.feature_importances_
-        importances = [{"feature": feature_names[i], "importance": float(imp[i])}
-                       for i in range(min(len(feature_names), len(imp)))]
+        importances = []
     result = {
         "id": mid, "modelType": model_type, "featureNames": feature_names,
         "featureImportance": sorted(importances, key=lambda x: x["importance"], reverse=True),
     }
     if meta:
-        result["trainedAt"] = meta.get("trainedAt")
-        result["nSamples"] = meta.get("nSamples")
+        for k in ("trainedAt", "nSamples", "name", "manual", "rule",
+                  "threshold", "imported", "sourceFile", "featureWeights"):
+            if k in meta:
+                result[k] = meta[k]
     return result
 
 
@@ -729,7 +815,8 @@ def _apply_threshold(preds: list[float], threshold: float | None) -> list[float]
 
 async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
                        progress_cb=None, adjust: dict | None = None,
-                       asset_class: str = "a-share") -> list[dict]:
+                       asset_class: str = "a-share",
+                       boards: list[str] | None = None) -> list[dict]:
     """加载落盘模型对候选池最新截面打分，返回按预测分降序的打分列表。"""
     bundle = _load_model(mid)
     feature_names = bundle["feature_names"]
@@ -743,11 +830,13 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
         kline_fn = adapters.fetch_future_kline
         snap_keys = []
     else:
-        pool = await adapters.fetch_market_list(board, pool_size)
+        pool = await adapters.fetch_market_list_multi(_resolve_boards(board, boards), pool_size)
         kline_fn = adapters.fetch_kline
         # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
         # 旧版直接引用未定义的 snap_keys 抛 NameError，使 score_latest 完全不可用
         snap_keys = [k for k in feature_names if k in snap_set]
+    if not pool:
+        raise _empty_pool_error(board, pool_size)
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
     sem = asyncio.Semaphore(min(50, max(15, len(pool))))
@@ -756,10 +845,9 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
     async def one(row):
         code = row["code"]
         async with sem:
-            try:
-                kline = await kline_fn(code, 260)
-            except Exception as e:
-                logger.warning("ML打分拉取K线失败 code=%s: %s", code, e)
+            kline = await _kline_retry(kline_fn, code, 260)
+            if not kline:
+                logger.warning("ML打分拉取K线失败 code=%s", code)
                 return
         if len(kline) < 60:
             return
@@ -807,7 +895,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                          asset_class: str = "a-share",
                          start_date: str | None = None,
                          end_date: str | None = None,
-                         config: dict | None = None) -> dict:
+                         config: dict | None = None,
+                         boards: list[str] | None = None) -> dict:
     """用落盘模型预测分作为截面信号做分层回测，响应结构与 /api/select/backtest 一致，
     前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。"""
     bundle = _load_model(mid)
@@ -819,7 +908,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
 
     groups = max(2, min(10, groups))
     n = max(1, n)
-    hist = max(60, hist)
+    # 历史钳制：内置长周期因子需要足够窗口（momentum120 / dist_52w_high 240 日）
+    hist = max(int(hist), min_hist_for_ml(n))
 
     bench_code = BENCHMARKS.get(benchmark)
     if benchmark != "none" and bench_code is None:
@@ -830,10 +920,13 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         kline_fn = adapters.fetch_future_kline
         snap_keys = []
     else:
-        pool = await adapters.fetch_market_list(board, pool_size)
+        pool = await adapters.fetch_market_list_multi(_resolve_boards(board, boards), pool_size)
         kline_fn = adapters.fetch_kline
         # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
         snap_keys = [k for k in feature_names if k in snap_set]
+    # 候选池为空：报「上游行情源故障」而非误导性的「样本不足」
+    if not pool:
+        raise _empty_pool_error(board, pool_size)
     # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
@@ -842,22 +935,25 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
         for r in pool
     }
-    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
+    # 并发上限收紧 + 单票重试：上游限流时 50 并发极易被掐，10~12 并发 + 3 次重试稳得多
+    sem = asyncio.Semaphore(min(12, max(8, len(codes))))
+    fetch_fail = 0
 
     async def fetch_one(code):
+        nonlocal fetch_fail
         async with sem:
-            try:
-                kline = await kline_fn(code, hist + n + 25)
-            except Exception as e:
-                logger.warning("ML回测拉取K线失败 code=%s: %s", code, e)
-                return code, []
+            kline = await _kline_retry(kline_fn, code, hist + n + 25)
+            if not kline:
+                fetch_fail += 1
+                logger.warning("ML回测拉取K线失败 code=%s", code)
             return code, kline
 
     fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
     series = {code: kl for code, kl in fetched if len(kl) >= 40}
     if len(series) < groups * 3:
         raise ValueError(
-            f"有效股票样本不足：候选池 {len(pool)} 只，K线≥40日的仅 {len(series)} 只（需 ≥{groups * 3}）。"
+            f"有效股票样本不足：候选池 {len(pool)} 只，K线拉取失败 {fetch_fail} 只，"
+            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只（需 ≥{groups * 3}）。"
             f"请增大候选池规模或放宽板块范围。"
         )
 
@@ -1102,10 +1198,9 @@ async def score_codes(mid: str, codes: list[str]) -> list[dict]:
 
     async def one(code):
         async with sem:
-            try:
-                kline = await adapters.fetch_kline(code, 260)
-            except Exception as e:
-                logger.warning("盯盘模型打分拉取K线失败 code=%s: %s", code, e)
+            kline = await adapters.fetch_kline_retry(code, 260)
+            if not kline:
+                logger.warning("盯盘模型打分拉取K线失败 code=%s", code)
                 return
             if len(kline) < 60:
                 return
@@ -1174,6 +1269,13 @@ def import_model_file(filename: str, data: bytes) -> dict:
         "imported": True, "sourceFile": filename or "",
         "trainedAt": datetime.datetime.now().isoformat(),
     }
+    # 导入时提取重要性写入侧车 JSON，调参接口无需反序列化整包模型
+    if model is not None and hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        meta["featureImportance"] = sorted(
+            [{"feature": list(feature_names)[i], "importance": float(imp[i])}
+             for i in range(min(len(feature_names), len(imp)))],
+            key=lambda x: x["importance"], reverse=True)
     try:
         with open(os.path.join(ML_DIR, f"{mid}.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -1260,6 +1362,9 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
         "name": (name or mid).strip(), "featureNames": feature_names,
         "featureWeights": valid, "threshold": float(threshold or 0.0),
         "rule": rule or "", "manual": True,
+        "featureImportance": sorted(
+            [{"feature": k, "importance": abs(float(v))} for k, v in valid.items()],
+            key=lambda x: x["importance"], reverse=True),
         "trainedAt": datetime.datetime.now().isoformat(),
     }
     try:

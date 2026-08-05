@@ -7,6 +7,7 @@ import { useWatchlistStore } from '../stores/watchlist'
 import { useResearchStore } from '../stores/research'
 import { stripPrefix, fmtPct, fmtNum } from '../utils/format'
 import Skeleton from '../components/Skeleton.vue'
+import BoardSelect from '../components/BoardSelect.vue'
 
 const { toast } = useToast()
 const watchlist = useWatchlistStore()
@@ -23,7 +24,7 @@ const BOARD_OPTIONS = [
 ]
 const GROUP_LABELS = { quant: '量价类因子', fundamental: '估值/财务类因子', technical: '技术类因子（基于K线，计算较慢）', moneyflow: '资金流因子', custom: '自定义组合因子' }
 
-const board = ref('all')
+const boards = ref(['all'])
 const poolSize = ref(200)
 const topN = ref(20)
 const loading = ref(false)
@@ -104,12 +105,12 @@ async function runSelect() {
   checked.clear()
   try {
     const data = await api.post('/select', {
-      board: board.value, poolSize: Number(poolSize.value), topN: Number(topN.value),
+      board: 'all', boards: boards.value, poolSize: Number(poolSize.value), topN: Number(topN.value),
       factors: selectedFactors.value, filters: buildFilters(),
       startDate: startDate.value || null, endDate: endDate.value || null
     })
     result.value = data
-    research.setCurrentSelectResult({ board: board.value, poolSize: Number(poolSize.value), rows: data.rows })
+    research.setCurrentSelectResult({ board: 'all', boards: boards.value, poolSize: Number(poolSize.value), rows: data.rows })
   } catch (e) {
     toast(e.message)
     result.value = null
@@ -164,7 +165,7 @@ async function buyIntoPortfolio() {
 
 // 把当前候选池参数带到主回测页（打通选股→回测，旧版选股结果只能加自选/买入）
 function gotoBacktest() {
-  research.setOptimalParams({ board: board.value, poolSize: Number(poolSize.value) })
+  research.setOptimalParams({ boards: boards.value, poolSize: Number(poolSize.value) })
   router.push('/backtest')
 }
 
@@ -180,9 +181,9 @@ async function saveArtifact() {
       payload: {
         codes: result.value.rows.map(r => r.code),
         rows: result.value.rows,
-        config: { board: board.value, poolSize: Number(poolSize.value), topN: Number(topN.value) },
+        config: { board: 'all', boards: boards.value, poolSize: Number(poolSize.value), topN: Number(topN.value) },
       },
-      name: `选股-${board.value}-${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+      name: `选股-${boards.value.join('+')}-${new Date().toLocaleString('zh-CN', { hour12: false })}`,
     })
     savedArtifactId.value = meta.id
     toast(`已保存中间结果：${meta.id}`)
@@ -197,12 +198,11 @@ async function exportSelectReport(fmt) {
   exportingSel.value = true
   try {
     const payload = {
-      format: fmt,
-      board: board.value,
+      format: fmt, board: 'all', boards: boards.value,
       poolSize: Number(poolSize.value),
       topN: Number(topN.value),
       rows: result.value.rows,
-      config: { board: board.value, poolSize: Number(poolSize.value), topN: Number(topN.value) },
+      config: { board: 'all', boards: boards.value, poolSize: Number(poolSize.value), topN: Number(topN.value) },
     }
     await downloadFile('/reports/select', payload, `select.${fmt}`)
   } catch (e) { toast(e.message) }
@@ -218,14 +218,7 @@ onMounted(() => { loadCatalog(); loadSectors() })
       <div class="card-head"><h2>候选池与筛选条件</h2></div>
       <div class="select-body">
         <div class="panel-row">
-          <div class="field"><label>板块</label>
-            <select v-model="board">
-              <option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option>
-              <optgroup v-if="sectorOptions.length" label="行业板块（动态加载）">
-                <option v-for="s in sectorOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
-              </optgroup>
-            </select>
-          </div>
+          <BoardSelect v-model="boards" :sectors="sectorOptions" />
           <div class="field"><label>候选池规模(按成交额取前N)</label><input v-model="poolSize" type="number" min="20" max="1000" /></div>
           <div class="field"><label>选出 TopN</label><input v-model="topN" type="number" min="1" max="100" /></div>
           <label class="checkbox-field"><input type="checkbox" v-model="filters.excludeSt" /> 剔除 ST</label>

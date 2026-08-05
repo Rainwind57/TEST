@@ -5,6 +5,7 @@ import api from '../api/client'
 import { useToast } from '../stores/toast'
 import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
+import BoardSelect from '../components/BoardSelect.vue'
 
 const { toast } = useToast()
 const router = useRouter()
@@ -19,7 +20,7 @@ const BOARD_OPTIONS = [
   { value: 'bse', label: '北交所' }
 ]
 
-const board = ref('all')
+const boards = ref(['all'])
 const poolSize = ref(80)
 const days = ref(5)
 const hist = ref(200)
@@ -44,7 +45,7 @@ async function runRegression() {
   loading.value = true
   try {
     const data = await api.post('/select/factor-regression', {
-      board: board.value, poolSize: Number(poolSize.value), factors: selectedKeys.value,
+      board: 'all', boards: boards.value, poolSize: Number(poolSize.value), factors: selectedKeys.value,
       n: Number(days.value), hist: Number(hist.value)
     })
     result.value = data
@@ -83,7 +84,7 @@ const returnLineOption = computed(() => {
 function gotoBacktest() {
   const sig = result.value?.summary?.find(s => Math.abs(s.tStat) >= 2) || result.value?.summary?.[0]
   const factor = sig?.key || selectedKeys.value[0]
-  research.setOptimalParams({ factor, board: board.value, poolSize: Number(poolSize.value), n: Number(days.value), hist: Number(hist.value) })
+  research.setOptimalParams({ factor, boards: boards.value, poolSize: Number(poolSize.value), n: Number(days.value), hist: Number(hist.value) })
   router.push('/backtest')
 }
 
@@ -93,11 +94,7 @@ onMounted(loadFactorOptions)
 <template>
   <div>
     <div class="panel-toolbar">
-      <div class="field"><label>板块</label>
-        <select v-model="board">
-          <option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option>
-        </select>
-      </div>
+      <BoardSelect v-model="boards" />
       <div class="field"><label>候选池规模</label><input v-model="poolSize" type="number" min="30" max="300" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
       <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="2500" /></div>

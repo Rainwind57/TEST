@@ -5,12 +5,13 @@ import api from '../api/client'
 import { useToast } from '../stores/toast'
 import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
+import BoardSelect from '../components/BoardSelect.vue'
 
 const { toast } = useToast()
 const router = useRouter()
 const research = useResearchStore()
 
-const board = ref('all')
+const boards = ref(['all'])
 const poolSize = ref(60)
 const factor = ref('momentum')
 const strategySource = ref('factor')   // factor=技术因子 | model=ML模型
@@ -22,6 +23,7 @@ const nTrials = ref(30)
 const benchmark = ref('none')
 
 const loading = ref(false)
+const jobStatus = ref('')
 const result = ref(null)
 const factorOptions = ref([])
 const modelOptions = ref([])
@@ -38,7 +40,7 @@ async function loadModels() {
 
 function baseCfg() {
   const cfg = {
-    board: board.value, poolSize: Number(poolSize.value),
+    board: 'all', boards: boards.value, poolSize: Number(poolSize.value),
     groups: Number(groups.value), n: Number(n.value), hist: Number(hist.value),
     benchmark: benchmark.value,
     commissionRate: 0.00025, stampDuty: 0.001, slippage: 0.001, applyCost: true,
@@ -51,15 +53,32 @@ function baseCfg() {
   return cfg
 }
 
+let pollActive = true
+async function pollJob(jobId, onProgress) {
+  let delay = 1500
+  while (pollActive) {
+    if (document.hidden) { await new Promise(r => setTimeout(r, 1000)); continue }
+    const j = await api.get(`/jobs/${jobId}`)
+    onProgress && onProgress(j.progress, j.message)
+    if (j.status === 'done') return j.result
+    if (j.status === 'error') throw new Error(j.error || '任务失败')
+    if (j.status === 'cancelled') throw new Error('任务已取消')
+    await new Promise(r => setTimeout(r, delay))
+    delay = Math.min(delay * 1.3, 4000)
+  }
+  throw new Error('任务已随页面离开而中止')
+}
+
 async function run() {
   if (strategySource.value === 'model' && !modelId.value) { toast('请先选择 ML 模型'); return }
   loading.value = true
   try {
     const cfg = { ...baseCfg(), nTrials: Number(nTrials.value) }
-    result.value = await api.post('/optimize/backtest', cfg)
+    const { jobId } = await api.post('/jobs', { kind: strategySource.value === 'model' ? 'ml-optimize' : 'optimize', config: cfg })
+    result.value = await pollJob(jobId, (p, m) => jobStatus.value = m || `进度 ${p || 0}%`)
     toast(`寻优完成，${result.value.nTrials} 次试验`)
   } catch (e) { toast(e.message) }
-  finally { loading.value = false }
+  finally { loading.value = false; jobStatus.value = '' }
 }
 
 async function saveStrategy() {
@@ -121,15 +140,7 @@ onMounted(async () => {
     <div class="card">
       <div class="card-head"><h3>参数寻优 · Optuna 贝叶斯搜索</h3><span class="hint">Walk-Forward：IS 区间调参，OOS 区间验证</span></div>
       <div class="panel-toolbar">
-        <div class="field"><label>板块</label>
-          <select v-model="board">
-            <option value="all">全部A股</option>
-            <option value="sh_main">沪市主板</option>
-            <option value="sz_main">深市主板</option>
-            <option value="gem">创业板</option>
-            <option value="star">科创板</option>
-          </select>
-        </div>
+        <BoardSelect v-model="boards" />
         <div class="field"><label>策略来源</label>
           <select v-model="strategySource">
             <option value="factor">技术因子</option>
@@ -159,6 +170,7 @@ onMounted(async () => {
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-primary" :disabled="loading" @click="run">{{ loading ? '寻优中…' : '开始寻优' }}</button>
+        <span v-if="jobStatus" class="hint" style="margin-left:8px">{{ jobStatus }}</span>
         <button class="btn-ghost" v-if="result" @click="saveStrategy">回写为策略</button>
         <button class="btn-ghost" v-if="result" @click="applyToBacktest">应用到回测</button>
       </div>

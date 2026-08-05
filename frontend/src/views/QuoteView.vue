@@ -50,18 +50,42 @@ async function loadKline() {
 }
 
 const klineOption = computed(() => {
-  const dates = klineData.value.map(k => k.date)
-  const values = klineData.value.map(k => [k.open, k.close, k.low, k.high])
+  const data = klineData.value
+  const dates = data.map(k => k.date)
+  const values = data.map(k => [k.open, k.close, k.low, k.high])
+  const closes = data.map(k => k.close)
+  const volumes = data.map(k => k.volume)
+  const ma = (n) => closes.map((_, i) => {
+    if (i < n - 1) return null
+    let s = 0; for (let j = i - n + 1; j <= i; j++) s += closes[j]
+    return +(s / n).toFixed(3)
+  })
   return {
     backgroundColor: 'transparent',
-    grid: { left: 50, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: dates, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' } },
-    yAxis: { scale: true, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-    series: [{
-      type: 'candlestick', data: values,
-      itemStyle: { color: '#ff4d4f', color0: '#21c08b', borderColor: '#ff4d4f', borderColor0: '#21c08b' }
-    }]
+    legend: { data: ['K线', 'MA5', 'MA10', 'MA20', '成交量'], top: 0, textStyle: { fontSize: 11, color: '#8a94a6' } },
+    grid: { left: 60, right: 20, top: 40, bottom: 90 },
+    xAxis: { type: 'category', data: dates, axisLabel: { color: '#8a94a6', rotate: 30 } },
+    yAxis: [
+      { scale: true, position: 'left', axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
+      { scale: true, position: 'right', axisLabel: { color: '#8a94a6' }, splitLine: { show: false }, min: 0 }
+    ],
+    dataZoom: [
+      { type: 'inside', start: 60, end: 100 },
+      { type: 'slider', start: 60, end: 100, height: 24, bottom: 10 }
+    ],
+    series: [
+      { name: 'K线', type: 'candlestick', data: values,
+        itemStyle: { color: '#ff4d4f', color0: '#21c08b', borderColor: '#ff4d4f', borderColor0: '#21c08b' } },
+      { name: 'MA5', type: 'line', data: ma(5), smooth: true, showSymbol: false,
+        lineStyle: { color: '#ff9800', width: 1 }, yAxisIndex: 0 },
+      { name: 'MA10', type: 'line', data: ma(10), smooth: true, showSymbol: false,
+        lineStyle: { color: '#2196f3', width: 1 }, yAxisIndex: 0 },
+      { name: 'MA20', type: 'line', data: ma(20), smooth: true, showSymbol: false,
+        lineStyle: { color: '#9c27b0', width: 1 }, yAxisIndex: 0 },
+      { name: '成交量', type: 'bar', data: volumes, yAxisIndex: 1,
+        itemStyle: { color: params => (params.dataIndex > 0 && closes[params.dataIndex] >= closes[params.dataIndex-1] ? '#ff4d4f' : '#21c08b') } },
+    ]
   }
 })
 
@@ -132,7 +156,7 @@ onUnmounted(() => clearInterval(timer))
     </div>
 
     <div class="card chart-card mb-24">
-      <EChart v-if="klineData.length" :option="klineOption" height="320px" />
+      <EChart v-if="klineData.length" :option="klineOption" height="420px" />
       <div v-else class="empty-hint">暂无K线数据</div>
     </div>
 

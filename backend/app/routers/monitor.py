@@ -51,6 +51,15 @@ async def toggle(body: ToggleBody):
     return {"enabled": scheduler.is_enabled()}
 
 
+@router.post("/scan")
+async def scan(force: bool = False):
+    """立即手动扫描一次盯盘信号（无需等待交易日 15:10 的 cron）。
+
+    force=true 时跳过交易日判断，任意时刻均可验证扫描逻辑。
+    """
+    return await scheduler.scan_now(force=force)
+
+
 @router.get("/equity")
 def equity_history(limit: int = 60):
     conn = db.get_conn()

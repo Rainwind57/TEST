@@ -89,6 +89,7 @@ class FilterSpec(BaseModel):
 
 class SelectBody(BaseModel):
     board: str = "all"
+    boards: list[str] | None = None   # 多板块 OR 组合（如 ["sh_main","gem"]），优先于 board
     poolSize: int = 200
     factors: list[FactorSpec] = []   # 旧版固定规格加权（key/weight/direction）
     expression: str | None = None    # P1-6 表达式引擎：传表达式时优先于 factors
@@ -152,7 +153,8 @@ async def run_select(body: SelectBody):
             adjust = rec.get("payload")
         try:
             rows = await ml.score_latest(body.modelId, body.board, body.poolSize,
-                                         adjust=adjust, asset_class=body.assetClass)
+                                         adjust=adjust, asset_class=body.assetClass,
+                                         boards=body.boards)
         except FileNotFoundError as e:
             raise HTTPException(404, str(e))
         except ValueError as e:
@@ -195,19 +197,22 @@ async def run_select(body: SelectBody):
         uf_defs[s.key] = uf
 
     # 自定义股票池：传 codes 时跳过 market_list 拉取，直接用指定代码
+    # 多板块 OR 合并取池（hs300/zz500 在 adapters 内走真实成分股，跨模块行为一致）
     if body.codes:
         pool = [{"code": c, "name": c} for c in body.codes]
-    elif body.board in ("hs300", "zz500"):
-        index_map = {"hs300": "sh000300", "zz500": "sh000905"}
-        constituents = await adapters.fetch_index_constituents(index_map[body.board])
-        if not constituents:
-            raise HTTPException(502, f"获取{body.board}成分股失败")
-        pool = [{"code": c, "name": c} for c in constituents[:body.poolSize]]
     else:
         try:
-            pool = await adapters.fetch_market_list(body.board, body.poolSize)
+            pool = await adapters.fetch_market_list_multi(
+                ml._resolve_boards(body.board, body.boards), body.poolSize)
         except Exception as e:
             raise HTTPException(502, f"候选池获取失败: {e}")
+
+    if not pool:
+        raise HTTPException(
+            502,
+            "候选池为空：上游行情列表获取失败或被限流（非参数问题）。"
+            "请稍后重试，或先到行情页确认列表可加载。",
+        )
 
     f = body.filters
     candidates = []
@@ -347,6 +352,7 @@ async def run_select(body: SelectBody):
 
 class BacktestBody(BaseModel):
     board: str = "all"
+    boards: list[str] | None = None   # 多板块 OR 组合，优先于 board
     poolSize: int = 60
     factor: str = "momentum"
     modelId: str | None = None      # ML 模型 ID：指定时走 ML 信号分层回测（与技术因子二选一）
@@ -377,6 +383,7 @@ async def run_backtest(body: BacktestBody):
                 asset_class=body.assetClass,
                 start_date=body.startDate, end_date=body.endDate,
                 config=body.model_dump(),
+                boards=body.boards,
             )
             res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
             if body.saveArtifact:
@@ -396,6 +403,10 @@ async def run_backtest(body: BacktestBody):
     groups = max(2, min(10, body.groups))
     n = max(1, body.n)
     hist = max(60, body.hist)
+    # 起止日对齐：给定 startDate 时取数窗口需额外覆盖前置暖机（因子计算窗口+回测起点），
+    # 避免用户选了 2020-01-01 但 hist=180 只拉到最近半年、startDate 形同虚设
+    if body.startDate:
+        hist = max(hist, hist + 240)
 
     bench_code = BENCHMARKS.get(body.benchmark)
     if body.benchmark != "none" and bench_code is None:
@@ -408,9 +419,16 @@ async def run_backtest(body: BacktestBody):
             # 期货回测：候选池取主力连续合约，K线走期货适配器，无涨跌停/ST 约束
             pool = [{"code": c, "name": c} for c in adapters.FUTURE_UNIVERSE[:body.poolSize]]
         else:
-            pool = await adapters.fetch_market_list(body.board, body.poolSize)
+            pool = await adapters.fetch_market_list_multi(
+                ml._resolve_boards(body.board, body.boards), body.poolSize)
     except Exception as e:
         raise HTTPException(502, f"候选池获取失败: {e}")
+    if not pool:
+        raise HTTPException(
+            502,
+            "候选池为空：上游行情列表获取失败或被限流（非参数问题）。"
+            "请稍后重试，或先到行情页确认列表可加载。",
+        )
 
     codes = [row["code"] for row in pool]
     is_st = {} if body.assetClass == "future" else {
@@ -419,23 +437,26 @@ async def run_backtest(body: BacktestBody):
     }
     # 回测 K 线并发随池大小自适应（旧版固定 15）
     sem = asyncio.Semaphore(min(50, max(15, len(codes))))
+    fetch_fail = 0
 
     async def fetch_one(code):
+        nonlocal fetch_fail
         async with sem:
-            try:
-                if body.assetClass == "future":
-                    kline = await adapters.fetch_future_kline(code, hist)
-                else:
-                    kline = await adapters.fetch_kline(code, hist)
-            except Exception as e:
-                logger.warning("回测拉取K线失败 code=%s: %s", code, e)
-                return code, []
+            kline_fn = adapters.fetch_future_kline if body.assetClass == "future" else adapters.fetch_kline
+            kline = await ml._kline_retry(kline_fn, code, hist)
+            if not kline:
+                fetch_fail += 1
             return code, kline
 
     fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
     series = {code: kl for code, kl in fetched if len(kl) >= 40}
     if len(series) < groups * 3:
-        raise HTTPException(422, "有效股票样本不足，请增大候选池规模")
+        raise HTTPException(
+            422,
+            f"有效股票样本不足：候选池 {len(pool)} 只，K线拉取失败 {fetch_fail} 只，"
+            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只。"
+            f"请增大候选池规模。",
+        )
 
     bench_series = None
     if bench_code:
@@ -652,17 +673,20 @@ async def run_event_backtest(body: EventBacktestBody):
         pool = await adapters.fetch_market_list(body.board, body.poolSize)
     except Exception as e:
         raise HTTPException(502, f"候选池获取失败: {e}")
+    if not pool:
+        raise HTTPException(
+            502,
+            "候选池为空：上游行情列表获取失败或被限流（非参数问题）。"
+            "请稍后重试，或先到行情页确认列表可加载。",
+        )
     codes = [r["code"] for r in pool]
     sem = asyncio.Semaphore(min(50, max(15, len(codes))))
     kline_by_code = {}
 
     async def fetch_one(code):
         async with sem:
-            try:
-                kl = await adapters.fetch_kline(code, body.hist)
-                return code, kl
-            except Exception:
-                return code, []
+            kl = await ml._kline_retry(adapters.fetch_kline, code, body.hist)
+            return code, kl
     fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
     for code, kl in fetched:
         if len(kl) >= 40:
@@ -739,6 +763,7 @@ def ols_regression_local(xs: list[float], ys: list[float]) -> dict:
 
 class FactorRegressionBody(BaseModel):
     board: str = "all"
+    boards: list[str] | None = None
     poolSize: int = 60
     factors: list[str] = ["momentum", "ma_dev"]
     n: int = 5
@@ -756,27 +781,39 @@ async def run_factor_regression(body: FactorRegressionBody):
     hist = max(60, body.hist)
 
     try:
-        pool = await adapters.fetch_market_list(body.board, body.poolSize)
+        pool = await adapters.fetch_market_list_multi(
+            ml._resolve_boards(body.board, body.boards), body.poolSize)
     except Exception as e:
         raise HTTPException(502, f"候选池获取失败: {e}")
+    if not pool:
+        raise HTTPException(
+            502,
+            "候选池为空：上游行情列表获取失败或被限流（非参数问题）。"
+            "请稍后重试，或先到行情页确认列表可加载。",
+        )
 
     codes = [row["code"] for row in pool]
     sem = asyncio.Semaphore(min(50, max(15, len(codes))))
+    fetch_fail = 0
 
     async def fetch_one(code):
+        nonlocal fetch_fail
         async with sem:
-            try:
-                kline = await adapters.fetch_kline(code, hist)
-            except Exception as e:
-                logger.warning("回测拉取K线失败 code=%s: %s", code, e)
-                return code, []
+            kline = await ml._kline_retry(adapters.fetch_kline, code, hist)
+            if not kline:
+                fetch_fail += 1
             return code, kline
 
     fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
     series = {code: kl for code, kl in fetched if len(kl) >= 40}
     min_sample = len(keys) * 3 + 5
     if len(series) < min_sample:
-        raise HTTPException(422, "有效股票样本不足，请增大候选池规模")
+        raise HTTPException(
+            422,
+            f"有效股票样本不足：候选池 {len(pool)} 只，K线拉取失败 {fetch_fail} 只，"
+            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只（需 ≥{min_sample}）。"
+            f"请增大候选池规模。",
+        )
 
     calcs = {k: FACTORS[k]["calc"] for k in keys}
     date_maps = {code: {row["date"]: idx for idx, row in enumerate(kl)} for code, kl in series.items()}

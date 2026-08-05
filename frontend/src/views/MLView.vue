@@ -5,12 +5,13 @@ import api, { longTask, downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
 import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
+import BoardSelect from '../components/BoardSelect.vue'
 
 const { toast } = useToast()
 const research = useResearchStore()
 const router = useRouter()
 
-const board = ref('all')
+const boards = ref(['all'])
 const poolSize = ref(80)
 const n = ref(5)
 const hist = ref(500)
@@ -50,11 +51,13 @@ const adjustMeta = ref(null)
 const featureWeights = reactive({})
 const threshold = ref(null)
 const lastAdjustId = ref('')
+const adjustNote = ref('')
 
 async function openAdjust(m) {
   if (adjustPanel.value === m.id) { adjustPanel.value = ''; return }
   adjustPanel.value = m.id
   lastAdjustId.value = ''
+  adjustNote.value = ''
   threshold.value = null
   try {
     adjustMeta.value = await api.get(`/ml/models/${m.id}/params`)
@@ -78,13 +81,14 @@ async function saveAdjust(m) {
   try {
     const res = await api.post(`/ml/models/${m.id}/adjust`, { ...adjustPayload(), saveArtifact: true })
     lastAdjustId.value = res.adjustId || ''
+    adjustNote.value = res.effectNote || ''
     toast(lastAdjustId.value ? `调参配置已保存：${lastAdjustId.value}` : '调参已应用（未保存）')
   } catch (e) { toast(e.message) }
 }
 
 function evalConfig() {
   return {
-    board: board.value, poolSize: Number(poolSize.value), n: Number(n.value),
+    board: 'all', boards: boards.value, poolSize: Number(poolSize.value), n: Number(n.value),
     hist: Number(hist.value), modelType: modelType.value,
     nSplits: Number(nSplits.value), gap: Number(gap.value),
     useSnapshot: useSnapshot.value, assetClass: assetClass.value,
@@ -156,7 +160,7 @@ async function runScore(m) {
   scoring.value = m.id
   scoreResult.value = null
   try {
-    const payload = { modelId: m.id, board: board.value, poolSize: Number(poolSize.value), assetClass: assetClass.value }
+    const payload = { modelId: m.id, board: 'all', boards: boards.value, poolSize: Number(poolSize.value), assetClass: assetClass.value }
     if (adjustPanel.value === m.id) {
       const adj = adjustPayload()
       if (Object.keys(adj.featureWeights).length || adj.threshold !== null) payload.adjust = adj
@@ -173,7 +177,7 @@ async function runMLBacktest(m) {
   btResult.value = null
   try {
     const { jobId } = await api.post('/jobs', { kind: 'ml-backtest', config: {
-      modelId: m.id, board: board.value, poolSize: Number(poolSize.value),
+      modelId: m.id, board: 'all', boards: boards.value, poolSize: Number(poolSize.value),
       n: Number(n.value), hist: Number(hist.value), assetClass: assetClass.value,
       startDate: btStart.value || null, endDate: btEnd.value || null,
     }})
@@ -310,17 +314,7 @@ onUnmounted(() => { pollActive = false })
           </select>
         </div>
         <div class="field"><label>板块</label>
-          <select v-model="board">
-            <option value="all">全部A股</option>
-            <option value="sh_main">沪市主板</option>
-            <option value="sz_main">深市主板</option>
-            <option value="gem">创业板</option>
-            <option value="star">科创板</option>
-            <option value="bse">北交所</option>
-            <optgroup v-if="sectorOptions.length" label="行业板块（动态加载）">
-              <option v-for="s in sectorOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
-            </optgroup>
-          </select>
+          <BoardSelect v-model="boards" :sectors="sectorOptions" />
         </div>
         <div class="field"><label>候选池</label><input v-model="poolSize" type="number" /></div>
         <div class="field"><label>预测期N(日)</label><input v-model="n" type="number" /></div>
@@ -439,6 +433,7 @@ onUnmounted(() => { pollActive = false })
           <button class="btn-primary sm" @click="saveAdjust({ id: adjustPanel })">保存调参配置</button>
           <span v-if="lastAdjustId" class="hint">已保存 adjustId：{{ lastAdjustId }}（打分/回测自动生效）</span>
         </div>
+        <div v-if="adjustNote" class="adj-note">{{ adjustNote }}</div>
       </div>
     </div>
 
@@ -486,6 +481,7 @@ onUnmounted(() => { pollActive = false })
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }
 .muted { color: var(--text-mute); font-size: 12px; }
 .btn-ghost.sm.danger { color: #ff6b6b; }
+.adj-note { margin-top: 10px; padding: 8px 12px; background: rgba(79,140,255,.08); border: 1px solid rgba(79,140,255,.2); border-radius: 8px; font-size: 12px; color: var(--text-dim); }
 .btn-ghost.sm { padding: 4px 10px; font-size: 12px; }
 .adjust-box { border-top: 1px solid var(--border); padding: 16px 22px; }
 .adj-threshold { display: flex; align-items: center; gap: 10px; margin: 10px 0; }

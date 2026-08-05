@@ -14,10 +14,11 @@ from . import adapters, db
 from .routers import selection as sel
 
 
-async def _mid_date(board: str, hist: int) -> str | None:
+async def _mid_date(board: str, hist: int, boards: list[str] | None = None) -> str | None:
     """拉参考 K 线取日期中点，作为 IS/OOS 不重叠切分点。"""
     try:
-        pool = await adapters.fetch_market_list(board, 5)
+        pool = await adapters.fetch_market_list_multi(
+            boards or [board or "all"], 5)
     except Exception:
         pool = []
     for row in pool:
@@ -34,6 +35,7 @@ def _objective(trial: optuna.Trial, base: dict, full_hist: int, is_end_date: str
     """单次试验：用 IS 区间（早期段，endDate=中点）跑回测，返回 Sharpe（越大越好）。"""
     cfg = {
         "board": base["board"],
+        "boards": base.get("boards"),
         "poolSize": trial.suggest_int("poolSize", 30, 150, step=10),
         "groups": trial.suggest_int("groups", 3, 8),
         "n": trial.suggest_int("n", 1, 10),
@@ -72,7 +74,8 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -
 
     loop = asyncio.new_event_loop()
     try:
-        mid_date = loop.run_until_complete(_mid_date(base_config["board"], full_hist))
+        mid_date = loop.run_until_complete(
+            _mid_date(base_config["board"], full_hist, base_config.get("boards")))
     finally:
         loop.run_until_complete(adapters.close_http_client())
         loop.close()
@@ -114,6 +117,7 @@ def _run_with(base: dict, full_hist: int, params: dict,
               start_date: str | None = None, end_date: str | None = None) -> dict:
     cfg = {
         "board": base["board"],
+        "boards": base.get("boards"),
         "poolSize": params.get("poolSize", base["poolSize"]),
         "groups": params.get("groups", base["groups"]),
         "n": params.get("n", base["n"]),
@@ -152,6 +156,7 @@ def save_best_as_strategy(base_config: dict, best_params: dict, name: str) -> di
     """
     cfg = {
         "board": base_config.get("board", "all"),
+        "boards": base_config.get("boards"),
         "poolSize": best_params.get("poolSize", 60),
         "groups": best_params.get("groups", 5),
         "n": best_params.get("n", 5),

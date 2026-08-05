@@ -1,10 +1,11 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import api, { longTask, downloadFile, downloadGet } from '../api/client'
 import { useToast } from '../stores/toast'
 import { useResearchStore } from '../stores/research'
 import EChart from '../components/EChart.vue'
 import Skeleton from '../components/Skeleton.vue'
+import BoardSelect from '../components/BoardSelect.vue'
 
 const { toast } = useToast()
 const research = useResearchStore()
@@ -24,7 +25,7 @@ const BENCH_OPTIONS = [
   { value: 'sse', label: '上证指数' }
 ]
 
-const board = ref('all')
+const boards = ref(['all'])
 const poolSize = ref(60)
 const factorKey = ref('momentum')
 const strategySource = ref('factor')   // factor=技术因子 | model=ML模型
@@ -44,6 +45,17 @@ const endDate = ref('')
 const sectorOptions = ref([])
 // P2：资产类别（future 时候选池取期货主力连续合约）
 const assetClass = ref('a-share')
+
+// 起止日联动 hist：选了回测区间后自动推算最小所需历史长度（因子窗口+暖机）
+watch([startDate, endDate], ([s, e]) => {
+  if (s && e) {
+    const days = (new Date(e) - new Date(s)) / 86400000
+    if (days > 0) {
+      const minHist = Math.max(250, Math.ceil(days) + 200)  // 200 暖机：因子窗口(120)+回测起点(60)+冗余
+      if (Number(hist.value) < minHist) hist.value = minHist
+    }
+  }
+})
 
 async function loadSectors() {
   try {
@@ -92,7 +104,7 @@ async function loadModels() {
 
 const backtestConfig = () => {
   const cfg = {
-    board: board.value, poolSize: Number(poolSize.value),
+    board: 'all', boards: boards.value, poolSize: Number(poolSize.value),
     groups: Number(groups.value), n: Number(days.value), hist: Number(hist.value),
     benchmark: benchmark.value, applyCost: applyCost.value,
     commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
@@ -245,7 +257,8 @@ onMounted(async () => {
   // 消费寻优页回填的最优参数（researchStore 跨页共享）
   const p = research.consumeOptimalParams()
   if (p) {
-    if (p.board) board.value = p.board
+    if (p.boards) boards.value = p.boards
+    else if (p.board) boards.value = [p.board]
     if (p.poolSize) poolSize.value = p.poolSize
     if (p.groups) groups.value = p.groups
     if (p.n) days.value = p.n
@@ -272,14 +285,7 @@ onMounted(async () => {
           <option value="future">期货（主力连续）</option>
         </select>
       </div>
-      <div class="field"><label>板块</label>
-        <select v-model="board">
-          <option v-for="b in BOARD_OPTIONS" :key="b.value" :value="b.value">{{ b.label }}</option>
-          <optgroup v-if="sectorOptions.length" label="行业板块（动态加载）">
-            <option v-for="s in sectorOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
-          </optgroup>
-        </select>
-      </div>
+      <BoardSelect v-model="boards" />
       <div class="field"><label>候选池规模</label><input v-model="poolSize" type="number" min="20" max="300" /></div>
       <div class="field"><label>策略来源</label>
         <select v-model="strategySource">

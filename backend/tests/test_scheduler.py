@@ -55,12 +55,12 @@ async def test_load_trading_days_returns_set():
 
 
 def test_scan_signals_no_20_hardcap():
-    """_scan_signals 不再硬截断 codes[:20]（P0-3b 回归）。
+    """_scan_signals_impl 不再硬截断 codes[:20]（P0-3b 回归）。
 
-    检查函数体 AST，不存在对 codes 的 [:20] 切片。
+    检查函数体 AST，不存在对 codes 的 [:20] 切片；应改用信号量限流。
     """
     import ast
-    src = inspect.getsource(scheduler._scan_signals)
+    src = inspect.getsource(scheduler._scan_signals_impl)
     tree = ast.parse(src)
     found_hardcap = False
     for node in ast.walk(tree):
@@ -74,6 +74,65 @@ def test_scan_signals_no_20_hardcap():
                     upper_val = None
                 if upper_val == 20:
                     found_hardcap = True
-    assert not found_hardcap, "_scan_signals 仍含 codes[:20] 硬截断"
+    assert not found_hardcap, "_scan_signals_impl 仍含 codes[:20] 硬截断"
     # 应改用信号量限流
     assert "Semaphore" in src
+
+
+def test_scan_now_force_runs_impl(monkeypatch):
+    """scan_now(force=True) 应跳过交易日判断并执行一次扫描（返回 ok + signals）。"""
+    import asyncio
+
+    calls = {"n": 0}
+
+    async def fake_impl():
+        calls["n"] += 1
+        scheduler._last_signals = []
+
+    monkeypatch.setattr(scheduler, "_scan_signals_impl", fake_impl)
+    result = asyncio.run(scheduler.scan_now(force=True))
+    assert result["ok"] is True
+    assert isinstance(result["signals"], list)
+    assert calls["n"] == 1
+
+
+def test_scan_now_skips_non_trading_day(monkeypatch):
+    """未加 force 且非交易日时应跳过（ok=False 带原因），不执行扫描。"""
+    import asyncio
+
+    async def fake_is_trading_day():
+        return False
+
+    async def fake_impl():
+        raise AssertionError("非交易日不应执行扫描")
+
+    monkeypatch.setattr(scheduler, "_is_trading_day", fake_is_trading_day)
+    monkeypatch.setattr(scheduler, "_scan_signals_impl", fake_impl)
+    result = asyncio.run(scheduler.scan_now(force=False))
+    assert result["ok"] is False
+    assert "非交易日" in result["reason"]
+
+
+def test_set_signal_config_rejects_missing_model(tmp_path, monkeypatch):
+    """模型模式下 modelId 不存在应拒绝保存（P2：防配置残留失效模型导致静默失败）。"""
+    settings = {}
+    monkeypatch.setattr(scheduler.db, "set_setting", lambda k, v: settings.__setitem__(k, v))
+    monkeypatch.setattr(scheduler.db, "get_setting", lambda k, d="": settings.get(k, d))
+    from app import ml
+    monkeypatch.setattr(ml, "ML_DIR", str(tmp_path))
+    with pytest.raises(ValueError, match="模型不存在"):
+        scheduler.set_signal_config("model", "no_such_model")
+
+    # 模型文件存在时允许保存
+    (tmp_path / "mlmodel_ok.joblib").write_bytes(b"x")
+    cfg = scheduler.set_signal_config("model", "mlmodel_ok")
+    assert cfg["modelId"] == "mlmodel_ok"
+
+
+def test_set_signal_config_model_requires_id(monkeypatch):
+    """模型模式必须指定 modelId。"""
+    settings = {}
+    monkeypatch.setattr(scheduler.db, "set_setting", lambda k, v: settings.__setitem__(k, v))
+    monkeypatch.setattr(scheduler.db, "get_setting", lambda k, d="": settings.get(k, d))
+    with pytest.raises(ValueError, match="modelId"):
+        scheduler.set_signal_config("model", "")

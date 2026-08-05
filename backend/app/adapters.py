@@ -67,6 +67,32 @@ async def _http_get(url: str, timeout: int = 8, headers: dict | None = None,
     raise last_exc
 
 
+# 行情源健康状态：上游（新浪/东财）连续降级时记录，供调用方区分
+# 「板块列表拉不到（网络故障）」与「板块本身无匹配股票」两类失败，避免误报“样本不足”。
+_market_status: dict = {"degraded": False, "last_error": "", "ts": 0.0}
+
+
+def market_list_health() -> dict:
+    """返回最近一次板块列表拉取的健康状态（降级标记 + 错误信息）。"""
+    return dict(_market_status)
+
+
+async def fetch_kline_retry(code: str, days: int, attempts: int = 3,
+                            delay: float = 0.3) -> list[dict]:
+    """拉日K线带重试：上游限流/超时返回空或抛错时快速重试，
+    避免回测/打分高并发场景下单次网络抖动静默丢票。"""
+    for attempt in range(attempts):
+        try:
+            kl = await fetch_kline(code, days)
+            if kl:
+                return kl
+        except Exception:
+            pass
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay * (attempt + 1))
+    return []
+
+
 def _to_secid(code: str) -> str:
     return ("1" if code.startswith("sh") else "0") + "." + code[2:]
 
@@ -385,6 +411,23 @@ async def fetch_market_list(board: str = "all", limit: int = 300, sort_field: st
             _market_cache[cache_key] = (time.time(), out)
         return out
 
+    # 指数成分板块（hs300/zz500）：按真实成分股过滤，消除“挂名”却不过滤的跨模块不一致
+    # （选股 vs 回测/ML 对同一“沪深300”含义不同的历史 bug）
+    if board in ("hs300", "zz500"):
+        index_code = {"hs300": "sh000300", "zz500": "sh000905"}[board]
+        codes = await fetch_index_constituents(index_code)
+        if not codes:
+            _market_status["degraded"] = True
+            _market_status["last_error"] = f"{board}: 成分股列表获取失败（东财）"
+            _market_status["ts"] = time.time()
+            return []
+        rows = await fetch_market_list("all", 3000, sort_field)
+        by_code = {r["code"]: r for r in rows}
+        out = [by_code[c] for c in codes if c in by_code][:limit]
+        if out:
+            _market_cache[cache_key] = (time.time(), out)
+        return out
+
     matcher = BOARD_MATCHERS.get(board, BOARD_MATCHERS["all"])
     limit = max(1, min(limit, 3000))
     cache_key = f"{board}:{limit}:{sort_field}"
@@ -394,19 +437,53 @@ async def fetch_market_list(board: str = "all", limit: int = 300, sort_field: st
 
     try:
         rows = await _fetch_sina_market(board, limit, sort_field, matcher)
-    except Exception:
+        _market_status["degraded"] = False
+        _market_status["last_error"] = ""
+    except Exception as e:
+        _market_status["degraded"] = True
+        _market_status["last_error"] = f"sina: {e}"
+        _market_status["ts"] = time.time()
         rows = []
     if not rows:
         # 新东财降级：新浪限流/返回空时用东财 clist 兜底，避免“网络一差→股票池全空→全线报样本不足”
         try:
             rows = await fetch_eastmoney_market(board, limit)
-        except Exception:
+            if rows:
+                _market_status["degraded"] = False
+                _market_status["last_error"] = ""
+        except Exception as e:
+            if not _market_status["last_error"]:
+                _market_status["last_error"] = f"eastmoney: {e}"
+            _market_status["degraded"] = True
+            _market_status["ts"] = time.time()
             rows = []
 
     # 空结果禁止写缓存：旧版把空列表也缓存 60s，故障被放大；空时强制下次重拉
     if rows:
         _market_cache[cache_key] = (time.time(), rows)
     return rows
+
+
+async def fetch_market_list_multi(boards: list[str], limit: int = 300,
+                                  sort_field: str = "amount") -> list[dict]:
+    """多板块 OR 合并候选池：逐板块取池后去重合并（板块可组合，如「沪市主板+创业板」）。
+
+    hs300/zz500 走真实成分股（fetch_market_list 内部已处理），合并结果按原序去重。
+    """
+    boards = [b for b in (boards or []) if b] or ["all"]
+    out: list[dict] = []
+    seen: set[str] = set()
+    per = max(10, limit // len(boards))
+    for b in boards:
+        try:
+            rows = await fetch_market_list(b, per, sort_field)
+        except Exception:
+            rows = []
+        for r in rows:
+            if r["code"] not in seen:
+                seen.add(r["code"])
+                out.append(r)
+    return out[:limit]
 
 
 async def _fetch_sina_market(board: str, limit: int, sort_field: str, matcher) -> list[dict]:

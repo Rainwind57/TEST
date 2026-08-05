@@ -11,9 +11,10 @@ router = APIRouter(prefix="/api/ml", tags=["ml"])
 
 class EvalBody(BaseModel):
     board: str = "all"
+    boards: list[str] | None = None  # 多板块 OR 组合（如 ["sh_main","gem"]），优先于 board
     poolSize: int = 100
     n: int = 5
-    hist: int = 240
+    hist: int = ml.ML_DEFAULT_HIST  # 默认 1024：覆盖内置长周期因子（momentum120/dist_52w_high），开箱即用
     modelType: str = "gbdt"
     nSplits: int = 5
     gap: int = 5
@@ -30,7 +31,8 @@ async def evaluate(body: EvalBody):
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
                                          use_snapshot=body.useSnapshot, asset_class=body.assetClass,
-                                         start_date=body.startDate, end_date=body.endDate)
+                                         start_date=body.startDate, end_date=body.endDate,
+                                         boards=body.boards)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -48,7 +50,8 @@ async def train(body: EvalBody):
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
                                          use_snapshot=body.useSnapshot, asset_class=body.assetClass,
-                                         start_date=body.startDate, end_date=body.endDate)
+                                         start_date=body.startDate, end_date=body.endDate,
+                                         boards=body.boards)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -70,9 +73,10 @@ def list_models():
 
 class OptimizeMlBody(BaseModel):
     board: str = "all"
+    boards: list[str] | None = None  # 多板块 OR 组合，优先于 board
     poolSize: int = 100
     n: int = 5
-    hist: int = 240
+    hist: int = ml.ML_DEFAULT_HIST  # 默认 1024：覆盖内置长周期因子，寻优开箱即用
     modelType: str = "lightgbm"  # 默认启用已装的 lightgbm（旧版仅 gbdt）
     nSplits: int = 5
     gap: int = 5
@@ -94,7 +98,8 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
                                          use_snapshot=body.useSnapshot, asset_class=body.assetClass,
-                                         start_date=body.startDate, end_date=body.endDate)
+                                         start_date=body.startDate, end_date=body.endDate,
+                                         boards=body.boards)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -167,8 +172,15 @@ class ModelAdjustBody(BaseModel):
 
 @router.get("/models/{mid}/params")
 def get_model_params(mid: str):
-    """查看已落盘模型的参数（特征重要性 + 超参 + 特征名），供人工调参参考。"""
-    meta = ml.load_model_meta(mid)
+    """查看已落盘模型的参数（特征重要性 + 超参 + 特征名），供人工调参参考。
+
+    读取失败时返回结构化 500 而非让 worker 崩溃（旧版 load_model_meta 无条件
+    joblib.load 整包，跨 lightgbm 版本反序列化可能段错误 → 前端 network error）。
+    """
+    try:
+        meta = ml.load_model_meta(mid)
+    except Exception as e:
+        raise HTTPException(500, f"模型元数据读取失败（模型文件可能损坏或版本不兼容）: {e}")
     if not meta:
         raise HTTPException(404, "模型不存在")
     return meta
@@ -180,10 +192,17 @@ def adjust_model(mid: str, body: ModelAdjustBody):
 
     调整配置落盘为中间结果（kind=ml_adjust），打分层/回测接口传 adjustId 即可生效，
     形成"调参→回测验证→再调"闭环，打通 ML→选股/回测。
+    对树模型（GBDT/LightGBM）说明调参的实际语义：权重是对输入特征做线性缩放，
+    经分裂路径间接改变预测，并非改写模型内部系数。
     """
-    meta = ml.load_model_meta(mid)
+    try:
+        meta = ml.load_model_meta(mid)
+    except Exception as e:
+        raise HTTPException(500, f"模型元数据读取失败（模型文件可能损坏或版本不兼容）: {e}")
     if not meta:
         raise HTTPException(404, "模型不存在")
+    model_type = meta.get("modelType", "gbdt")
+    tree_like = model_type in ("gbdt", "lightgbm", "gradient_boosting", "lgbm")
     adjust_cfg = {"modelId": mid, "featureNames": meta.get("featureNames", [])}
     if body.featureWeights is not None:
         valid_features = set(meta.get("featureNames", []))
@@ -192,7 +211,14 @@ def adjust_model(mid: str, body: ModelAdjustBody):
             adjust_cfg["featureWeights"] = fw
     if body.threshold is not None:
         adjust_cfg["threshold"] = body.threshold
-    result = {"modelId": mid, "adjustConfig": adjust_cfg, "originalMeta": meta}
+    effect_note = (
+        f"模型类型 {model_type}。特征权重会对输入特征做线性缩放后再预测（非改写模型内部系数），"
+        f"对树模型效果有限；如需真正「调整系数」，建议用「人造模型」（人工加权线性模型）或重训练。"
+        if tree_like else
+        f"模型类型 {model_type}（线性/人工加权），特征权重即为最终系数，调整直接生效。"
+    )
+    result = {"modelId": mid, "adjustConfig": adjust_cfg, "originalMeta": meta,
+              "effectNote": effect_note}
     if body.saveArtifact:
         from .. import artifacts
         meta2 = artifacts.save_artifact("ml_adjust", adjust_cfg,
@@ -223,6 +249,7 @@ def _load_adjust(adjustId: str | None, adjust: dict | None) -> dict | None:
 class ScoreBody(BaseModel):
     modelId: str
     board: str = "all"
+    boards: list[str] | None = None  # 多板块 OR 组合，优先于 board
     poolSize: int = 100
     saveArtifact: bool = False   # 打分结果落盘为中间结果（选股结果 codes 供下一环节复用）
     adjustId: str | None = None  # 调参配置 artifact id（/models/{mid}/adjust 产出）
@@ -239,7 +266,8 @@ async def score(body: ScoreBody):
     try:
         adjust = _load_adjust(body.adjustId, body.adjust)
         rows = await ml.score_latest(body.modelId, body.board, body.poolSize,
-                                     adjust=adjust, asset_class=body.assetClass)
+                                     adjust=adjust, asset_class=body.assetClass,
+                                     boards=body.boards)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -264,6 +292,7 @@ async def score(body: ScoreBody):
 class MLBacktestBody(BaseModel):
     modelId: str
     board: str = "all"
+    boards: list[str] | None = None  # 多板块 OR 组合，优先于 board
     poolSize: int = 60
     groups: int = 5
     n: int = 5
@@ -295,6 +324,7 @@ async def ml_backtest(body: MLBacktestBody):
             adjust=adjust, asset_class=body.assetClass,
             start_date=body.startDate, end_date=body.endDate,
             config=body.model_dump(),
+            boards=body.boards,
         )
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))

@@ -9,6 +9,7 @@
 """
 import asyncio
 import datetime
+import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -47,6 +48,13 @@ def get_signal_config() -> dict:
 def set_signal_config(mode: str, model_id: str = "") -> dict:
     if mode not in ("rule", "model"):
         raise ValueError("mode 必须为 rule 或 model")
+    # 模型模式校验：modelId 必须真实存在，否则开启后模型打分静默失败、永远无信号
+    if mode == "model":
+        if not model_id:
+            raise ValueError("模型模式下必须指定模型 modelId")
+        from . import ml as _ml
+        if not os.path.exists(os.path.join(_ml.ML_DIR, f"{model_id}.joblib")):
+            raise ValueError(f"模型不存在: {model_id}，请重新选择或删除该配置")
     db.set_setting("monitor_mode", mode)
     db.set_setting("monitor_model_id", model_id or "")
     return get_signal_config()
@@ -153,6 +161,21 @@ async def _refresh_equity():
 async def _scan_signals():
     if not await _is_trading_day():
         return
+    await _scan_signals_impl()
+
+
+async def scan_now(force: bool = False) -> dict:
+    """立即手动执行一次盯盘信号扫描（替代只能等交易日 15:10 cron 的被动模式）。
+
+    force=True 时跳过交易日判断，方便用户任意时刻验证扫描逻辑能否产出信号。
+    """
+    if not force and not await _is_trading_day():
+        return {"ok": False, "reason": "当前非交易日，扫描已跳过（可加 force=true 强制扫描）", "signals": []}
+    await _scan_signals_impl()
+    return {"ok": True, "signals": _last_signals}
+
+
+async def _scan_signals_impl():
     global _last_signals
     try:
         conn = db.get_conn()
@@ -167,6 +190,13 @@ async def _scan_signals():
         # 模型模式：用落盘 ML 模型预测分生成信号（打通 ML→盯盘调度断点）
         if cfg["mode"] == "model" and cfg.get("modelId"):
             from . import ml
+            # 校验模型仍存在：配置残留失效 modelId 时明确报错，而非静默无信号
+            if not os.path.exists(os.path.join(ml.ML_DIR, f"{cfg['modelId']}.joblib")):
+                _last_signals = []
+                db.log_scheduler_run("scan_signals", False,
+                                     error=f"模型模式配置的 modelId 已不存在: {cfg['modelId']}，"
+                                           f"请重新保存配置（或切回规则模式）")
+                return
             try:
                 scored = await ml.score_codes(cfg["modelId"], codes)
             except Exception as e:

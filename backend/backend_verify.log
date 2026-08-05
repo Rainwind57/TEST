@@ -1,0 +1,19 @@
+INFO:     Started server process [6128]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8899 (Press CTRL+C to quit)
+INFO:     127.0.0.1:6451 - "GET /api/health HTTP/1.1" 200 OK
+{"ts": "2026-08-05T16:18:31.680", "level": "INFO", "logger": "quant.request", "msg": "POST /api/monitor/scan 200 27ms", "request_id": "48d7cd8fd083"}
+INFO:     127.0.0.1:6464 - "POST /api/monitor/scan?force=true HTTP/1.1" 200 OK
+{"ts": "2026-08-05T16:18:57.568", "level": "INFO", "logger": "quant.request", "msg": "POST /api/ml/evaluate 200 16902ms", "request_id": "6f6007ab3f30"}
+INFO:     127.0.0.1:6473 - "POST /api/ml/evaluate HTTP/1.1" 200 OK
+{"ts": "2026-08-05T16:19:11.618", "level": "INFO", "logger": "quant.request", "msg": "POST /api/monitor/config 400 1ms", "request_id": "db8836a26eb3"}
+INFO:     127.0.0.1:6522 - "POST /api/monitor/config HTTP/1.1" 400 Bad Request
+{"ts": "2026-08-05T16:19:23.510", "level": "INFO", "logger": "quant.request", "msg": "POST /api/select/backtest 200 1862ms", "request_id": "e52791fe8ab1"}
+INFO:     127.0.0.1:6534 - "POST /api/select/backtest HTTP/1.1" 200 OK
+{"ts": "2026-08-05T16:19:23.563", "level": "INFO", "logger": "quant.request", "msg": "GET /api/monitor/status 200 9ms", "request_id": "d8a5d94fa2aa"}
+INFO:     127.0.0.1:6549 - "GET /api/monitor/status HTTP/1.1" 200 OK
+{"ts": "2026-08-05T16:19:33.656", "level": "INFO", "logger": "quant.request", "msg": "POST /api/monitor/config 200 45ms", "request_id": "6bfdafc0d626"}
+INFO:     127.0.0.1:6557 - "POST /api/monitor/config HTTP/1.1" 200 OK
+{"ts": "2026-08-05T16:20:54.279", "level": "INFO", "logger": "quant.request", "msg": "POST /api/monitor/scan 200 621ms", "request_id": "4ef282c1d76e"}
+INFO:     127.0.0.1:6696 - "POST /api/monitor/scan?force=true HTTP/1.1" 200 OK

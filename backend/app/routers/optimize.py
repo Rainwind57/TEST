@@ -10,6 +10,7 @@ router = APIRouter(prefix="/api/optimize", tags=["optimize"])
 
 class OptimizeBody(BaseModel):
     board: str = "all"
+    boards: list[str] | None = None   # 多板块 OR 组合，优先于 board
     poolSize: int = 60
     factor: str = "momentum"
     modelId: str | None = None      # 指定时对 ML 模型策略寻优（与技术因子二选一）

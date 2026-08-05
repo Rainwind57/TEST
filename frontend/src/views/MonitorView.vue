@@ -16,6 +16,7 @@ const mode = ref('rule')
 const modelId = ref('')
 const modelOptions = ref([])
 const savingCfg = ref(false)
+const scanning = ref(false)
 
 async function loadStatus() {
   try {
@@ -58,6 +59,18 @@ async function toggle() {
     toast(res.enabled ? '调度器已开启（交易日 15:05/15:10 执行）' : '调度器已关闭')
   } catch (e) { toast(e.message) }
   finally { loading.value = false }
+}
+
+// 手动立即扫描：无需等交易日 15:10 的 cron，随时验证盯盘能否产出信号
+async function scanNow() {
+  scanning.value = true
+  try {
+    const res = await api.post('/monitor/scan?force=true')
+    signals.value = res.signals || []
+    toast(res.ok ? `扫描完成，共 ${signals.value.length} 条信号` : res.reason || '扫描被跳过')
+    await loadStatus()
+  } catch (e) { toast(e.message) }
+  finally { scanning.value = false }
 }
 
 async function refresh() {
@@ -107,6 +120,7 @@ onMounted(() => { refresh(); loadModels() })
           </select>
         </div>
         <button class="btn-ghost" :disabled="savingCfg" @click="saveConfig">{{ savingCfg ? '保存中…' : '保存配置' }}</button>
+        <button class="btn-ghost" :disabled="scanning" @click="scanNow">{{ scanning ? '扫描中…' : '立即扫描' }}</button>
         <button class="btn-primary" :disabled="loading" @click="toggle">
           {{ enabled ? '停止调度' : '开启调度' }}
         </button>

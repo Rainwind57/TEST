@@ -40,7 +40,36 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     import json as _json
     m = payload.get("metrics") or {}
     bench = payload.get("benchmark")
+    cfg = payload.get("config") or {}
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # 回测概要信息块（起止日 / 历史长度 / 成本 / 候选池 → 解决"报告看不出回测区间"的历史问题）
+    start = cfg.get("startDate") or "-"
+    end = cfg.get("endDate") or "-"
+    hist_val = cfg.get("hist") or "-"
+    board_val = cfg.get("board") or "-"
+    pool_size = cfg.get("poolSize") or "-"
+    n_val = cfg.get("n") or "-"
+    cost = f"佣金{_fmt(cfg.get('commissionRate') or 0.00025)} "
+    cost += f"印花{_fmt(cfg.get('stampDuty') or 0.001)} "
+    cost += f"滑点{_fmt(cfg.get('slippage') or 0.001)}"
+    strategy_kind = "ML模型" if cfg.get("modelId") else "技术因子"
+    strategy_name = cfg.get("modelId") or payload.get("factorLabel") or "-"
+    if strategy_kind == "ML模型":
+        strategy_name = cfg.get("modelId") or "-"
+
+    summary = (
+        f'<div class="card"><h3>回测概要</h3><table class="summary-table">'
+        f'<tr><td>策略来源</td><td>{strategy_kind}</td>'
+        f'<td>策略名/模型ID</td><td>{strategy_name}</td></tr>'
+        f'<tr><td>回测区间</td><td>{start} ~ {end}</td>'
+        f'<td>历史长度(hist)</td><td>{hist_val}</td></tr>'
+        f'<tr><td>持有期(n)</td><td>{n_val}</td>'
+        f'<td>候选池规模</td><td>{pool_size}</td></tr>'
+        f'<tr><td>板块</td><td>{board_val}</td>'
+        f'<td>成本</td><td>{cost}</td></tr>'
+        f'</table></div>'
+    )
 
     kpi = lambda label, val, pct=False: (
         f'<div class="kpi"><div class="n">{_fmt(val, pct)}</div>'
@@ -98,7 +127,7 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <title>{label} · {title}</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
 <style>
 body{{font-family:-apple-system,"Segoe UI","PingFang SC",sans-serif;background:#0b1020;color:#e6ebf5;margin:0;padding:32px}}
 h1{{font-size:24px;border-left:4px solid #4f8cff;padding-left:10px}}
@@ -113,11 +142,14 @@ th,td{{border:1px solid #23304f;padding:8px;text-align:left}}
 th{{background:#16213c;color:#cfe0ff}}
 .chart{{width:100%;height:340px}}
 .sub{{color:#8e9bbd;font-size:13px}}
+.summary-table td{{padding:6px 12px; vertical-align:top;}}
+.summary-table td:first-child,.summary-table td:nth-child(3){{color:#8e9bbd; font-size:12px; width:100px;}}
 @media print{{.chart{{height:300px}} body{{background:#fff;color:#000}} .kpi,.card{{border-color:#ccc;background:#fff}} th{{background:#f0f0f0;color:#000}} h1,h3{{color:#000}}}}
 </style></head><body>
-<h1>{label}</h1>
-<div class="sub">生成时间 {now} · 调仓次数 {m.get('rebalanceCount','-')} · 成本率 {_fmt(m.get('costRate'))}</div>
-<div class="grid">{kpis}</div>
+	<h1>{label}</h1>
+	<div class="sub">生成时间 {now} · 调仓次数 {m.get('rebalanceCount','-')} · 成本率 {_fmt(m.get('costRate'))}</div>
+	{summary}
+	<div class="grid">{kpis}</div>
 {bench_html}
 <div class="card"><h3>分组收益</h3><table>
 <tr><th>分组</th><th>平均收益</th><th>样本数</th></tr>{rows}</table></div>
@@ -259,6 +291,13 @@ def render_pdf(payload: dict) -> bytes:
     c.setFont("STSong-Light", 9)
     c.setFillColorRGB(0.4, 0.4, 0.5)
     c.drawString(50, y, f"生成时间 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    y -= 14
+    # 回测区间与策略来源（HTML 与 PDF 均含，补齐报告历史缺口）
+    cfg = payload.get("config") or {}
+    sdate, edate = cfg.get("startDate") or "最远", cfg.get("endDate") or "最新"
+    strategy_kind = "ML模型" if cfg.get("modelId") else "技术因子"
+    strategy_name = cfg.get("modelId") or payload.get("factorLabel") or "-"
+    c.drawString(50, y, f"回测区间 {sdate} ~ {edate}  |  策略来源 {strategy_kind}  |  {strategy_name}")
     y -= 26
     c.setFont("STSong-Light", 13)
     c.drawString(50, y, "绩效指标")
