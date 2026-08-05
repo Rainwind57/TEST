@@ -33,6 +33,27 @@ async def get_kline(code: str, days: int = 500, forceRefresh: bool = False):
     return {"code": code, "data": data}
 
 
+@router.get("/stock/exists")
+async def stock_exists(code: str):
+    """校验股票代码是否存在：依次查腾讯/新浪/东财，任一有。
+
+    返回 {"exists": bool, "name": str}；所有数据源异常时 exists=true（无法确认则放行，
+    避免网络抖动误拦真实股票）。
+    """
+    code = code.strip().lower()
+    queried_ok = False
+    for fn in (adapters.fetch_tencent_quotes, adapters.fetch_sina_quotes,
+               adapters.fetch_eastmoney_quotes):
+        try:
+            data = await fn([code])
+            queried_ok = True
+            if data.get(code):
+                return {"exists": True, "name": data[code].get("name", "")}
+        except Exception:
+            continue
+    return {"exists": not queried_ok, "name": ""}
+
+
 @router.get("/watchlist")
 def get_watchlist():
     conn = db.get_conn()

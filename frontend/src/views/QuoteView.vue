@@ -26,9 +26,12 @@ async function addCode() {
   if (!c) { toast('代码格式错误，应为 6 位数字或 sh/sz/bj 前缀'); return }
   if (store.codes.includes(c)) { toast('已在自选列表中'); return }
   try {
+    // 先校验代码是否存在：不存在直接提示，不入自选（旧版会加进去一直"加载中"）
+    const r = await api.get('/stock/exists', { params: { code: c } })
+    if (r.exists === false) { toast(`未找到该股票：${c}，请检查代码是否正确`); return }
     await store.addCode(c)
     codeInput.value = ''
-    toast('已添加 ' + c)
+    toast('已添加 ' + (r.name || c))
   } catch (e) { toast(e.message) }
 }
 
@@ -72,12 +75,13 @@ async function refresh() {
 }
 
 watch(() => store.activeCode, loadKline)
-watch(() => store.source, () => store.refreshQuotes())
+watch(() => store.source, () => store.refreshQuotes().catch(() => {}))
 
 onMounted(async () => {
-  await store.fetchWatchlist()
-  await refresh()
-  timer = setInterval(() => { if (!document.hidden) store.refreshQuotes() }, 6000)
+  // 任一接口失败不阻塞页面初始化与定时刷新（旧版 await 抛错会跳过 timer，页面停摆）
+  try { await store.fetchWatchlist() } catch (e) { toast('自选列表加载失败: ' + e.message) }
+  await refresh().catch(() => {})
+  timer = setInterval(() => { if (!document.hidden) store.refreshQuotes().catch(() => {}) }, 6000)
 })
 onUnmounted(() => clearInterval(timer))
 </script>
@@ -150,7 +154,8 @@ onUnmounted(() => clearInterval(timer))
               <td><span class="del-btn" @click.stop="removeCode(code)">删除</span></td>
             </template>
             <template v-else>
-              <td colspan="8" class="empty-row">{{ code }} 加载中…</td>
+              <td colspan="7" class="empty-row">{{ store.noData.includes(code) ? `${code} 暂无行情数据` : `${code} 加载中…` }}</td>
+              <td><span class="del-btn" @click.stop="removeCode(code)">删除</span></td>
             </template>
           </tr>
         </tbody>

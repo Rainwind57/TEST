@@ -6,6 +6,7 @@ export const useWatchlistStore = defineStore('watchlist', {
     codes: [],
     source: 'tencent',
     quotes: {},          // { code: quoteObj }
+    noData: [],          // 已拉取但无行情数据的代码（无效代码/退市/停牌无数据），用于区分"加载中"与"无数据"
     activeCode: null,
     loading: false,
     lastUpdated: null
@@ -22,7 +23,8 @@ export const useWatchlistStore = defineStore('watchlist', {
       await api.post('/watchlist', { code })
       await this.fetchWatchlist()
       this.activeCode = code
-      await this.refreshQuotes()
+      // 行情拉取失败不影响添加结果（无效代码/弱网时刷新会抛错，股票本身已入自选）
+      try { await this.refreshQuotes() } catch (e) { /* 忽略，noData 仍会标记 */ }
     },
     async removeCode(code) {
       await api.delete(`/watchlist/${code}`)
@@ -38,6 +40,8 @@ export const useWatchlistStore = defineStore('watchlist', {
         this.lastUpdated = new Date()
       } finally {
         this.loading = false
+        // 拉取完成后：有 codes 但始终无行情数据的即视为"无数据"（而非永久"加载中"）
+        this.noData = this.codes.filter(c => !this.quotes[c])
       }
     },
     setSource(src) {
