@@ -2,11 +2,42 @@
 
 供 routers/reports.py（导出接口）、selection.py / ml.py（回测完成自动存档）复用。
 """
+import base64
 import io
 import os
 import datetime
 
 from . import db
+
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+_ECHARTS_PATH = os.path.join(_STATIC_DIR, "echarts.min.js")
+
+
+def _echarts_script_tag() -> str:
+    """返回 ECharts 加载脚本标签。
+
+    优先从 backend/app/static/echarts.min.js 内联 base64（完全离线、自包含），
+    若文件不存在则降级为多 CDN 链（国内→国际）。
+    """
+    if os.path.exists(_ECHARTS_PATH):
+        with open(_ECHARTS_PATH, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f'<script src="data:text/javascript;base64,{b64}"></script>'
+
+    # 降级：多 CDN 容错链（cdn.bootcdn.net 在国内较稳，再备 unpkg / cdnjs）
+    return (
+        '<script>'
+        '(function(){'
+        'var u=["https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js",'
+        '"https://unpkg.com/echarts@5.5.0/dist/echarts.min.js",'
+        '"https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"],'
+        'i=0;function t(){if(i>=u.length){'
+        'document.getElementById("chart-fallback").style.display="block";return}'
+        'var s=document.createElement("script");s.src=u[i++];'
+        's.onerror=t;document.head.appendChild(s)}t()'
+        '})()'
+        '</script>'
+    )
 
 REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
@@ -127,9 +158,7 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <title>{label} · {title}</title>
-<script>
-(function(){{var s=document.createElement('script');s.src='https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js';s.onerror=function(){{var s2=document.createElement('script');s2.src='https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js';s2.onerror=function(){{var s3=document.createElement('script');s3.src='https://unpkg.com/echarts@5.5.0/dist/echarts.min.js';s3.onerror=function(){{document.getElementById('chart-fallback').style.display='block'}};document.head.appendChild(s3)}};document.head.appendChild(s2)}};document.head.appendChild(s)}})();
-</script>
+{_echarts_script_tag()}
 <style>
 body{{font-family:-apple-system,"Segoe UI","PingFang SC",sans-serif;background:#0b1020;color:#e6ebf5;margin:0;padding:32px}}
 h1{{font-size:24px;border-left:4px solid #4f8cff;padding-left:10px}}

@@ -23,14 +23,11 @@ const SOURCE_META = {
 
 const activeQuote = computed(() => store.quotes[store.activeCode])
 
-// ---- 技术指标 ----
-const activeIndicators = ref([])
+// ---- 技术指标（单选切换） ----
+const activeIndicator = ref('')
 const INDICATOR_COLORS = ['#00bcd4', '#ff9800', '#e91e63']
 
-const chartHeight = computed(() => {
-  const n = activeIndicators.value.length
-  return n === 0 ? 520 : n === 1 ? 620 : n === 2 ? 720 : 820
-})
+const chartHeight = computed(() => activeIndicator.value ? 620 : 520)
 
 function calcMACD(closes) {
   const ema = (data, n) => { let k = 2/(n+1); let r = [data[0]]; for (let i = 1; i < data.length; i++) r.push(data[i]*k + r[i-1]*(1-k)); return r }
@@ -70,9 +67,7 @@ function calcBOLL(closes, n = 20) {
 }
 
 function toggleIndicator(name) {
-  const idx = activeIndicators.value.indexOf(name)
-  if (idx >= 0) activeIndicators.value.splice(idx, 1)
-  else activeIndicators.value.push(name)
+  activeIndicator.value = activeIndicator.value === name ? '' : name
 }
 
 // ---- 多股对比 ----
@@ -117,7 +112,7 @@ const compareOption = computed(() => {
     xAxis: { type: 'category', data: baseDates, axisLabel: { color: '#8a94a6', rotate: 30 }, axisLine: { lineStyle: { color: '#e9edf5' } } },
     yAxis: { axisLabel: { color: '#8a94a6', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
     series,
-  }
+  };
 })
 
 async function addCode() {
@@ -125,7 +120,6 @@ async function addCode() {
   if (!c) { toast('代码格式错误，应为 6 位数字或 sh/sz/bj 前缀'); return }
   if (store.codes.includes(c)) { toast('已在自选列表中'); return }
   try {
-    // 先校验代码是否存在：不存在直接提示，不入自选（旧版会加进去一直"加载中"）
     const r = await api.get('/stock/exists', { params: { code: c } })
     if (r.exists === false) { toast(`未找到该股票：${c}，请检查代码是否正确`); return }
     await store.addCode(c)
@@ -163,17 +157,16 @@ const klineOption = computed(() => {
     return +(s / n).toFixed(3)
   })
 
-  const indicators = activeIndicators.value
-  const hasIndicators = indicators.length > 0
+  const indicator = activeIndicator.value
+  const hasIndicators = !!indicator
 
-  // 动态构建 grid
   const grids = [
-    { left: 60, right: 20, top: 40, bottom: hasIndicators ? '60%' : '52%' },
-    { left: 60, right: 20, top: hasIndicators ? '45%' : '58%', bottom: hasIndicators ? '32%' : 60 },
+    { left: 60, right: 20, top: 40, bottom: hasIndicators ? 370 : 250 },
+    { left: 60, right: 20, top: hasIndicators ? 258 : 280, bottom: hasIndicators ? 250 : 90 },
   ]
   const xAxes = [
-    { type: 'category', data: dates, gridIndex: 0, axisLabel: { show: false }, axisTick: { show: false } },
-    { type: 'category', data: dates, gridIndex: 1, axisLabel: { color: '#8a94a6' }, axisLine: { lineStyle: { color: '#e9edf5' } } },
+    { type: 'category', data: dates, gridIndex: 0, axisLabel: { show: false }, axisTick: { show: false }, axisLine: { show: false } },
+    { type: 'category', data: dates, gridIndex: 1, axisLabel: { show: !hasIndicators, color: '#8a94a6', fontSize: 10, hideOverlap: true }, axisLine: { lineStyle: { color: '#e9edf5' } } },
   ]
   const yAxes = [
     { scale: true, gridIndex: 0, position: 'left', axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
@@ -192,64 +185,66 @@ const klineOption = computed(() => {
       itemStyle: { color: params => (params.dataIndex > 0 && closes[params.dataIndex] >= closes[params.dataIndex-1] ? '#ff4d4f' : '#21c08b') } },
   ]
   const legendData = ['K线', 'MA5', 'MA10', 'MA20', 'MA60', 'MA120', 'MA250', '成交量']
+  const indLegendData = []
 
-  // 动态追加强标子图
-  const dzXAxisIndexBase = 2
-  let indicatorGridTop = 0.72
-  indicators.forEach((name, idx) => {
-    const gi = 2 + idx
-    grids.push({ left: 60, right: 20, top: `${indicatorGridTop * 100}%`, bottom: idx === indicators.length - 1 ? 60 : `${(indicatorGridTop + 0.14) * 100 + 1}%` })
-    xAxes.push({ type: 'category', data: dates, gridIndex: gi, axisLabel: { show: idx === indicators.length - 1, color: '#8a94a6', rotate: 30 }, axisTick: { show: false } })
-    yAxes.push({ scale: true, gridIndex: gi, position: 'left', axisLabel: { color: '#8a94a6', fontSize: 10 }, splitLine: { lineStyle: { color: '#e9edf5' } } })
-    indicatorGridTop -= 0.14
+  // 单选指标子图（仅一个，互斥显示）
+  if (indicator === 'MACD') {
+    grids.push({ left: 60, right: 20, top: 398, bottom: 64 })
+    xAxes.push({ type: 'category', data: dates, gridIndex: 2, axisLabel: { color: '#8a94a6', fontSize: 10, hideOverlap: true }, axisTick: { show: false } })
+    yAxes.push({ scale: true, gridIndex: 2, position: 'left', axisLabel: { color: '#8a94a6', fontSize: 10 }, splitLine: { lineStyle: { color: '#e9edf5' } } })
+    const { dif, dea, bar } = calcMACD(closes)
+    indLegendData.push('DIF', 'DEA', 'MACD')
+    series.push(
+      { name: 'DIF', type: 'line', data: dif, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#00bcd4', width: 1 } },
+      { name: 'DEA', type: 'line', data: dea, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#ff9800', width: 1 } },
+      { name: 'MACD', type: 'bar', data: bar, xAxisIndex: 2, yAxisIndex: 2, itemStyle: { color: p => bar[p.dataIndex] >= 0 ? '#ff4d4f' : '#21c08b' } },
+    )
+  } else if (indicator === 'KDJ') {
+    grids.push({ left: 60, right: 20, top: 398, bottom: 64 })
+    xAxes.push({ type: 'category', data: dates, gridIndex: 2, axisLabel: { color: '#8a94a6', fontSize: 10, hideOverlap: true }, axisTick: { show: false } })
+    yAxes.push({ scale: true, gridIndex: 2, position: 'left', axisLabel: { color: '#8a94a6', fontSize: 10 }, splitLine: { lineStyle: { color: '#e9edf5' } } })
+    const { k, d, j } = calcKDJ(highs, lows, closes)
+    indLegendData.push('K', 'D', 'J')
+    series.push(
+      { name: 'K', type: 'line', data: k, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#00bcd4', width: 1 } },
+      { name: 'D', type: 'line', data: d, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#ff9800', width: 1 } },
+      { name: 'J', type: 'line', data: j, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#e91e63', width: 1 } },
+    )
+  } else if (indicator === 'BOLL') {
+    grids.push({ left: 60, right: 20, top: 398, bottom: 64 })
+    xAxes.push({ type: 'category', data: dates, gridIndex: 2, axisLabel: { color: '#8a94a6', fontSize: 10, hideOverlap: true }, axisTick: { show: false } })
+    yAxes.push({ scale: true, gridIndex: 2, position: 'left', axisLabel: { color: '#8a94a6', fontSize: 10 }, splitLine: { lineStyle: { color: '#e9edf5' } } })
+    const { mid, upper, lower } = calcBOLL(closes)
+    indLegendData.push('BOLL中轨', '上轨', '下轨')
+    series.push(
+      { name: 'BOLL中轨', type: 'line', data: mid, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#ff9800', width: 1 } },
+      { name: '上轨', type: 'line', data: upper, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#2196f3', width: 1, type: 'dashed' } },
+      { name: '下轨', type: 'line', data: lower, smooth: true, showSymbol: false, xAxisIndex: 2, yAxisIndex: 2, lineStyle: { color: '#2196f3', width: 1, type: 'dashed' }, areaStyle: { color: 'rgba(33,150,243,0.05)' } },
+    )
+  }
 
-    if (name === 'MACD') {
-      const { dif, dea, bar } = calcMACD(closes)
-      legendData.push('DIF', 'DEA', 'MACD')
-      series.push(
-        { name: 'DIF', type: 'line', data: dif, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#00bcd4', width: 1 } },
-        { name: 'DEA', type: 'line', data: dea, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#ff9800', width: 1 } },
-        { name: 'MACD', type: 'bar', data: bar, xAxisIndex: gi, yAxisIndex: gi,
-          itemStyle: { color: p => bar[p.dataIndex] >= 0 ? '#ff4d4f' : '#21c08b' } },
-      )
-    } else if (name === 'KDJ') {
-      const { k, d, j } = calcKDJ(highs, lows, closes)
-      legendData.push('K', 'D', 'J')
-      series.push(
-        { name: 'K', type: 'line', data: k, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#00bcd4', width: 1 } },
-        { name: 'D', type: 'line', data: d, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#ff9800', width: 1 } },
-        { name: 'J', type: 'line', data: j, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#e91e63', width: 1 } },
-      )
-    } else if (name === 'BOLL') {
-      const { mid, upper, lower } = calcBOLL(closes)
-      legendData.push('BOLL中轨', '上轨', '下轨')
-      series.push(
-        { name: 'BOLL中轨', type: 'line', data: mid, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#ff9800', width: 1 } },
-        { name: '上轨', type: 'line', data: upper, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#2196f3', width: 1, type: 'dashed' } },
-        { name: '下轨', type: 'line', data: lower, smooth: true, showSymbol: false, xAxisIndex: gi, yAxisIndex: gi, lineStyle: { color: '#2196f3', width: 1, type: 'dashed' }, areaStyle: { color: 'rgba(33,150,243,0.05)' } },
-      )
-    }
-  })
-
-  const dzXAxisIndices = hasIndicators ? Array.from({ length: 2 + indicators.length }, (_, i) => i) : [0, 1]
+  const dzXAxisIndices = hasIndicators ? [0, 1, 2] : [0, 1]
 
   return {
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-    legend: { data: legendData, top: 0, textStyle: { fontSize: 11, color: '#8a94a6' } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, confine: true },
+    legend: [
+      { data: legendData, top: 0, textStyle: { fontSize: 11, color: '#8a94a6' } },
+      ...(indLegendData.length ? [{ data: indLegendData, top: 374, left: 60, itemGap: 8, itemWidth: 14, itemHeight: 8, textStyle: { fontSize: 10, color: '#8a94a6' } }] : []),
+    ],
     grid: grids,
     xAxis: xAxes,
     yAxis: yAxes,
     dataZoom: [
       { type: 'inside', xAxisIndex: dzXAxisIndices, start: 60, end: 100 },
-      { type: 'slider', xAxisIndex: dzXAxisIndices, start: 60, end: 100, height: 24, bottom: 10 },
+      { type: 'slider', xAxisIndex: dzXAxisIndices, start: 60, end: 100, height: 20, bottom: 8 },
     ],
     series,
   }
 })
 
 async function refresh() {
-  if (refreshing) return   // 在途锁：上次未完成则跳过
+  if (refreshing) return
   refreshing = true
   try {
     await store.refreshQuotes()
@@ -261,7 +256,6 @@ watch(() => store.activeCode, loadKline)
 watch(() => store.source, () => store.refreshQuotes().catch(() => {}))
 
 onMounted(async () => {
-  // 任一接口失败不阻塞页面初始化与定时刷新（旧版 await 抛错会跳过 timer，页面停摆）
   try { await store.fetchWatchlist() } catch (e) { toast('自选列表加载失败: ' + e.message) }
   await refresh().catch(() => {})
   timer = setInterval(() => { if (!document.hidden) store.refreshQuotes().catch(() => {}) }, 6000)
@@ -329,7 +323,7 @@ onUnmounted(() => clearInterval(timer))
         </div>
         <span class="sep">|</span>
         <button v-for="ind in ['MACD','KDJ','BOLL']" :key="ind"
-          class="btn-ghost sm" :class="{ 'btn-active': activeIndicators.includes(ind) }"
+          class="btn-ghost sm" :class="{ 'btn-active': activeIndicator === ind }"
           @click="toggleIndicator(ind)">{{ ind }}</button>
       </div>
       <EChart v-if="klineData.length" :option="klineOption" :height="chartHeight + 'px'" />
@@ -372,3 +366,54 @@ onUnmounted(() => clearInterval(timer))
     </div>
   </div>
 </template>
+
+<style scoped>
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+.data-table th, .data-table td { border: 1px solid var(--border); padding: 9px 11px; text-align: left; }
+.data-table th { background: var(--card-2); color: var(--text-dim); font-weight: 600; }
+
+.detail-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 24px; margin-bottom: 16px; }
+.detail-head { display: flex; align-items: baseline; gap: 12px; }
+.detail-name { font-size: 18px; font-weight: 700; color: var(--text); }
+.detail-code { font-size: 13px; color: var(--text-mute); font-family: monospace; }
+.detail-time { margin-left: auto; font-size: 12px; color: var(--text-mute); }
+.price-block { display: flex; align-items: baseline; gap: 14px; margin: 10px 0; }
+.price-main { font-size: 28px; font-weight: 700; }
+.price-change { display: flex; gap: 8px; font-size: 14px; }
+.grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; }
+.grid-4 .item { background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; text-align: center; }
+.grid-4 .label { font-size: 11px; color: var(--text-mute); }
+.grid-4 .value { font-size: 15px; font-weight: 600; color: var(--text); margin-top: 4px; }
+
+.chart-card { position: relative; }
+.chart-toolbar { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; padding: 6px 0; }
+.chart-toolbar .sep { color: var(--border); font-size: 16px; margin: 0 6px; }
+.btn-active { background: var(--accent) !important; color: #fff !important; border-color: var(--accent) !important; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { background: var(--card-2); color: var(--text-dim); font-weight: 600; padding: 10px 12px; text-align: left; border-bottom: 2px solid var(--border); position: sticky; top: 0; }
+td { padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text); }
+.clickable-row { cursor: pointer; }
+.clickable-row:hover { background: var(--bg-2); }
+.active-row { background: rgba(79,140,255,.08); }
+.td-name { font-weight: 600; }
+.td-code { display: block; font-size: 11px; color: var(--text-mute); font-family: monospace; }
+.empty-row { text-align: center; color: var(--text-mute); }
+.empty-hint { text-align: center; color: var(--text-mute); padding: 30px; font-size: 14px; }
+.del-btn { color: #ff6b6b; cursor: pointer; font-size: 12px; }
+.del-btn:hover { text-decoration: underline; }
+
+.up { color: #ff4d4f; }
+.down { color: #21c08b; }
+
+.toolbar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.toolbar-row select { width: 160px; }
+.search-bar { display: flex; gap: 10px; margin-bottom: 16px; }
+.search-bar input { flex: 1; }
+.field { display: flex; align-items: center; gap: 6px; }
+.field label { font-size: 12px; color: var(--text-mute); white-space: nowrap; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.card-head h2, .card-head h3 { color: var(--text); }
+.count { font-size: 12px; color: var(--text-mute); }
+.mb-24 { margin-bottom: 24px; }
+</style>

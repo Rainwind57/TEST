@@ -9,6 +9,7 @@ const props = defineProps({
 
 const el = ref(null)
 let chart = null
+let ro = null
 
 function render() {
   if (!chart) return
@@ -20,11 +21,14 @@ function handleResize() { chart && chart.resize() }
 onMounted(() => {
   chart = echarts.init(el.value)
   render()
+  ro = new ResizeObserver(handleResize)
+  ro.observe(el.value)
   window.addEventListener('resize', handleResize)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  if (ro) { ro.disconnect(); ro = null }
   if (chart) { chart.dispose(); chart = null }
 })
 

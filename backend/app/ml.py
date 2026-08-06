@@ -1071,6 +1071,21 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             Xp = _apply_feature_weights(Xp, feature_names, adjust.get("featureWeights") or {})
         preds = model.predict(Xp).tolist()
 
+        # 人造模型规则过滤：仅保留满足规则的截面样本（与 score_latest 对齐）
+        model_rule = getattr(model, 'rule', '')
+        if model_rule:
+            keep_idx = _apply_rule_filter(
+                [{}] * len(cross_codes),
+                np.array(cross_feats, dtype=np.float64),
+                feature_names, model_rule)
+            if len(keep_idx) < len(cross_codes):
+                cross_codes = [cross_codes[i] for i in keep_idx]
+                cross_feats = [cross_feats[i] for i in keep_idx]
+                cross_rets = [cross_rets[i] for i in keep_idx]
+                preds = [preds[i] for i in keep_idx]
+        if len(cross_codes) < groups * 2:
+            continue
+
         ic = _pearson(preds, cross_rets)
         rank_ic = _spearman(preds, cross_rets)
         ic_series.append({"date": date_t, "ic": ic, "rankIc": rank_ic, "sample": len(cross_codes)})
@@ -1238,6 +1253,14 @@ async def score_codes(mid: str, codes: list[str]) -> list[dict]:
     X = np.array([f for _, f in collected], dtype=np.float64)
     Xp = _apply_preprocess(X, params)
     preds = model.predict(Xp).tolist()
+    # 人造模型规则过滤
+    model_rule = getattr(model, 'rule', '')
+    if model_rule:
+        keep_idx = _apply_rule_filter(
+            [{}] * len(collected), X, feature_names, model_rule)
+        if len(keep_idx) < len(collected):
+            collected = [collected[i] for i in keep_idx]
+            preds = [preds[i] for i in keep_idx]
     return [{"code": c, "score": float(p)} for c, p in zip([c for c, _ in collected], preds)]
 
 
