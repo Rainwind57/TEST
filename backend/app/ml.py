@@ -136,12 +136,15 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
                         asset_class: str = "a-share",
                         start_date: str | None = None,
                         end_date: str | None = None,
-                        boards: list[str] | None = None) -> dict:
+                        boards: list[str] | None = None,
+                        selected_factors: list[str] | None = None) -> dict:
     """构建 ML 数据集：候选池每只股票算全部量价因子 + 未来 N 日收益。
 
     返回 {features, target, codes, dates, feature_names}。
     use_snapshot=True 时追加全部快照因子（含财务/资金流，需额外拉取）作为静态特征
     （含前视风险，仅探索用；推理 score_latest/backtest_model 会按 feature_names 一致拉取）。
+    selected_factors 不为空时仅使用指定因子子集（技术因子 key 或快照因子 key），
+    未传则默认使用全部因子。
     asset_class=future 时候选池取期货主力连续合约（FUTURE_UNIVERSE），K 线走期货适配器，
     快照因子不适用（期货无财务/资金流字段），强制忽略。
     """
@@ -164,6 +167,11 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     hist = max(int(hist), min_hist_for_ml(n))
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
+    # 因子选择：selected_factors 非空时只保留用户勾选的因子
+    if selected_factors:
+        sel = set(selected_factors)
+        sem_factor_keys = [k for k in sem_factor_keys if k in sel]
+        snapshot_keys = [k for k in snapshot_keys if k in sel]
     if snapshot_keys:
         await _enrich_pool_extra(pool, snapshot_keys)
     row_by_code = {r["code"]: r for r in pool}
@@ -879,6 +887,13 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
         preds = _apply_threshold(preds.tolist(), adjust.get("threshold"))
     else:
         preds = preds.tolist()
+    # 人造模型规则过滤：rule 不为空时在打分后过滤不符合规则的样本
+    model_rule = getattr(model, 'rule', '')
+    if model_rule:
+        keep_idx = _apply_rule_filter(collected, X, feature_names, model_rule)
+        if len(keep_idx) < len(collected):
+            collected = [collected[i] for i in keep_idx]
+            preds = [preds[i] for i in keep_idx]
     rows = [{"code": r["code"], "name": r["name"], "score": float(p)}
             for r, p in zip(collected, preds)]
     rows.sort(key=lambda x: x["score"], reverse=True)
@@ -1295,15 +1310,66 @@ def _alpha_beta(bench: list[float], strat: list[float]) -> dict:
     return {"alpha": my - b * mx, "beta": b}
 
 
+def _parse_rule(rule: str, feature_names: list[str]) -> str | None:
+    """将中文规则字符串转为可 eval 的 Python 表达式。
+
+    支持的语法：因子名 > < >= <= 数值，and/or 连接。
+    因子名先在 feature_names 中精确匹配，再尝试模糊匹配（key 包含关系）。
+    返回可 eval 的表达式字符串，或 None（解析失败）。
+    """
+    if not rule or not rule.strip():
+        return None
+    expr = rule.strip()
+    # 将中文逻辑运算符替换为 Python 语法
+    expr = expr.replace("且", " and ").replace("或", " or ").replace("并且", " and ").replace("或者", " or ")
+    expr = expr.replace("大于等于", ">=").replace("小于等于", "<=").replace("大于", ">").replace("小于", "<")
+    expr = expr.replace("等于", "==").replace("不等于", "!=").replace("不低于", ">=").replace("不超过", "<=")
+    # 尝试将因子名映射为数组索引
+    for i, fn in enumerate(feature_names):
+        # 精确匹配或包含匹配（处理 "动量20"/"momentum_20" 等变体）
+        if fn in expr:
+            expr = expr.replace(fn, f"f[{i}]")
+    # 还没替换的因子名：尝试模糊匹配
+    import re
+    for i, fn in enumerate(feature_names):
+        # 提取中文label作为备选（从FACTORS/SNAPSHOT_FACTORS找）
+        label = ((FACTORS.get(fn) or SNAPSHOT_FACTORS.get(fn)) or {}).get("label", "")
+        if label and label in expr:
+            expr = expr.replace(label, f"f[{i}]")
+    # 验证：表达式中不应再有中文（未识别的因子名）
+    if re.search(r'[\u4e00-\u9fff]{2,}', expr):
+        return None
+    return expr
+
+
+def _apply_rule_filter(rows: list[dict], fvals_matrix: np.ndarray,
+                       feature_names: list[str], rule: str) -> list[int]:
+    """按 rule 过滤样本，返回通过过滤的索引列表。rule 为空或无法解析时不过滤。"""
+    expr = _parse_rule(rule, feature_names)
+    if not expr:
+        return list(range(len(rows)))
+    keep = []
+    for i, f in enumerate(fvals_matrix):
+        try:
+            if eval(expr, {"f": f, "__builtins__": {}}):
+                keep.append(i)
+        except Exception:
+            keep.append(i)  # 单样本解析失败不丢弃
+    return keep
+
+
 # ---------------- 人造/手动模型（P4） ----------------
 
-MANUAL_FEATURES = list(FACTORS.keys())
+MANUAL_FEATURES = list(FACTORS.keys()) + [k for k in SNAPSHOT_FACTORS if SNAPSHOT_FACTORS[k].get("format") != "categorical"]
 
 
 def manual_feature_options() -> list[dict]:
-    """可选手工构建模型的因子（与平台 build_dataset 的技术因子同构，可直接推理）。"""
-    return [{"key": k, "label": FACTORS[k]["label"], "group": FACTORS[k]["group"]}
-            for k in MANUAL_FEATURES]
+    """可选手工构建模型的因子（技术因子 + 快照因子，与 build_dataset 同构，可直接推理）。"""
+    options = []
+    for k in MANUAL_FEATURES:
+        meta = FACTORS.get(k) or SNAPSHOT_FACTORS.get(k) or {}
+        options.append({"key": k, "label": meta.get("label", k), "group": meta.get("group", "")})
+    return options
 
 
 class _ManualModel:
@@ -1316,7 +1382,7 @@ class _ManualModel:
     def __init__(self, feature_names: list[str], weights: dict, threshold: float = 0.0,
                  rule: str = ""):
         self.feature_names = list(feature_names)
-        self.weights = [float(weights.get(n, 1.0)) for n in self.feature_names]
+        self.weights = [float(weights.get(n, 0.0)) for n in self.feature_names]
         self.threshold = float(threshold or 0.0)
         self.rule = rule or ""
 
@@ -1336,8 +1402,8 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
                         rule: str = "") -> dict:
     """创建并落盘一个人造/手动模型（不依赖任何自动训练）。
 
-    feature_names 固定为全部技术因子（FACTORS），落盘结构与自动训练产物完全同构，
-    之后即可用于打分、回测、盯盘调度。返回模型元数据。
+    feature_names 为全部候选因子（技术 + 快照），落盘结构与自动训练产物完全同构，
+    之后即可用于打分、回测、盯盘调度。未指定权重的因子默认权重为 0。返回模型元数据。
     """
     feature_names = MANUAL_FEATURES
     valid = {k: v for k, v in (weights or {}).items() if k in feature_names}
@@ -1359,7 +1425,7 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
     }, path)
     meta = {
         "id": mid, "path": path, "modelType": "manual",
-        "name": (name or mid).strip(), "featureNames": feature_names,
+        "name": (name or mid).strip(), "featureNames": list(valid.keys()),
         "featureWeights": valid, "threshold": float(threshold or 0.0),
         "rule": rule or "", "manual": True,
         "featureImportance": sorted(
@@ -1388,7 +1454,7 @@ def model_import_template() -> dict:
     )
     return {
         "featureNames": MANUAL_FEATURES,
-        "featureLabels": [{"key": k, "label": FACTORS[k]["label"]} for k in MANUAL_FEATURES],
+        "featureLabels": [{"key": k, "label": (FACTORS.get(k) or SNAPSHOT_FACTORS.get(k) or {}).get("label", k)} for k in MANUAL_FEATURES],
         "sampleCode": sample,
         "note": "模型包需包含 model(实现.predict) 与 feature_names(与本清单一致)；preprocess 缺失时按恒等变换兜底。",
     }

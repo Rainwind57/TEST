@@ -90,7 +90,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist,
                                              use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass,
                                              start_date=cfg.startDate, end_date=cfg.endDate,
-                                             boards=cfg.boards)
+                                             boards=cfg.boards,
+                                             selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
         jobs.submit(jid, _run())
@@ -99,7 +100,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist,
                                              use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass,
                                              start_date=cfg.startDate, end_date=cfg.endDate,
-                                             boards=cfg.boards)
+                                             boards=cfg.boards,
+                                             selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
             ev = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
             meta = await loop.run_in_executor(None, ml.train_final_model, dataset, cfg.modelType)
@@ -110,7 +112,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
             dataset = await ml.build_dataset(cfg.board, cfg.poolSize, cfg.n, cfg.hist,
                                              use_snapshot=cfg.useSnapshot, asset_class=cfg.assetClass,
                                              start_date=cfg.startDate, end_date=cfg.endDate,
-                                             boards=cfg.boards)
+                                             boards=cfg.boards,
+                                             selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)

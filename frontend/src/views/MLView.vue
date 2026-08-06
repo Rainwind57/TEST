@@ -26,6 +26,14 @@ const btStart = ref('')             // ML 回测验证区间起始日
 const btEnd = ref('')               // ML 回测验证区间结束日
 const sectorOptions = ref([])
 
+// 任务1：训练因子多选
+const selectedFactors = ref([])
+const factorPanelOpen = ref(false)
+
+// 任务2：调参面板搜索/分组
+const adjustSearch = ref('')
+const adjGroupOpen = reactive({})
+
 async function loadSectors() {
   try {
     const map = await api.get('/data/sectors')
@@ -58,11 +66,28 @@ async function openAdjust(m) {
   adjustPanel.value = m.id
   lastAdjustId.value = ''
   adjustNote.value = ''
-  threshold.value = null
+  adjustSearch.value = ''
   try {
     adjustMeta.value = await api.get(`/ml/models/${m.id}/params`)
     for (const k of Object.keys(featureWeights)) delete featureWeights[k]
-    for (const f of adjustMeta.value.featureNames || []) featureWeights[f] = 1
+    for (const k of Object.keys(adjGroupOpen)) delete adjGroupOpen[k]
+    threshold.value = adjustMeta.value.threshold ?? null
+    const existingWeights = adjustMeta.value.featureWeights || {}
+    const featureNames = adjustMeta.value.featureNames || []
+    for (const f of featureNames) {
+      featureWeights[f] = existingWeights[f] ?? 1
+    }
+    // 默认展开有非零权重的分组
+    const groupHasNonZero = {}
+    for (const f of featureNames) {
+      const mf = manualFeatures.value.find(m => m.key === f)
+      const g = (mf ? mf.group : '其他') || '其他'
+      if (!(g in groupHasNonZero)) groupHasNonZero[g] = false
+      if ((featureWeights[f] ?? 1) !== 1) groupHasNonZero[g] = true
+    }
+    for (const [g, open] of Object.entries(groupHasNonZero)) {
+      adjGroupOpen[g] = open
+    }
   } catch (e) { toast(e.message); adjustPanel.value = '' }
 }
 
@@ -76,6 +101,14 @@ function adjustPayload() {
     ? null : Number(threshold.value)
   return { featureWeights: fw, threshold: th }
 }
+
+function featureLabel(key) {
+  const m = manualFeatures.value.find(f => f.key === key)
+  return m ? m.label : key
+}
+
+function selectAllFactors() { selectedFactors.value = manualFeatures.value.map(f => f.key) }
+function deselectAllFactors() { selectedFactors.value = [] }
 
 async function saveAdjust(m) {
   try {
@@ -93,6 +126,7 @@ function evalConfig() {
     nSplits: Number(nSplits.value), gap: Number(gap.value),
     useSnapshot: useSnapshot.value, assetClass: assetClass.value,
     startDate: trainStart.value || null, endDate: trainEnd.value || null,
+    selectedFactors: selectedFactors.value.length ? selectedFactors.value : null,
   }
 }
 
@@ -282,6 +316,56 @@ const impOption = computed(() => {
   }
 })
 
+// 任务1：因子按 group 分组
+const groupedFeatures = computed(() => {
+  const groups = {}
+  for (const f of manualFeatures.value) {
+    const g = f.group || '其他'
+    if (!groups[g]) groups[g] = []
+    groups[g].push(f)
+  }
+  return groups
+})
+
+// 任务2：调参因子增强（含 importance、group、label）
+const adjustFeaturesEnriched = computed(() => {
+  if (!adjustMeta.value) return []
+  const impMap = {}
+  const fi = adjustMeta.value.featureImportance || adjustMeta.value.featureImportances || []
+  for (const item of fi) {
+    if (item.feature !== undefined) impMap[item.feature] = item.importance ?? 0
+  }
+  return (adjustMeta.value.featureNames || []).map(f => ({
+    key: f,
+    label: featureLabel(f),
+    group: (manualFeatures.value.find(mf => mf.key === f) || {}).group || '其他',
+    importance: impMap[f] ?? 0,
+  })).sort((a, b) => b.importance - a.importance)
+})
+
+const filteredAdjustFeatures = computed(() => {
+  const q = (adjustSearch.value || '').trim().toLowerCase()
+  if (!q) return adjustFeaturesEnriched.value
+  return adjustFeaturesEnriched.value.filter(f =>
+    f.label.toLowerCase().includes(q) || f.key.toLowerCase().includes(q)
+  )
+})
+
+const groupedAdjustFeatures = computed(() => {
+  const groups = []
+  const map = {}
+  for (const f of filteredAdjustFeatures.value) {
+    const g = f.group
+    if (!map[g]) { map[g] = []; groups.push(g) }
+    map[g].push(f)
+  }
+  return groups.map(g => ({ group: g, features: map[g] }))
+})
+
+function toggleAdjGroup(group) {
+  adjGroupOpen[group] = !adjGroupOpen[group]
+}
+
 const lsOption = computed(() => {
   if (!btResult.value?.longShort?.length) return {}
   const pts = btResult.value.longShort
@@ -326,6 +410,30 @@ onUnmounted(() => { pollActive = false })
         <div class="field"><label>训练起始日</label><input v-model="trainStart" type="date" /></div>
         <div class="field"><label>训练结束日</label><input v-model="trainEnd" type="date" /></div>
         <span class="hint">留空=用最近 hist 天全部样本；限定后仅用该区间样本训练/评估</span>
+      </div>
+      <!-- 任务1：因子选择折叠面板 -->
+      <div class="factor-select-box">
+        <button class="btn-ghost sm" @click="factorPanelOpen = !factorPanelOpen">
+          因子选择 ({{ selectedFactors.length }}/{{ manualFeatures.length }})
+          <span class="arrow" :class="{ open: factorPanelOpen }">▾</span>
+        </button>
+        <div v-if="factorPanelOpen" class="factor-panel">
+          <div class="factor-actions">
+            <button class="btn-ghost sm" @click="selectAllFactors">全选</button>
+            <button class="btn-ghost sm" @click="deselectAllFactors">取消全选</button>
+          </div>
+          <div class="factor-groups">
+            <div v-for="(features, group) in groupedFeatures" :key="group" class="factor-group">
+              <div class="factor-group-title">{{ group }} ({{ features.length }})</div>
+              <div class="factor-grid">
+                <label v-for="f in features" :key="f.key" class="factor-checkbox">
+                  <input type="checkbox" :value="f.key" v-model="selectedFactors" />
+                  <span>{{ f.label }}</span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-ghost" :disabled="loading" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
@@ -423,11 +531,29 @@ onUnmounted(() => { pollActive = false })
           <label>预测阈值偏移</label>
           <input v-model="threshold" type="number" step="0.01" placeholder="默认 0" />
         </div>
-        <div class="adj-features">
-          <div class="adj-row" v-for="f in (adjustMeta.featureNames || [])" :key="f">
-            <span class="adj-name" :title="f">{{ f }}</span>
-            <input class="adj-weight" v-model="featureWeights[f]" type="number" step="0.1" min="0" />
+        <!-- 任务2：搜索框 -->
+        <div class="adj-search">
+          <input v-model="adjustSearch" type="text" placeholder="搜索因子名称或 key…" class="adj-search-input" />
+        </div>
+        <!-- 任务2：按分组折叠 + importance 排序 -->
+        <div class="adj-groups">
+          <div v-for="g in groupedAdjustFeatures" :key="g.group" class="adj-group">
+            <div class="adj-group-title" @click="toggleAdjGroup(g.group)">
+              <span class="adj-group-arrow" :class="{ open: adjGroupOpen[g.group] }">▸</span>
+              <span>{{ g.group }}</span>
+              <span class="adj-group-count">{{ g.features.length }} 因子</span>
+            </div>
+            <div v-if="adjGroupOpen[g.group]" class="adj-group-features">
+              <div class="adj-row" v-for="f in g.features" :key="f.key">
+                <span class="adj-name" :title="f.key">{{ f.label }}</span>
+                <span class="adj-imp" v-if="f.importance" :title="'importance: ' + f.importance.toFixed(4)">
+                  {{ f.importance.toFixed(3) }}
+                </span>
+                <input class="adj-weight" v-model="featureWeights[f.key]" type="number" step="0.1" min="0" />
+              </div>
+            </div>
           </div>
+          <div v-if="!filteredAdjustFeatures.length" class="adj-empty">无匹配因子</div>
         </div>
         <div class="panel-toolbar">
           <button class="btn-primary sm" @click="saveAdjust({ id: adjustPanel })">保存调参配置</button>
@@ -486,10 +612,34 @@ onUnmounted(() => { pollActive = false })
 .adjust-box { border-top: 1px solid var(--border); padding: 16px 22px; }
 .adj-threshold { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
 .adj-threshold input { width: 120px; }
-.adj-features { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; max-height: 260px; overflow: auto; }
+/* 旧 .adj-features 替换为 adj-groups */
+.adj-search { margin: 10px 0; }
+.adj-search-input { width: 100%; max-width: 360px; padding: 6px 10px; font-size: 13px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-2); color: var(--text); }
+.adj-groups { max-height: 420px; overflow: auto; }
+.adj-group { margin-bottom: 4px; }
+.adj-group-title { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--card-2); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; user-select: none; font-size: 13px; font-weight: 600; color: var(--text-dim); }
+.adj-group-title:hover { background: var(--bg-2); }
+.adj-group-arrow { display: inline-block; width: 14px; font-size: 11px; transition: transform .15s; color: var(--text-mute); }
+.adj-group-arrow.open { transform: rotate(90deg); }
+.adj-group-count { font-size: 11px; color: var(--text-mute); font-weight: 400; margin-left: auto; }
+.adj-group-features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 6px; padding: 8px 0 8px 20px; }
 .adj-row { display: flex; align-items: center; gap: 8px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
 .adj-name { flex: 1; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.adj-weight { width: 70px; }
+.adj-imp { font-size: 10px; color: var(--accent); font-family: monospace; min-width: 40px; text-align: right; }
+.adj-weight { width: 64px; }
+.adj-empty { text-align: center; padding: 20px; color: var(--text-mute); font-size: 13px; }
+/* 因子选择面板 */
+.factor-select-box { margin-top: 10px; }
+.factor-select-box .arrow { display: inline-block; margin-left: 4px; font-size: 10px; transition: transform .15s; }
+.factor-select-box .arrow.open { transform: rotate(180deg); }
+.factor-panel { border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin-top: 8px; background: var(--bg-2); }
+.factor-actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.factor-groups { max-height: 360px; overflow: auto; }
+.factor-group { margin-bottom: 10px; }
+.factor-group-title { font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+.factor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 4px; }
+.factor-checkbox { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+.factor-checkbox input { margin: 0; }
 .panel-toolbar { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
 .file-input { font-size: 12px; color: var(--text-dim); max-width: 320px; }
 .manual-features { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; margin-top: 12px; max-height: 300px; overflow: auto; }

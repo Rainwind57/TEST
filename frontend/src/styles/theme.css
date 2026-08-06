@@ -93,6 +93,8 @@ input::placeholder { color: var(--text-mute); }
   transition: all .2s;
 }
 .btn-ghost:hover { border-color: var(--accent); color: var(--text); }
+.btn-active { border-color: var(--accent) !important; color: var(--accent) !important; background: rgba(79,140,255,0.08) !important; }
+.chart-toolbar .sep { color: var(--border); margin: 0 8px; user-select: none; }
 
 .card {
   background: var(--card);

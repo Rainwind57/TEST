@@ -127,7 +127,9 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <title>{label} · {title}</title>
-<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
+<script>
+(function(){{var s=document.createElement('script');s.src='https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js';s.onerror=function(){{var s2=document.createElement('script');s2.src='https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js';s2.onerror=function(){{var s3=document.createElement('script');s3.src='https://unpkg.com/echarts@5.5.0/dist/echarts.min.js';s3.onerror=function(){{document.getElementById('chart-fallback').style.display='block'}};document.head.appendChild(s3)}};document.head.appendChild(s2)}};document.head.appendChild(s)}})();
+</script>
 <style>
 body{{font-family:-apple-system,"Segoe UI","PingFang SC",sans-serif;background:#0b1020;color:#e6ebf5;margin:0;padding:32px}}
 h1{{font-size:24px;border-left:4px solid #4f8cff;padding-left:10px}}
@@ -145,8 +147,9 @@ th{{background:#16213c;color:#cfe0ff}}
 .summary-table td{{padding:6px 12px; vertical-align:top;}}
 .summary-table td:first-child,.summary-table td:nth-child(3){{color:#8e9bbd; font-size:12px; width:100px;}}
 @media print{{.chart{{height:300px}} body{{background:#fff;color:#000}} .kpi,.card{{border-color:#ccc;background:#fff}} th{{background:#f0f0f0;color:#000}} h1,h3{{color:#000}}}}
-</style></head><body>
-	<h1>{label}</h1>
+	</style></head><body>
+		<div id="chart-fallback" style="display:none;background:#2a1a1a;border:1px solid #ff4d4f;border-radius:8px;padding:16px;margin:16px 0;color:#ffa39e;font-size:13px">⚠️ 图表加载失败，请检查网络连接后刷新页面，或导出 Excel/PDF 格式查看数据</div>
+		<h1>{label}</h1>
 	<div class="sub">生成时间 {now} · 调仓次数 {m.get('rebalanceCount','-')} · 成本率 {_fmt(m.get('costRate'))}</div>
 	{summary}
 	<div class="grid">{kpis}</div>

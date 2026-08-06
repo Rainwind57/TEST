@@ -23,6 +23,7 @@ class EvalBody(BaseModel):
     assetClass: str = "a-share"  # a-share | future（期货主力连续合约池）
     startDate: str | None = None  # 训练集样本起始日（YYYY-MM-DD，含），限定分时段训练
     endDate: str | None = None    # 训练集样本结束日（YYYY-MM-DD，含）
+    selectedFactors: list[str] | None = None  # 指定因子子集训练（key 列表），不传=全部
 
 
 @router.post("/evaluate")
@@ -32,7 +33,8 @@ async def evaluate(body: EvalBody):
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
                                          use_snapshot=body.useSnapshot, asset_class=body.assetClass,
                                          start_date=body.startDate, end_date=body.endDate,
-                                         boards=body.boards)
+                                         boards=body.boards,
+                                         selected_factors=body.selectedFactors)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -51,7 +53,8 @@ async def train(body: EvalBody):
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
                                          use_snapshot=body.useSnapshot, asset_class=body.assetClass,
                                          start_date=body.startDate, end_date=body.endDate,
-                                         boards=body.boards)
+                                         boards=body.boards,
+                                         selected_factors=body.selectedFactors)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
@@ -99,7 +102,8 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
                                          use_snapshot=body.useSnapshot, asset_class=body.assetClass,
                                          start_date=body.startDate, end_date=body.endDate,
-                                         boards=body.boards)
+                                         boards=body.boards,
+                                         selected_factors=body.selectedFactors)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
