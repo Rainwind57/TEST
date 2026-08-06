@@ -6,7 +6,22 @@ import datetime
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant.db")
 INIT_CASH = 1_000_000.0
 
-DEFAULT_CODES = ["sh000001", "sh600519", "sz000001", "sz300750", "sh601318"]
+DEFAULT_CODES = ["sh600519", "sz000001", "sz300750", "sh601318"]
+
+# 不可交易代码黑名单：以 sh/sz 前缀 + 数字段判定
+import re as _re
+_INDEX_PATTERN = _re.compile(r"^(sh|sz)0{3,4}\d{2,3}$")
+_ETF_PATTERN = _re.compile(r"^(sh|sz)5[0-9]{4}$")
+
+
+def is_tradable(code: str) -> bool:
+    """校验代码是否为可交易个股（排除指数、ETF等不可交易品种）。"""
+    c = code.strip().lower()
+    if _INDEX_PATTERN.match(c):
+        return False
+    if _ETF_PATTERN.match(c):
+        return False
+    return True
 
 
 def get_conn():

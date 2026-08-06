@@ -322,12 +322,25 @@ async def ml_backtest(body: MLBacktestBody):
     """
     try:
         adjust = _load_adjust(body.adjustId, body.adjust)
+        config = body.model_dump()
+        # 注入模型元数据供报告渲染模型类型/超参/特征重要性
+        try:
+            meta = ml.load_model_meta(body.modelId)
+        except Exception:
+            meta = None
+        if meta:
+            config["_modelMeta"] = {
+                "modelType": meta.get("modelType", "gbdt"),
+                "featureNames": meta.get("featureNames") or [],
+                "featureImportance": meta.get("featureImportance") or [],
+                "bestParams": meta.get("bestParams"),
+            }
         return await ml.backtest_model(
             body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
             body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
             adjust=adjust, asset_class=body.assetClass,
             start_date=body.startDate, end_date=body.endDate,
-            config=body.model_dump(),
+            config=config,
             boards=body.boards,
         )
     except FileNotFoundError as e:

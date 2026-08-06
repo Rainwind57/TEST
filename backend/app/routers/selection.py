@@ -369,6 +369,7 @@ class BacktestBody(BaseModel):
     codes: list[str] | None = None    # 自定义股票池（传 code 列表则跳过 market_list 拉取）
     assetClass: str = "a-share"       # a-share | future（期货取主力连续合约池，无涨跌停约束）
     saveArtifact: bool = False        # 回测结果落盘为中间结果，供组合/风险环节复用
+    longOnly: bool = True             # 仅多头（可实盘）；False=多空组合（研究用，需做空）
 
 
 @router.post("/backtest")
@@ -475,7 +476,7 @@ async def run_backtest(body: BacktestBody):
     for code, kl in series.items():
         arr = kline_to_arrays(kl)
         fseries = compute_factor_series(body.factor, arr)
-        code_cache[code] = {"closes": arr["close"], "volumes": arr["volume"], "fseries": fseries, "kline": kl}
+        code_cache[code] = {"closes": arr["close"], "opens": arr.get("open", arr["close"]), "volumes": arr["volume"], "fseries": fseries, "kline": kl}
 
     cost_rate = round_trip_cost_rate(body.commissionRate, body.stampDuty, body.slippage) if body.applyCost else 0.0
 
@@ -509,6 +510,7 @@ async def run_backtest(body: BacktestBody):
             fseries = cc["fseries"]
             fv = series_at(fseries, i) if fseries is not None else calc(cc["kline"], i)
             closes = cc["closes"]
+            opens = cc["opens"]
             if fv is None or closes[i] == 0:
                 continue
             # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（A 股不可强制成交；期货无涨跌停跳过）
@@ -526,7 +528,9 @@ async def run_backtest(body: BacktestBody):
             vols = cc["volumes"]
             if any(vols[j] == 0 for j in range(i, i + n + 1)):
                 continue
-            fret = closes[i + n] / closes[i] - 1
+            # T+1：信号在 t 日收盘后产生，入场为 t+1 日开盘（与事件回测一致）
+            entry_price = opens[i + 1] if i + 1 < len(opens) and opens[i + 1] > 0 else closes[i]
+            fret = closes[i + n] / entry_price - 1
             cross.append((code, fv, fret))
         if len(cross) < groups * 2:
             continue
@@ -580,33 +584,55 @@ async def run_backtest(body: BacktestBody):
     # 调仓间隔 n 日 → 年化采样数 = 252/n（旧版误用 252，年化收益高估 n 倍、Sharpe 高估 √n 倍）
     ppy = 252.0 / max(1, n)
 
-    metrics = {
-        "cumulativeReturn": cum - 1.0,
-        "annualizedReturn": annualized_return(ls_returns, ppy),
-        "annualizedVolatility": annualized_volatility(ls_returns, ppy),
-        "sharpe": sharpe_ratio(ls_returns, periods_per_year=ppy),
-        "sortino": sortino_ratio(ls_returns, periods_per_year=ppy),
-        "maxDrawdown": max_drawdown(ls_equity),
-        "calmar": calmar_ratio(ls_returns, ppy),
-        "winRate": win_rate(ls_returns),
-        "topGroupCumReturn": cum_top - 1.0,
-        "topGroupAnnualized": annualized_return(top_group_returns, ppy),
-        "rebalanceCount": len(ic_series),
-        "costRate": cost_rate,
-        "applyCost": body.applyCost,
-    }
+    # longOnly 模式：主指标用多头 top 组（可实盘），多空组合为次级/研究用
+    if body.longOnly:
+        primary_returns = top_group_returns
+        primary_equity = _equity_curve(primary_returns)
+        primary_cum = cum_top
+        metrics = {
+            "cumulativeReturn": cum_top - 1.0,
+            "annualizedReturn": annualized_return(top_group_returns, ppy),
+            "annualizedVolatility": annualized_volatility(top_group_returns, ppy),
+            "sharpe": sharpe_ratio(top_group_returns, periods_per_year=ppy),
+            "sortino": sortino_ratio(top_group_returns, periods_per_year=ppy),
+            "maxDrawdown": max_drawdown(primary_equity),
+            "calmar": calmar_ratio(top_group_returns, ppy),
+            "winRate": win_rate(top_group_returns),
+            "rebalanceCount": len(ic_series),
+            "costRate": cost_rate,
+            "applyCost": body.applyCost,
+        }
+    else:
+        primary_returns = ls_returns
+        primary_equity = ls_equity
+        primary_cum = cum
+        metrics = {
+            "cumulativeReturn": cum - 1.0,
+            "annualizedReturn": annualized_return(ls_returns, ppy),
+            "annualizedVolatility": annualized_volatility(ls_returns, ppy),
+            "sharpe": sharpe_ratio(ls_returns, periods_per_year=ppy),
+            "sortino": sortino_ratio(ls_returns, periods_per_year=ppy),
+            "maxDrawdown": max_drawdown(ls_equity),
+            "calmar": calmar_ratio(ls_returns, ppy),
+            "winRate": win_rate(ls_returns),
+            "topGroupCumReturn": cum_top - 1.0,
+            "topGroupAnnualized": annualized_return(top_group_returns, ppy),
+            "rebalanceCount": len(ic_series),
+            "costRate": cost_rate,
+            "applyCost": body.applyCost,
+        }
 
     bench_metrics = None
     if bench_by_date:
-        # 按日期交集对齐策略与基准收益（旧版长度不等即置 alpha/beta=0，掩盖真实 beta）
-        aligned = [(p["longShort"], bench_by_date[p["date"]])
-                   for p in long_short_points if p["date"] in bench_by_date]
-        aligned_ls = [a for a, _ in aligned]
+        # 按日期交集对齐策略与基准收益
+        aligned = [(primary_returns[i] if i < len(primary_returns) else 0, bench_by_date[p["date"]])
+                   for i, p in enumerate(long_short_points) if p["date"] in bench_by_date]
+        aligned_strat = [a for a, _ in aligned]
         aligned_bench = [b for _, b in aligned]
         bench_cum = 1.0
         for r in aligned_bench:
             bench_cum *= (1.0 + r)
-        bench_alpha_beta = (_alpha_beta(aligned_bench, aligned_ls)
+        bench_alpha_beta = (_alpha_beta(aligned_bench, aligned_strat)
                             if len(aligned_bench) > 1 else {"alpha": 0.0, "beta": 0.0})
         bench_metrics = {
             "code": bench_code,
@@ -630,7 +656,12 @@ async def run_backtest(body: BacktestBody):
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
         "config": body.model_dump(),
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
+        "longOnly": body.longOnly,
     }
+    if body.longOnly:
+        result["longOnlyNote"] = "当前为仅多头模式（可实盘），主指标基于做多Top组。多空组合(longShort)需做空个股，A股散户不可实盘，仅供研究参考。"
+    else:
+        result["longShortNote"] = "多空组合需同时做多Top组和做空Bottom组。A股散户做空个股需融券/股指期货，本回测绩效不可直接实盘，仅供研究参考。"
     if body.saveArtifact:
         from .. import artifacts
         meta = artifacts.save_artifact("backtest", result, name=f"回测-{body.factor}")
@@ -911,6 +942,8 @@ async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
         added = 0
         for code in body.codes:
             code = code.strip().lower()
+            if not db.is_tradable(code):
+                continue
             existing = conn.execute("SELECT 1 FROM watchlist WHERE code = ?", (code,)).fetchone()
             if existing:
                 continue
@@ -925,9 +958,12 @@ async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
         if not body.totalCash or body.totalCash <= 0:
             raise HTTPException(400, "请提供买入总资金 totalCash")
         per_code_cash = body.totalCash / len(body.codes)
-        codes = [c.strip().lower() for c in body.codes]
+        codes = [c.strip().lower() for c in body.codes if db.is_tradable(c.strip().lower())]
+        if not codes:
+            return {"ok": False, "results": [], "reason": "所有代码均为不可交易标的（指数/ETF）"}
         quotes = await adapters.fetch_tencent_quotes(codes)
         results = []
+        bought_codes = []
         for code in codes:
             q = quotes.get(code)
             if not q or not q.get("price"):
@@ -940,8 +976,22 @@ async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
             try:
                 await place_order(OrderBody(code=code, side="buy", qty=qty), uid)
                 results.append({"code": code, "ok": True, "qty": qty})
+                bought_codes.append(code)
             except HTTPException as e:
                 results.append({"code": code, "ok": False, "reason": e.detail})
-        return {"ok": True, "results": results}
+        # 买入成功的 code 自动同步到 watchlist（使盯盘可跟踪）
+        if bought_codes:
+            try:
+                conn = db.get_conn()
+                for c in bought_codes:
+                    existing = conn.execute("SELECT 1 FROM watchlist WHERE code=?", (c,)).fetchone()
+                    if not existing:
+                        conn.execute("INSERT INTO watchlist (code, added_at) VALUES (?, ?)",
+                                    (c, datetime.datetime.now().isoformat()))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        return {"ok": True, "results": results, "syncedToWatchlist": bought_codes if bought_codes else []}
 
     raise HTTPException(400, "action 必须为 watchlist 或 buy")

@@ -146,15 +146,14 @@ class EventBacktest:
                 continue
             limits = self._limit_by_code[code].get(date, (None, None))
             snap[code] = {
-                # kline_to_arrays 仅返回 close/high/low/volume，撮合价用 close 代 open
-                "open": float(arr["close"][idx]),
-                "close": float(arr["close"][idx]),
-                "high": float(arr["high"][idx]),
-                "low": float(arr["low"][idx]),
-                "volume": float(arr["volume"][idx]),
-                "upper_limit": limits[0],
-                "lower_limit": limits[1],
-            }
+                    "open": float(arr["open"][idx]) if "open" in arr else float(arr["close"][idx]),
+                    "close": float(arr["close"][idx]),
+                    "high": float(arr["high"][idx]),
+                    "low": float(arr["low"][idx]),
+                    "volume": float(arr["volume"][idx]),
+                    "upper_limit": limits[0],
+                    "lower_limit": limits[1],
+                }
         return snap
 
     def _match_orders(self, date: str):

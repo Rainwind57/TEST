@@ -326,14 +326,52 @@ def purged_walk_forward_split(n_samples: int, n_splits: int = 5, test_ratio: flo
     return splits
 
 
-def _find_cv_splits(n_samples: int, n_splits: int, gap: int):
-    """时序 CV 折自动降级（P9 友好处理）：请求折数分不出（训练≥50 & 测试≥10）的有效折时，
-    逐档下调折数重试，返回首个满足条件的折列表；全部失败返回 []（由调用方报结构化错误）。"""
+def purged_walk_forward_split_by_dates(dates: list[str], n_splits: int = 5,
+                                      test_ratio: float = 0.2, gap_days: int = 5):
+    """时序 Walk-Forward 分割（按交易日 gap，杜绝同日 train/test 重叠）。
+
+    dates 已按时间升序排列。去重后按日期组切块，训练区末尾与测试区起始之间至少间隔
+    gap_days 个交易日（而非样本序号），确保整日不会被 train/test 拆分。
+    返回 [(train_idx, test_idx), ...]，idx 为原样本序号。
+    """
+    unique_dates = sorted(set(dates))
+    # 日期 → 该日期样本在 dates 中的所有下标
+    date_to_indices = {d: [] for d in unique_dates}
+    for idx, d in enumerate(dates):
+        date_to_indices[d].append(idx)
+
+    n_dates = len(unique_dates)
+    fold_dates = n_dates // n_splits
+    test_dates_count = max(1, int(fold_dates * test_ratio))
+
+    splits = []
+    for k in range(n_splits):
+        train_end_date_idx = k * fold_dates
+        test_start_date_idx = train_end_date_idx + gap_days
+        test_end_date_idx = test_start_date_idx + test_dates_count
+        if test_end_date_idx > n_dates:
+            break
+
+        train_dates = unique_dates[:train_end_date_idx]
+        test_dates = unique_dates[test_start_date_idx:test_end_date_idx]
+
+        train_idx = np.array([i for d in train_dates for i in date_to_indices[d]], dtype=int)
+        test_idx = np.array([i for d in test_dates for i in date_to_indices[d]], dtype=int)
+
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            continue
+        splits.append((train_idx, test_idx))
+
+    return splits
+
+
+def _find_cv_splits_by_dates(dates: list[str], n_splits: int, gap_days: int):
+    """按日期 purged CV 自动降级。"""
     for ns in (n_splits, *range(max(2, n_splits - 1), 1, -1)):
-        splits = purged_walk_forward_split(n_samples, n_splits=ns, gap=gap)
+        splits = purged_walk_forward_split_by_dates(dates, n_splits=ns, gap_days=gap_days)
         if any(len(tr) >= 50 and len(te) >= 10 for tr, te in splits):
             if ns != n_splits:
-                logger.info("CV 折数从 %s 自动降级为 %s（样本 %s）", n_splits, ns, n_samples)
+                logger.info("CV 折数从 %s 自动降级为 %s（按交易日 gap=%s）", n_splits, ns, gap_days)
             return splits
     return []
 
@@ -341,14 +379,15 @@ def _find_cv_splits(n_samples: int, n_splits: int, gap: int):
 def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
                      gap: int = 5, progress_cb=None) -> dict:
     """时序 CV 评估：每折在训练折内 fit 预处理（缩尾+标准化）再 apply 到测试折，
-    杜绝预处理泄漏；OOS Sharpe 按调仓日聚合多空序列计算（旧版单元素列表恒为 0）。"""
+    杜绝预处理泄漏；OOS Sharpe 按调仓日聚合多空序列计算（旧版单元素列表恒为 0）。
+    gap 按交易日计数（非样本序号），杜绝同日 train/test 重叠。"""
     X_raw = dataset["features"]
     y = dataset["target"]
     dates = dataset["dates"]
     feature_names = dataset["feature_names"]
     n = len(y)
 
-    splits = _find_cv_splits(n, n_splits, gap)
+    splits = _find_cv_splits_by_dates(dates, n_splits, gap)
     if not splits:
         raise ValueError(
             f"样本不足以做时序交叉验证：当前样本 {n} 条，分不出（训练≥50 & 测试≥10）的有效折。"
@@ -491,7 +530,7 @@ def optimize_model(dataset: dict, model_type: str = "lightgbm",
     y = dataset["target"]
     dates = dataset["dates"]
     n = len(y)
-    splits = purged_walk_forward_split(n, n_splits=n_splits, gap=gap)
+    splits = _find_cv_splits_by_dates(dates, n_splits, gap)
     if not splits:
         raise ValueError("样本不足以做时序交叉验证")
 
@@ -1189,6 +1228,13 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
     }
     if config is not None:
         result["config"] = config
+    # 快照因子前视风险警告
+    if snap_keys:
+        result["snapshotWarning"] = (
+            "本模型包含基本面/资金流快照因子（如ROE/PE/主力净流入），"
+            "回测时将当前最新值应用到所有历史截面，存在前视偏差（look-ahead bias），"
+            "回测绩效（IC/Sharpe/分层收益）会被系统性高估。含快照因子的回测结果仅供探索参考，不可直接指导实盘。"
+        )
     # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
     try:
         from . import reporting

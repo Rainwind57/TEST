@@ -80,6 +80,8 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
         raise HTTPException(400, "数量需为 100 的整数倍")
 
     code = body.code.strip().lower()
+    if not db.is_tradable(code):
+        raise HTTPException(400, f"无法交易非交易标的（{code} 为指数/ETF），仅支持可交易个股")
     try:
         quotes = await adapters.fetch_tencent_quotes([code])
     except Exception as e:

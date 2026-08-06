@@ -55,14 +55,22 @@ def _fmt(v, pct=False):
 
 def payload_from_result(result: dict) -> dict:
     """从回测结果 dict 提取报告载荷（前端导出与后端存档共用同一结构）。"""
+    cfg = result.get("config") or {}
     return {
         "factorLabel": result.get("factorLabel", "回测"),
-        "config": result.get("config") or {},
+        "config": cfg,
         "metrics": result.get("metrics") or {},
         "benchmark": result.get("benchmark"),
         "groupSummary": result.get("groupSummary") or [],
         "longShort": result.get("longShort") or [],
         "icSeries": result.get("icSeries") or [],
+        "survivorshipBiasWarning": result.get("survivorshipBiasWarning", ""),
+        "snapshotWarning": result.get("snapshotWarning", ""),
+        "longOnly": result.get("longOnly", True),
+        "longOnlyNote": result.get("longOnlyNote", ""),
+        "longShortNote": result.get("longShortNote", ""),
+        # 模型详情：config 中携带的模型 meta（routers/ml.py 回测时注入）
+        "_modelMeta": cfg.get("_modelMeta") if cfg.get("modelId") else None,
     }
 
 
@@ -89,8 +97,72 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     if strategy_kind == "ML模型":
         strategy_name = cfg.get("modelId") or "-"
 
+    # 警告横幅：前视偏差 / 生存偏差 / 多空不可实盘
+    warnings = []
+    sw = payload.get("snapshotWarning", "")
+    if sw:
+        warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 前视偏差警告：{sw}</div>')
+    sb = payload.get("survivorshipBiasWarning", "")
+    if sb:
+        warnings.append(f'<div class="warn-banner">⚠️ 生存偏差：{sb}</div>')
+    lo = payload.get("longOnly", True)
+    if lo:
+        note = payload.get("longOnlyNote", "")
+        if note:
+            warnings.append(f'<div class="info-banner">📌 {note}</div>')
+    else:
+        note = payload.get("longShortNote", "")
+        if note:
+            warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ {note}</div>')
+
+    # 模型详情块
+    model_meta = payload.get("_modelMeta")
+    model_html = ""
+    if model_meta:
+        model_type = model_meta.get("modelType", "gbdt")
+        n_features = len(model_meta.get("featureNames") or [])
+        bp = model_meta.get("bestParams")
+        hp_str = ""
+        if bp:
+            parts = []
+            if "n_estimators" in bp:
+                parts.append(f"n_estimators={bp['n_estimators']}")
+            if "max_depth" in bp:
+                parts.append(f"max_depth={bp['max_depth']}")
+            if "learning_rate" in bp:
+                parts.append(f"learning_rate={bp['learning_rate']}")
+            hp_str = " · ".join(parts)
+        top_features = (model_meta.get("featureImportance") or [])[:5]
+        ft_rows = "".join(
+            f"<tr><td>{f['feature']}</td><td>{f['importance']:.4f}</td></tr>"
+            for f in top_features
+        )
+        model_html = (
+            f'<div class="card"><h3>模型详情</h3><table class="summary-table">'
+            f'<tr><td>模型类型</td><td>{model_type}</td>'
+            f'<td>特征数</td><td>{n_features}</td></tr>'
+            + (f'<tr><td>超参数</td><td colspan="3">{hp_str}</td></tr>' if hp_str else "") +
+            f'</table>'
+            f'<h4 style="margin-top:12px">Top 特征重要性</h4>'
+            f'<table><tr><th>特征</th><th>重要性</th></tr>{ft_rows}</table></div>'
+        )
+
+    # 调仓方式文字
+    groups_val = cfg.get("groups") or "-"
+    rebalance_desc = (
+        f"分层回测 · 每 {n_val} 交易日按因子值全市场排序分 {groups_val} 组 · "
+        + ("做多Top组（仅多头可实盘）" if lo else f"做多第1组 / 做空第{groups_val}组（研究用多空组合）")
+        + (" · 交易成本已计入" if cfg.get("applyCost") else " · 未计交易成本")
+        + " · T+1 开盘入场"
+    )
+
+    warnings_html = "\n".join(warnings) if warnings else ""
+
     summary = (
+        f'{warnings_html}'
+        f'{model_html}'
         f'<div class="card"><h3>回测概要</h3><table class="summary-table">'
+        f'<tr><td>调仓方式</td><td colspan="3">{rebalance_desc}</td></tr>'
         f'<tr><td>策略来源</td><td>{strategy_kind}</td>'
         f'<td>策略名/模型ID</td><td>{strategy_name}</td></tr>'
         f'<tr><td>回测区间</td><td>{start} ~ {end}</td>'
@@ -175,6 +247,8 @@ th{{background:#16213c;color:#cfe0ff}}
 .sub{{color:#8e9bbd;font-size:13px}}
 .summary-table td{{padding:6px 12px; vertical-align:top;}}
 .summary-table td:first-child,.summary-table td:nth-child(3){{color:#8e9bbd; font-size:12px; width:100px;}}
+.warn-banner{{background:#1a1410;border:1px solid #e6604d;border-radius:8px;padding:12px 16px;margin:12px 0;color:#ffa39e;font-size:13px;line-height:1.6}}
+.info-banner{{background:#101a25;border:1px solid #4f8cff;border-radius:8px;padding:12px 16px;margin:12px 0;color:#a0c4ff;font-size:13px;line-height:1.6}}
 @media print{{.chart{{height:300px}} body{{background:#fff;color:#000}} .kpi,.card{{border-color:#ccc;background:#fff}} th{{background:#f0f0f0;color:#000}} h1,h3{{color:#000}}}}
 	</style></head><body>
 		<div id="chart-fallback" style="display:none;background:#2a1a1a;border:1px solid #ff4d4f;border-radius:8px;padding:16px;margin:16px 0;color:#ffa39e;font-size:13px">⚠️ 图表加载失败，请检查网络连接后刷新页面，或导出 Excel/PDF 格式查看数据</div>

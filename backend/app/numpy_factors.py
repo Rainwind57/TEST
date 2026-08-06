@@ -9,6 +9,7 @@ import numpy as np
 def kline_to_arrays(kline: list[dict]) -> dict:
     """K 线序列转 numpy 数组。返回 {date, open, close, high, low, volume}。"""
     n = len(kline)
+    open_ = np.empty(n, dtype=np.float64)
     close = np.empty(n, dtype=np.float64)
     high = np.empty(n, dtype=np.float64)
     low = np.empty(n, dtype=np.float64)
@@ -16,11 +17,12 @@ def kline_to_arrays(kline: list[dict]) -> dict:
     dates = [None] * n
     for i, row in enumerate(kline):
         dates[i] = row["date"]
+        open_[i] = row["open"]
         close[i] = row["close"]
         high[i] = row["high"]
         low[i] = row["low"]
         volume[i] = row["volume"]
-    return {"date": dates, "close": close, "high": high, "low": low, "volume": volume}
+    return {"date": dates, "open": open_, "close": close, "high": high, "low": low, "volume": volume}
 
 
 def momentum_series(close: np.ndarray, n: int) -> np.ndarray:

@@ -1249,7 +1249,52 @@ async def fetch_future_kline(code: str, days: int = 150) -> list[dict]:
         return []
 
 
-# ---------------- 行业/宏观因子集成端点（供路由层调用） ----------------
+# ---------------- 分时图 ----------------
+
+_TIME_SHARE_CACHE: dict[str, tuple[float, list]] = {}
+_TIME_SHARE_TTL = 60  # 秒（盘中高频刷新）
+
+
+async def fetch_time_share(code: str) -> list[dict]:
+    """拉取当日分时数据（1分钟价格+成交量+均价黄线）。
+
+    优先用新浪 minute K 线 per="1", count=240，当日盘中数据。
+    返回 [{time, price, volume, avgPrice}]，按时间升序。无数据时返回 []。
+    """
+    cache_key = code
+    cached = _TIME_SHARE_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < _TIME_SHARE_TTL:
+        return cached[1]
+
+    try:
+        url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+               f"CN_MarketData.getKLineData?symbol={code}&scale=1&datalen=240")
+        resp = await _http_get(url, 10, headers=_SINA_HEADERS)
+        arr = resp.json() or []
+    except Exception:
+        arr = []
+
+    out = []
+    cum_amount = 0.0
+    cum_vol = 0.0
+    for row in arr:
+        try:
+            prc = float(row["close"])
+            vol = float(row["volume"])
+            cum_amount += prc * vol
+            cum_vol += vol
+            avg = cum_amount / cum_vol if cum_vol > 0 else prc
+            out.append({
+                "time": row["day"].split(" ")[-1][:5],
+                "price": prc,
+                "volume": vol,
+                "avgPrice": round(avg, 2),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    _TIME_SHARE_CACHE[cache_key] = (time.time(), out)
+    return out
 
 async def get_sector_exposures(codes: list[str]) -> list[list[float]]:
     """对一组股票代码返回行业哑变量矩阵，供选股中性化使用。"""

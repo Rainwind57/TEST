@@ -12,6 +12,7 @@ const codeInput = ref('')
 const klineData = ref([])
 const klineDays = ref(500)
 const klineFreq = ref('D')
+const timeshareData = ref([])
 let timer = null
 let refreshing = false
 
@@ -142,6 +143,14 @@ async function loadKline() {
   } catch (e) { klineData.value = [] }
 }
 
+async function loadTimeshare() {
+  if (!store.activeCode) { timeshareData.value = []; return }
+  try {
+    const res = await api.get('/timeshare', { params: { code: store.activeCode } })
+    timeshareData.value = res.data
+  } catch (e) { timeshareData.value = [] }
+}
+
 const klineOption = computed(() => {
   const data = klineData.value
   if (!data.length) return {}
@@ -243,16 +252,65 @@ const klineOption = computed(() => {
   }
 })
 
+const timeshareOption = computed(() => {
+  const data = timeshareData.value
+  if (!data.length) return {}
+  const times = data.map(d => d.time)
+  const prices = data.map(d => d.price)
+  const avgPrices = data.map(d => d.avgPrice)
+  const vols = data.map(d => d.volume)
+  const avgColor = '#f0a040'
+
+  return {
+    grid: { left: 70, right: 70, top: 20, bottom: 60 },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    xAxis: {
+      type: 'category', data: times, axisLabel: { interval: 30, rotate: 0, color: '#8e9bbd', fontSize: 10 },
+      axisLine: { lineStyle: { color: '#23304f' } }, axisTick: { show: false },
+    },
+    yAxis: [
+      { type: 'value', scale: true, splitLine: { lineStyle: { color: '#1e2845' } },
+        axisLabel: { color: '#8e9bbd', fontSize: 10 }, position: 'right' },
+      { type: 'value', scale: true, axisLabel: { show: false }, splitLine: { show: false } },
+    ],
+    dataZoom: [{ type: 'inside', start: 0, end: 100 }],
+    series: [
+      {
+        name: '价格', type: 'line', data: prices, smooth: false, symbol: 'none',
+        lineStyle: { color: '#4f8cff', width: 1.5 },
+        areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+          colorStops: [{offset:0,color:'rgba(79,140,255,0.15)'},{offset:1,color:'rgba(79,140,255,0.01)'}] } },
+      },
+      {
+        name: '均价', type: 'line', data: avgPrices, smooth: false, symbol: 'none',
+        lineStyle: { color: avgColor, width: 1, type: 'dashed' },
+      },
+      {
+        name: '成交量', type: 'bar', data: vols, yAxisIndex: 1,
+        itemStyle: { color: (p) => {
+          const idx = p.dataIndex
+          return idx > 0 && prices[idx] >= prices[idx-1] ? '#cc3d3d' : '#3dcc3d'
+        } },
+        barWidth: '100%',
+      },
+    ],
+  }
+})
+
 async function refresh() {
   if (refreshing) return
   refreshing = true
   try {
     await store.refreshQuotes()
-    await loadKline()
+    if (klineFreq.value !== '分时') await loadKline(); else await loadTimeshare()
   } finally { refreshing = false }
 }
 
-watch(() => store.activeCode, loadKline)
+watch(() => store.activeCode, (code) => {
+  if (code) {
+    if (klineFreq.value !== '分时') loadKline(); else loadTimeshare()
+  }
+})
 watch(() => store.source, () => store.refreshQuotes().catch(() => {}))
 
 onMounted(async () => {
@@ -311,7 +369,8 @@ onUnmounted(() => clearInterval(timer))
     <div class="card chart-card mb-24">
       <div class="chart-toolbar">
         <div class="field" style="margin-right:12px">
-          <select v-model="klineFreq" @change="loadKline" style="width:80px">
+          <select v-model="klineFreq" @change="klineFreq === '分时' ? loadTimeshare() : loadKline()" style="width:80px">
+            <option value="分时">分时</option>
             <option value="D">日K</option>
             <option value="W">周K</option>
             <option value="M">月K</option>
@@ -326,8 +385,14 @@ onUnmounted(() => clearInterval(timer))
           class="btn-ghost sm" :class="{ 'btn-active': activeIndicator === ind }"
           @click="toggleIndicator(ind)">{{ ind }}</button>
       </div>
-      <EChart v-if="klineData.length" :option="klineOption" :height="chartHeight + 'px'" />
-      <div v-else class="empty-hint">暂无K线数据</div>
+      <template v-if="klineFreq === '分时'">
+        <EChart v-if="timeshareData.length" :option="timeshareOption" height="520px" />
+        <div v-else class="empty-hint">暂无分时数据</div>
+      </template>
+      <template v-else>
+        <EChart v-if="klineData.length" :option="klineOption" :height="chartHeight + 'px'" />
+        <div v-else class="empty-hint">暂无K线数据</div>
+      </template>
     </div>
 
     <div v-if="compareCodes.length" class="card mb-24">

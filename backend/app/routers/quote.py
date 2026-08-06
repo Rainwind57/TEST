@@ -65,6 +65,8 @@ def get_watchlist():
 @router.post("/watchlist")
 def add_watchlist(body: WatchAddBody):
     code = body.code.strip().lower()
+    if not db.is_tradable(code):
+        raise HTTPException(400, f"无法添加非交易标的（{code} 为指数/ETF），请选择可交易个股")
     conn = db.get_conn()
     existing = conn.execute("SELECT 1 FROM watchlist WHERE code = ?", (code,)).fetchone()
     if existing:
@@ -84,3 +86,13 @@ def delete_watchlist(code: str):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@router.get("/timeshare")
+async def get_timeshare(code: str):
+    """当日分时图：1分钟价格+成交量+均价黄线。"""
+    try:
+        data = await adapters.fetch_time_share(code)
+    except Exception as e:
+        raise HTTPException(502, f"分时数据请求失败: {e}")
+    return {"code": code, "data": data}
