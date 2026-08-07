@@ -77,7 +77,7 @@ async def run_strategy(sid: int, request: Request):
         if kind == "ml":
             from .ml import MLBacktestBody
             return await ml_router.ml_backtest(MLBacktestBody(**cfg))
-    except TypeError as e:
+    except (TypeError, ValueError) as e:
         raise HTTPException(400, f"策略配置字段不匹配: {e}")
     raise HTTPException(400, f"暂不支持一键运行 kind={kind}")
 

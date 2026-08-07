@@ -65,7 +65,7 @@ def export_backtest(body: ExportBody):
 
 @router.get("/runs")
 def list_report_runs(limit: int = 50, uid: int = Depends(require_user_id)):
-    return db.list_backtest_runs(max(1, min(limit, 200)), user_id=None)
+    return db.list_backtest_runs(max(1, min(limit, 200)), user_id=uid)
 
 
 @router.get("/runs/{run_id}")
@@ -97,7 +97,7 @@ def regenerate_report(run_id: int, fmt: str = "html", uid: int = Depends(require
             media_type = "text/html"
         else:
             raise HTTPException(400, "该报告无存档数据，无法重新生成")
-    ext = "html" if media_type == "text/html" else "xlsx" if "excel" in media_type else "pdf"
+    ext = "html" if "html" in media_type else "xlsx" if "spreadsheetml" in media_type else "pdf"
     return Response(content=data, media_type=media_type,
                     headers={"Content-Disposition": f"attachment; filename=report_{run_id}.{ext}"})
 
@@ -111,17 +111,21 @@ def delete_report(run_id: int, uid: int = Depends(require_user_id)):
             os.remove(os.path.join(reporting.REPORT_DIR, path))
         except OSError:
             pass
-    if not db.delete_backtest_run(run_id):
+    if not db.delete_backtest_run(run_id, user_id=uid):
         raise HTTPException(404, "报告记录不存在")
     return {"ok": True}
 
 
 def _get_run(run_id: int, uid: int) -> dict:
-    rows = db.list_backtest_runs(200, user_id=None)
-    for r in rows:
-        if r["id"] == run_id:
-            return r
-    raise HTTPException(404, "报告记录不存在")
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT * FROM backtest_runs WHERE id = ? AND (user_id = ? OR user_id = 0)",
+        (run_id, uid)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "报告记录不存在")
+    return db._parse_backtest_run(row)
 
 
 # ---------------- 选股结果报告 ----------------

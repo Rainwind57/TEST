@@ -56,14 +56,20 @@ _SAFE_FUNCS = {
 
 
 def _rank(arr):
-    """截面排名归一化到 [0,1]。"""
+    """截面排名归一化到 [0,1]。NaN 排最低分 0。"""
     a = np.asarray(arr, dtype=np.float64)
     if a.size == 0:
         return a
-    order = np.argsort(a)
+    nan_mask = np.isnan(a)
+    # 将 NaN 替换为比最大值还大的值，使其排到最后（最低分）
+    max_val = np.nanmax(a) if np.any(~nan_mask) else 0.0
+    a_filled = np.where(nan_mask, max_val + 1.0, a)
+    order = np.argsort(a_filled)
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, a.size + 1)
-    return (ranks - 1) / max(1, a.size - 1)
+    result = (ranks - 1) / max(1, a.size - 1)
+    result[nan_mask] = 0.0
+    return result
 
 
 def _zscore(arr):
@@ -86,6 +92,9 @@ def validate_expression(expr: str) -> tuple[bool, str]:
     except SyntaxError as e:
         return False, f"语法错误: {e}"
     for node in ast.walk(tree):
+        # 白名单校验：不在白名单中的节点一律拒绝
+        if not isinstance(node, _ALLOWED_NODES):
+            return False, f"不允许的语法: {type(node).__name__}"
         # 黑名单：属性访问/下标/import/推导式/赋值等一律拒（防任意代码执行）
         if isinstance(node, _FORBIDDEN_NODES):
             return False, f"不允许的语法: {type(node).__name__}"
@@ -94,6 +103,8 @@ def validate_expression(expr: str) -> tuple[bool, str]:
                 return False, "只允许调用白名单函数"
             if node.func.id not in _SAFE_FUNCS:
                 return False, f"不允许的函数: {node.func.id}"
+            if node.keywords:
+                return False, "不允许关键字参数"
     return True, ""
 
 
@@ -142,10 +153,10 @@ def evaluate_expression(expr: str, rows: list[dict]) -> list[float]:
             return fn(*args)
         raise ValueError(f"不支持的节点: {type(node).__name__}")
 
+    # NaN / inf → 0
     result = _eval(tree.body)
     arr = np.asarray(result, dtype=np.float64)
     if arr.ndim == 0:  # 常量表达式
         arr = np.full(len(rows), float(arr))
-    # NaN → 0
-    arr = np.where(np.isnan(arr), 0.0, arr)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     return arr.tolist()

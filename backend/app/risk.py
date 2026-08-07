@@ -97,18 +97,30 @@ def _zscore_cols(X: np.ndarray) -> np.ndarray:
     return out
 
 
-def factor_covariance(factor_returns_panel: np.ndarray) -> np.ndarray:
-    """因子收益时序协方差矩阵（Fama-MacBeth beta 时序估计）。
+def factor_covariance(factor_returns_panel: np.ndarray, shrink: bool = True) -> np.ndarray:
+    """因子收益时序协方差矩阵（Fama-MacBeth beta 时序估计）+ Ledoit-Wolf 收缩。
 
     输入应为 (n_periods, n_factors) 的因子收益时序。旧版误用截面暴露矩阵 np.cov(X)
     冒充因子收益协方差——对象完全错误（截面暴露共变 ≠ 因子收益时序共变）。
+    shrink=True 时对齐噪声项做 Ledoit-Wolf 收缩，提升短面板（n_periods < n_factors×3）可靠性。
     """
     if factor_returns_panel.size == 0:
         return np.zeros((0, 0))
     if factor_returns_panel.ndim < 2 or factor_returns_panel.shape[0] < 2:
         k = factor_returns_panel.shape[-1] if factor_returns_panel.ndim >= 1 else 0
         return np.zeros((k, k))
-    return np.cov(factor_returns_panel, rowvar=False)
+    S = np.cov(factor_returns_panel, rowvar=False)
+    if not shrink:
+        return S
+    n, k = factor_returns_panel.shape
+    if n < k * 3:
+        # 短面板：用 Ledoit-Wolf 收缩到对角
+        d = np.diag(S).mean()
+        target = d * np.eye(k)
+        # 收缩强度 = k*(k+1) / (2*n*(k-1)) 粗略近似
+        rho = min(1.0, k * (k + 1) / (2 * max(1, n) * max(1, k - 1)))
+        return (1 - rho) * S + rho * target
+    return S
 
 
 def attribute_returns(weights: np.ndarray, X: np.ndarray, factor_returns: np.ndarray,
@@ -207,7 +219,7 @@ def estimate_specific_variances(stock_data: list[dict], X: np.ndarray, codes: li
         Xt = _zscore_cols(np.array(xrows, dtype=np.float64))
         rt = np.array(rets, dtype=np.float64)
         resid = rt - Xt @ factor_returns
-        sigmas[i] = float(np.var(resid, ddof=max(1, len(resid) - len(factor_returns) - 1)))
+        sigmas[i] = float(np.var(resid, ddof=k + 1))
         fallback_vals.append(sigmas[i])
     mean_v = float(np.mean(fallback_vals)) if fallback_vals else 0.0
     sigmas = np.where(sigmas > 0, sigmas, mean_v)

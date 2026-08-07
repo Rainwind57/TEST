@@ -11,8 +11,26 @@ import secrets
 import datetime
 import time
 import warnings
+from collections import defaultdict, deque
 
 from . import db
+
+# 登录撞库防护：每 IP 5 次/分钟，超过则锁定
+_LOGIN_ATTEMPTS: dict[str, deque] = defaultdict(deque)
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW = 60.0
+
+
+def _check_login_rate(ip: str) -> bool:
+    """检查登录频率，超限返回 False。"""
+    now = time.time()
+    dq = _LOGIN_ATTEMPTS[ip]
+    while dq and now - dq[0] > _LOGIN_WINDOW:
+        dq.popleft()
+    if len(dq) >= _LOGIN_MAX_ATTEMPTS:
+        return False
+    dq.append(now)
+    return True
 
 # JWT 密钥：优先读环境变量 QUANT_JWT_SECRET；未设时从 DB settings 表读取持久化密钥；
 # 都不存在时随机生成并持久化，避免重启后 token 全部失效（P2修复）。
@@ -113,14 +131,16 @@ def register_user(username: str, password: str) -> dict:
     return {"id": uid, "username": username, "token": _make_token(uid, username)}
 
 
-def login_user(username: str, password: str) -> dict:
+def login_user(username: str, password: str, client_ip: str = "") -> dict:
+    if client_ip and not _check_login_rate(client_ip):
+        raise ValueError("登录尝试次数过多，请稍后再试")
     conn = db.get_conn()
     row = conn.execute("SELECT id, username, password, salt FROM users WHERE username = ?",
                       (username,)).fetchone()
     conn.close()
     if not row:
         raise ValueError("用户不存在或密码错误")
-    if _hash_password(password, row["salt"]) != row["password"]:
+    if not hmac.compare_digest(_hash_password(password, row["salt"]), row["password"]):
         raise ValueError("用户不存在或密码错误")
     return {"id": row["id"], "username": row["username"], "token": _make_token(row["id"], row["username"])}
 

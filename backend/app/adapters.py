@@ -1,6 +1,7 @@
 """行情与历史K线数据源适配器（服务端直连，无跨域问题）。"""
 import asyncio
 import json
+import logging
 import re
 import threading
 import time
@@ -10,6 +11,8 @@ from urllib.parse import urlencode
 from collections import OrderedDict
 
 from . import db
+
+logger = logging.getLogger(__name__)
 
 _kline_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()
 KLINE_CACHE_TTL = 300  # 秒
@@ -464,25 +467,47 @@ async def fetch_market_list(board: str = "all", limit: int = 300, sort_field: st
     return rows
 
 
+_market_list_cache: dict[str, tuple[float, list[dict]]] = {}  # key→(timestamp, rows)
+_MARKET_LIST_CACHE_TTL = 120  # 缓存 2 分钟，扛限流
+
+
 async def fetch_market_list_multi(boards: list[str], limit: int = 300,
                                   sort_field: str = "amount") -> list[dict]:
     """多板块 OR 合并候选池：逐板块取池后去重合并（板块可组合，如「沪市主板+创业板」）。
 
-    hs300/zz500 走真实成分股（fetch_market_list 内部已处理），合并结果按原序去重。
+    hs300/zz500 走真实成分股。失败自动重试，全部失败时回退缓存（防 502）。
     """
     boards = [b for b in (boards or []) if b] or ["all"]
+    cache_key = "|".join(sorted(boards)) + f":{limit}"
     out: list[dict] = []
     seen: set[str] = set()
     per = max(10, limit // len(boards))
+    all_failed = True
     for b in boards:
-        try:
-            rows = await fetch_market_list(b, per, sort_field)
-        except Exception:
-            rows = []
+        rows = []
+        for attempt in range(3):
+            try:
+                rows = await fetch_market_list(b, per, sort_field)
+                if rows:
+                    all_failed = False
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        if not rows:
+            logger.warning("板块 %s 候选池拉取失败（3次重试后仍空），跳过", b)
         for r in rows:
             if r["code"] not in seen:
                 seen.add(r["code"])
                 out.append(r)
+    if not out:
+        cached = _market_list_cache.get(cache_key)
+        if cached and time.time() - cached[0] < _MARKET_LIST_CACHE_TTL:
+            logger.warning("候选池全部拉取失败，降级使用缓存（%d只）", len(cached[1]))
+            return cached[1]
+    if out:
+        _market_list_cache[cache_key] = (time.time(), out)
     return out[:limit]
 
 
@@ -916,6 +941,12 @@ INDEX_CACHE_TTL = 3600  # 1h，成分股变动低频
 _INDEX_BOARD_MAP = {
     "sh000300": "BK0500",   # 沪深300
     "sh000905": "BK0701",   # 中证500
+    "sh000016": "BK0501",   # 上证50
+    "sh000688": "BK0503",   # 科创50
+    "sh000852": "BK0513",   # 中证1000
+    "sz399006": "BK0564",   # 创业板指
+    "sz399330": "BK0602",   # 深证100
+    "sh000001": "BK0498",   # 上证综指（全部A股）
 }
 
 
@@ -1275,10 +1306,15 @@ async def fetch_time_share(code: str) -> list[dict]:
         arr = []
 
     out = []
+    # 按当日过滤：A股一日恰240根1分钟K线，"最近240根"必混入昨日→过滤并当日归零均价
+    today_str = datetime.date.today().isoformat()
     cum_amount = 0.0
     cum_vol = 0.0
     for row in arr:
         try:
+            day_str = row["day"][:10]  # "2026-08-07 09:30:00" → "2026-08-07"
+            if day_str != today_str:
+                continue
             prc = float(row["close"])
             vol = float(row["volume"])
             cum_amount += prc * vol

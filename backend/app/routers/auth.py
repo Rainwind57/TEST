@@ -21,9 +21,10 @@ def register(body: Credentials):
 
 
 @router.post("/login")
-def login(body: Credentials):
+def login(body: Credentials, request: Request):
     try:
-        return auth.login_user(body.username, body.password)
+        ip = request.client.host if request.client else ""
+        return auth.login_user(body.username, body.password, client_ip=ip)
     except ValueError as e:
         raise HTTPException(401, str(e))
 

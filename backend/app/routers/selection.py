@@ -452,11 +452,17 @@ async def run_backtest(body: BacktestBody):
     fetched = await asyncio.gather(*(fetch_one(c) for c in codes))
     series = {code: kl for code, kl in fetched if len(kl) >= 40}
     if len(series) < groups * 3:
+        hint = ""
+        if fetch_fail > len(pool) * 0.5:
+            hint = f"（{fetch_fail}/{len(pool)} K线拉取失败，疑似上游限流，建议减小候选池或错峰重试）"
+        elif len(pool) < groups * 3:
+            hint = "（候选池本身不足，建议减小分组数或扩大候选池）"
+        else:
+            hint = "（历史数据不足，建议减小持有期 n 或放宽板块范围）"
         raise HTTPException(
             422,
             f"有效股票样本不足：候选池 {len(pool)} 只，K线拉取失败 {fetch_fail} 只，"
-            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只。"
-            f"请增大候选池规模。",
+            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只（需≥{groups * 3}）。{hint}",
         )
 
     bench_series = None
@@ -521,13 +527,7 @@ async def run_backtest(body: BacktestBody):
             if limit is not None:
                 if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
                     continue
-                if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
-                    continue
-            # 停牌处理：持仓期 [i, i+n] 内有停牌日（成交量=0）则跳过该股该期，
-            # 旧版跨停牌用缺口价算收益致收益失真（停牌期间价格冻结，收益恒 0 或跳空失真）
-            vols = cc["volumes"]
-            if any(vols[j] == 0 for j in range(i, i + n + 1)):
-                continue
+            # 停牌期不剔除，保留真实收益分布（与 ml.py 修复对齐）
             # T+1：信号在 t 日收盘后产生，入场为 t+1 日开盘（与事件回测一致）
             entry_price = opens[i + 1] if i + 1 < len(opens) and opens[i + 1] > 0 else closes[i]
             fret = closes[i + n] / entry_price - 1

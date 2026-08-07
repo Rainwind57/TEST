@@ -26,6 +26,7 @@ async def get_quote(codes: str, source: str = "tencent"):
 
 @router.get("/kline")
 async def get_kline(code: str, days: int = 500, forceRefresh: bool = False):
+    days = max(30, min(days, 2000))  # 防止 days=99999 导致的请求爆炸
     try:
         data = await adapters.fetch_kline(code, days, force_refresh=forceRefresh)
     except Exception as e:

@@ -286,7 +286,7 @@ def list_backtest_runs(limit: int = 50, user_id: int | None = 0) -> list[dict]:
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM backtest_runs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM backtest_runs WHERE user_id = ? OR user_id = 0 ORDER BY id DESC LIMIT ?",
             (user_id, max(1, min(limit, 200)))
         ).fetchall()
     conn.close()

@@ -5,13 +5,14 @@ GET /api/jobs/{id} 轮询进度与结果。同步接口保持不变。
 """
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import jobs, ml, optimize
 from . import selection as sel
 from .ml import EvalBody
 from .optimize import OptimizeBody
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -25,7 +26,7 @@ class JobSubmitBody(BaseModel):
 
 
 @router.post("")
-async def submit_job(body: JobSubmitBody):
+async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
     if body.kind not in _VALID_KINDS:
         raise HTTPException(400, f"kind 必须为 {list(_VALID_KINDS)}")
 
@@ -71,7 +72,7 @@ async def submit_job(body: JobSubmitBody):
     async def _run_optimize():
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, optimize.optimize_backtest, config, n_trials)
+            jobs.get_executor(), optimize.optimize_backtest, config, n_trials)
 
     jobs.submit(jid, _run_optimize())
     return {"jobId": jid, "status": "pending"}
@@ -135,12 +136,12 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
 
 
 @router.get("")
-def list_jobs(limit: int = 50):
+def list_jobs(limit: int = 50, uid: int = Depends(require_user_id)):
     return jobs.list_jobs(max(1, min(limit, 200)))
 
 
 @router.get("/{jid}")
-def get_job(jid: str):
+def get_job(jid: str, uid: int = Depends(require_user_id)):
     j = jobs.get_job(jid)
     if not j:
         raise HTTPException(404, "任务不存在")
@@ -148,7 +149,7 @@ def get_job(jid: str):
 
 
 @router.delete("/{jid}")
-def cancel_job(jid: str):
+def cancel_job(jid: str, uid: int = Depends(require_user_id)):
     if not jobs.cancel(jid):
         raise HTTPException(404, "任务不存在或已完成")
     return {"ok": True}

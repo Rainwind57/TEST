@@ -29,6 +29,10 @@ class IntradayBody(BaseModel):
 async def backtest(body: IntradayBody):
     if not body.code and not body.codes:
         raise HTTPException(400, "code（单股）或 codes（组合）至少提供一个")
+    if body.takeProfit <= 0:
+        raise HTTPException(400, "takeProfit 必须 > 0（例如 0.02 表示 +2% 止盈）")
+    if body.stopLoss >= 0:
+        raise HTTPException(400, "stopLoss 必须 < 0（例如 -0.01 表示 -1% 止损）")
     cfg = intraday.IntradayConfig(
         code=body.code, period=body.period, count=body.count,
         signal_lookback=body.signalLookback, entry_threshold=body.entryThreshold,

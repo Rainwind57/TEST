@@ -4,10 +4,11 @@
 下一环节可从 /api/artifacts/{id} 读取上一环节的结果（如选股结果的 codes 直接
 喂给风险归因），形成可复现的研究流水线。
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import artifacts
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
 
@@ -19,7 +20,7 @@ class SaveBody(BaseModel):
 
 
 @router.post("")
-def save_artifact(body: SaveBody):
+def save_artifact(body: SaveBody, uid: int = Depends(require_user_id)):
     if not body.payload:
         raise HTTPException(400, "payload 不能为空")
     if not body.kind.strip():
@@ -28,12 +29,12 @@ def save_artifact(body: SaveBody):
 
 
 @router.get("")
-def list_artifacts(kind: str | None = None, limit: int = 100):
+def list_artifacts(kind: str | None = None, limit: int = 100, uid: int = Depends(require_user_id)):
     return artifacts.list_artifacts(kind, max(1, min(limit, 500)))
 
 
 @router.get("/{aid}")
-def get_artifact(aid: str):
+def get_artifact(aid: str, uid: int = Depends(require_user_id)):
     rec = artifacts.load_artifact(aid)
     if not rec:
         raise HTTPException(404, "中间结果不存在")
@@ -41,7 +42,7 @@ def get_artifact(aid: str):
 
 
 @router.delete("/{aid}")
-def remove_artifact(aid: str):
+def remove_artifact(aid: str, uid: int = Depends(require_user_id)):
     if not artifacts.delete_artifact(aid):
         raise HTTPException(404, "中间结果不存在")
     return {"ok": True}

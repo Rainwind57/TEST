@@ -8,10 +8,21 @@ IS（早期段）做参数搜索、OOS（晚期段）做样本外验证，最终
 两段窗口完全重叠 → OOS 指标 = IS 指标，所谓防过拟合不成立。
 """
 import asyncio
+import datetime
+
 import optuna
 
 from . import adapters, db
 from .routers import selection as sel
+
+
+def _next_trading_day(date_str: str) -> str:
+    """返回 date_str 次日（YYYY-MM-DD），用于 IS/OOS 不重叠切分。"""
+    try:
+        d = datetime.date.fromisoformat(date_str) + datetime.timedelta(days=1)
+        return d.isoformat()
+    except (ValueError, TypeError):
+        return date_str
 
 
 async def _mid_date(board: str, hist: int, boards: list[str] | None = None) -> str | None:
@@ -88,7 +99,9 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -
         study.optimize(lambda t: _objective(t, base_config, full_hist, mid_date),
                        n_trials=1, catch=(Exception,))
 
-    best = study.best_params if study.best_trial else {}
+    best = study.best_params if study.best_trial and (study.best_value or 0) > -1e8 else {}
+    if not best:
+        raise ValueError("Optuna 寻优未找到有效参数（所有 trial 均失败）。请检查因子/数据/参数范围。")
     best_params = {
         "poolSize": best.get("poolSize", base_config["poolSize"]),
         "groups": best.get("groups", base_config["groups"]),
@@ -96,7 +109,7 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -
     }
 
     is_metrics = _run_with(base_config, full_hist, best_params, end_date=mid_date)
-    oos_metrics = _run_with(base_config, full_hist, best_params, start_date=mid_date)
+    oos_metrics = _run_with(base_config, full_hist, best_params, start_date=_next_trading_day(mid_date))
 
     trials = [
         {"number": t.number, "value": t.value, "params": t.params}
@@ -148,7 +161,7 @@ def _run_with(base: dict, full_hist: int, params: dict,
         return {"error": str(e)}
 
 
-def save_best_as_strategy(base_config: dict, best_params: dict, name: str) -> dict:
+def save_best_as_strategy(base_config: dict, best_params: dict, name: str, user_id: int = 0) -> dict:
     """把最优参数回写为策略（kind=backtest）。
 
     base_config 由前端传入，可能只含部分字段（OptimizeBody 有默认值），用 .get 兜底
@@ -171,4 +184,4 @@ def save_best_as_strategy(base_config: dict, best_params: dict, name: str) -> di
         cfg["modelId"] = base_config["modelId"]
     else:
         cfg["factor"] = base_config.get("factor", "momentum")
-    return db.create_strategy(name, "backtest", cfg)
+    return db.create_strategy(name, "backtest", cfg, user_id=user_id)

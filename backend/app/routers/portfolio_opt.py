@@ -5,13 +5,14 @@
 - mu/cov NaN/Inf 校验（旧版无校验，NaN 导致 cvxpy 抛 500）
 - 新增 /apply：按优化权重一键建仓模拟盘（旧版权重结果只能画饼图，被丢弃）
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import asyncio
 import numpy as np
 
 from .. import portfolio_opt as po, db, adapters
 from .portfolio import OrderBody, place_order
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/portfolio-opt", tags=["portfolio-opt"])
 
@@ -61,7 +62,7 @@ class ApplyBody(BaseModel):
 
 
 @router.post("/apply")
-async def apply_to_portfolio(body: ApplyBody):
+async def apply_to_portfolio(body: ApplyBody, uid: int = Depends(require_user_id)):
     """按优化建仓模拟盘（按总资产×权重整手买入）。"""
     if len(body.codes) != len(body.weights):
         raise HTTPException(400, "codes 与 weights 长度不一致")
@@ -72,12 +73,14 @@ async def apply_to_portfolio(body: ApplyBody):
 
     conn = db.get_conn()
     cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-    positions = conn.execute("SELECT code, qty FROM positions").fetchall()
+    positions_rows = conn.execute("SELECT code, qty FROM positions").fetchall()
     conn.close()
+    positions = {p["code"]: p["qty"] for p in positions_rows}
 
-    quotes = await adapters.fetch_tencent_quotes(body.codes)
+    all_codes = list(set(body.codes) | set(positions.keys()))
+    quotes = await adapters.fetch_tencent_quotes(all_codes)
     market_value = sum(
-        quotes.get(p["code"], {}).get("price", 0) * p["qty"] for p in positions
+        quotes.get(code, {}).get("price", 0) * qty for code, qty in positions.items()
     )
     total = body.totalAssets if body.totalAssets else (cash + market_value)
 

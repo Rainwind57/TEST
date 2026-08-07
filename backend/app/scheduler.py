@@ -357,6 +357,9 @@ async def _scan_signals_impl():
         # 自动调仓（需显式开启 auto_trade 配置）
         if db.get_setting("auto_trade", "0") == "1":
             await _execute_auto_trade(signals, positions)
+        elif signals:
+            logger.info("盯盘产生 %d 个信号但 auto_trade 未开启，不会自动下单。"
+                        "在系统设置中将 auto_trade 设为 1 以启用自动调仓。", len(signals))
     except Exception as e:
         _last_signals = []
         db.log_scheduler_run("scan_signals", False, error=str(e))
@@ -367,7 +370,7 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
 
     风险控制：
     - 买单：仅对「看多」信号且未持仓的标的建仓，等权分配，单笔≤总现金 20%
-    - 卖单：对「平仓」「减仓」信号的已持仓标的全平
+    - 卖单：对「平仓」信号的已持仓标的全平；「减仓」卖出 50% 仓位保留剩余
     - 单次买卖各不超过 5 笔
     """
     import datetime as dt
@@ -435,27 +438,31 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             conn.commit()
             conn.close()
 
-    # 卖单：有卖出信号的持仓全平，最多 5 笔
+    # 卖单：平仓全平，减仓卖 50%，最多 5 笔
     max_sell = min(len(sell_signals), 5)
     for sig in sell_signals[:max_sell]:
         pos = positions[sig["code"]]
+        signal_type = sig.get("signal") or ""
+        is_reduce = "减仓" in signal_type and "平仓" not in signal_type
+        sell_qty = max(100, int(pos["qty"] * 0.5)) if is_reduce else pos["qty"]
+        sell_qty = min(sell_qty, pos["qty"])
         try:
             quotes = await adapters.fetch_tencent_quotes([sig["code"]])
         except Exception:
             continue
         q = quotes.get(sig["code"])
         price = q["price"] if q and q.get("price") and q["price"] > 0 else pos["avg_cost"]
-        amount = price * pos["qty"]
+        amount = price * sell_qty
         conn = db.get_conn()
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
-        if not cur_pos or cur_pos["qty"] < pos["qty"]:
+        if not cur_pos or cur_pos["qty"] < sell_qty:
             conn.close()
             continue
         cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
         new_cash = cur_cash + amount
-        remain = cur_pos["qty"] - pos["qty"]
+        remain = cur_pos["qty"] - sell_qty
         if remain <= 0:
             cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
         else:
@@ -463,7 +470,7 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
         cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
         cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
                    (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "sell", sig["code"],
-                    pos.get("name", sig["code"]), pos["qty"], price, amount))
+                    pos.get("name", sig["code"]), sell_qty, price, amount))
         conn.commit()
         conn.close()
 

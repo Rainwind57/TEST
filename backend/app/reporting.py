@@ -6,8 +6,11 @@ import base64
 import io
 import os
 import datetime
+import logging
 
 from . import db
+
+logger = logging.getLogger(__name__)
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _ECHARTS_PATH = os.path.join(_STATIC_DIR, "echarts.min.js")
@@ -115,6 +118,31 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
         if note:
             warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ {note}</div>')
 
+    # 因子说明块（技术因子回测无模型详情时，补充因子定义/方向/逻辑）
+    factor_html = ""
+    if not model_meta and payload.get("factorLabel"):
+        factor_key = payload.get("factorLabel", "")
+        try:
+            from .factors import FACTORS
+            fdef = FACTORS.get(factor_key)
+        except Exception:
+            fdef = None
+        if not fdef:
+            try:
+                from .ml import FACTORS as ML_FACTORS
+                fdef = ML_FACTORS.get(factor_key)
+            except Exception:
+                fdef = None
+        if fdef:
+            factor_html = (
+                f'<div class="card"><h3>因子说明</h3><table class="summary-table">'
+                f'<tr><td>因子名称</td><td>{fdef.get("label", factor_key)}</td>'
+                f'<td>方向</td><td>{fdef.get("direction", "-")}</td></tr>'
+                f'<tr><td>分组</td><td>{fdef.get("group", "-")}</td>'
+                f'<td>窗口</td><td>{fdef.get("window", "-")}</td></tr>'
+                f'</table></div>'
+            )
+
     # 模型详情块
     model_meta = payload.get("_modelMeta")
     model_html = ""
@@ -149,17 +177,25 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
 
     # 调仓方式文字
     groups_val = cfg.get("groups") or "-"
+    cost_note = ""
+    if cfg.get("applyCost"):
+        cost_note = (
+            "交易成本（佣金+印花税+滑点）已计入。高频调仓（n≤3日）时成本侵蚀显著，"
+            "建议关注减成本后指标（如净Sharpe与毛Sharpe的差异）。"
+        )
+    else:
+        cost_note = "⚠️ 未计入交易成本，实际收益需扣除佣金/印花税/滑点。"
     rebalance_desc = (
         f"分层回测 · 每 {n_val} 交易日按因子值全市场排序分 {groups_val} 组 · "
-        + ("做多Top组（仅多头可实盘）" if lo else f"做多第1组 / 做空第{groups_val}组（研究用多空组合）")
-        + (" · 交易成本已计入" if cfg.get("applyCost") else " · 未计交易成本")
-        + " · T+1 开盘入场"
+        + ("做多Top组（仅多头可实盘，空头需融券）" if lo else f"做多第1组 / 做空第{groups_val}组（研究用多空组合）")
+        + (f" · T+1开盘入场 · {cost_note}")
     )
 
     warnings_html = "\n".join(warnings) if warnings else ""
 
     summary = (
         f'{warnings_html}'
+        f'{factor_html}'
         f'{model_html}'
         f'<div class="card"><h3>回测概要</h3><table class="summary-table">'
         f'<tr><td>调仓方式</td><td colspan="3">{rebalance_desc}</td></tr>'
@@ -213,7 +249,11 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
             "</table></div>"
         )
 
+    # IC 统计
     ic_stats = ""
+    ics: list[float] = []
+    mean_ic = 0.0
+    pos = 0.0
     if payload.get("icSeries"):
         ics = [p.get("ic") for p in payload["icSeries"] if p.get("ic") is not None]
         if ics:
@@ -221,6 +261,36 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
             pos = sum(1 for v in ics if v > 0) / len(ics)
             ic_stats = (f'<div class="card"><h3>IC 统计</h3><p>'
                         f'平均 IC：{_fmt(mean_ic)} · IC 胜率：{pos*100:.1f}% · 截面数：{len(ics)}</p></div>')
+
+    # 结果解读
+    sharpe = m.get("sharpe") or 0
+    mdd = m.get("maxDrawdown") or 0
+    wr = m.get("winRate") or 0
+    ic_val = mean_ic
+    ic_pos = pos
+
+    sharpe_grade = "优秀（≥1.5）" if sharpe >= 1.5 else "良好（1.0~1.5）" if sharpe >= 1.0 else "一般（0.5~1.0）" if sharpe >= 0.5 else "偏低（<0.5）"
+    mdd_grade = "较大（<-30%）" if mdd < -0.3 else "中等（-20%~-30%）" if mdd < -0.2 else "可控（>-20%）"
+    ic_grade = "有效（均值>0.03）" if ic_val > 0.03 else "中等（0.01~0.03）" if ic_val > 0.01 else "偏弱（<0.01）"
+    conclusion = []
+    if sharpe >= 1.0 and mdd > -0.25:
+        conclusion.append("策略整体风险调整后收益表现良好，回撤可控，适合作为组合基础仓位。")
+    elif sharpe >= 0.5:
+        conclusion.append("策略有一定选股能力但回撤偏高，建议结合仓位管理或止损机制使用。")
+    else:
+        conclusion.append("策略信号偏弱，建议优化因子组合或扩大候选池后再评估。")
+    if ic_val > 0.02:
+        conclusion.append("IC 均值表明因子对截面收益有区分度，可配合其他因子构建多因子模型。")
+    if len(ics) < 20 and len(ics) > 0:
+        conclusion.append(f"调仓次数仅 {len(ics)} 次，样本偏少，绩效指标统计显著性不足。")
+
+    interp_html = (
+        f'<div class="card"><h3>结果解读</h3>'
+        f'<p style="line-height:1.8;color:#cfe0ff">Sharpe {sharpe_grade} · '
+        f'最大回撤 {mdd_grade} · 胜率 {wr*100:.1f}% · '
+        f'因子IC {ic_grade}。{" ".join(conclusion)}</p>'
+        f'</div>'
+    )
 
     ls_json = _json.dumps(payload.get("longShort") or [], ensure_ascii=False)
     gs_json = _json.dumps(payload.get("groupSummary") or [], ensure_ascii=False)
@@ -260,9 +330,10 @@ th{{background:#16213c;color:#cfe0ff}}
 <div class="card"><h3>分组收益</h3><table>
 <tr><th>分组</th><th>平均收益</th><th>样本数</th></tr>{rows}</table></div>
 {ic_stats}
-<div class="card"><h3>多空累计收益与回撤</h3><div id="chartLS" class="chart"></div></div>
-<div class="card"><h3>分组平均收益</h3><div id="chartGroup" class="chart"></div></div>
-<div class="card"><h3>IC / RankIC 时序列</h3><div id="chartIC" class="chart"></div></div>
+{interp_html}
+<div class="card"><h3>多空累计收益与回撤</h3><p class="sub" style="margin:4px 0 8px">蓝线为多空组合累计收益率（%），红色阴影为回撤。长期右上→策略有效。</p><div id="chartLS" class="chart"></div></div>
+<div class="card"><h3>分组平均收益</h3><p class="sub" style="margin:4px 0 8px">柱状图为各分组的平均持仓期收益，分组1→N 单调→因子区分度好。</p><div id="chartGroup" class="chart"></div></div>
+<div class="card"><h3>IC / RankIC 时序列</h3><p class="sub" style="margin:4px 0 8px">IC（皮尔逊）/ RankIC（斯皮尔曼）时序。>0 天数多→因子预测方向稳，|IC|大→区分度强。</p><div id="chartIC" class="chart"></div></div>
 <script>
 const LS={ls_json}, GS={gs_json}, IC={ic_json};
 const dates=LS.map(p=>p.date);
@@ -310,11 +381,21 @@ def render_excel(payload: dict) -> bytes:
         raise ValueError("服务器未安装 openpyxl，无法导出 Excel")
     wb = Workbook()
     m = payload.get("metrics") or {}
+    cfg = payload.get("config") or {}
 
     ws = wb.active
     ws.title = "绩效指标"
     rows = [
-        ("因子", payload.get("factorLabel")),
+        ("因子/模型", payload.get("factorLabel")),
+        ("板块", cfg.get("board", "-")),
+        ("持有期(n)", cfg.get("n", "-")),
+        ("历史长度(hist)", cfg.get("hist", "-")),
+        ("分组数", cfg.get("groups", "-")),
+        ("候选池规模", cfg.get("poolSize", "-")),
+        ("回测起始", cfg.get("startDate", "-")),
+        ("回测结束", cfg.get("endDate", "-")),
+        ("佣金/印花/滑点", f"{cfg.get('commissionRate',0.00025)}/{cfg.get('stampDuty',0.001)}/{cfg.get('slippage',0.001)}"),
+        ("", ""),
         ("累计收益", m.get("cumulativeReturn")),
         ("年化收益", m.get("annualizedReturn")),
         ("年化波动", m.get("annualizedVolatility")),
@@ -481,7 +562,8 @@ def store_backtest_report(result: dict, config: dict | None = None,
             result.get("metrics") or {}, report_path=fname,
             user_id=user_id, result=result)
         return run
-    except Exception:
+    except Exception as e:
+        logger.warning("回测报告自动存档失败: %s", e)
         return None
 
 

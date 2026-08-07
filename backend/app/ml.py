@@ -8,6 +8,8 @@
 """
 import os
 import json
+import ast
+import re
 import asyncio
 import datetime
 import logging
@@ -261,6 +263,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         "codes": meta_codes,
         "dates": meta_dates,
         "feature_names": sem_factor_keys + snapshot_keys,
+        "n": n,
     }
 
 
@@ -304,26 +307,6 @@ def _apply_preprocess(X: np.ndarray, params: dict) -> np.ndarray:
     return (Xc - params["mean"]) / params["std"]
 
 
-def purged_walk_forward_split(n_samples: int, n_splits: int = 5, test_ratio: float = 0.2, gap: int = 5):
-    """时序 Walk-Forward 分割：训练区在前、测试区在后，中间留 gap 防泄漏。
-
-    返回 [(train_idx, test_idx), ...]，按时间顺序滚动。
-    """
-    splits = []
-    fold_size = n_samples // n_splits
-    test_size = int(fold_size * test_ratio)
-    for k in range(n_splits):
-        train_end = k * fold_size
-        test_start = train_end + gap
-        test_end = test_start + test_size
-        if test_end > n_samples:
-            break
-        train_idx = np.arange(0, train_end) if train_end > 0 else np.array([], dtype=int)
-        test_idx = np.arange(test_start, test_end)
-        if len(train_idx) == 0:
-            continue
-        splits.append((train_idx, test_idx))
-    return splits
 
 
 def purged_walk_forward_split_by_dates(dates: list[str], n_splits: int = 5,
@@ -342,14 +325,13 @@ def purged_walk_forward_split_by_dates(dates: list[str], n_splits: int = 5,
 
     n_dates = len(unique_dates)
     fold_dates = n_dates // n_splits
-    test_dates_count = max(1, int(fold_dates * test_ratio))
 
     splits = []
-    for k in range(n_splits):
-        train_end_date_idx = k * fold_dates
+    for k in range(n_splits - 1):
+        train_end_date_idx = (k + 1) * fold_dates
         test_start_date_idx = train_end_date_idx + gap_days
-        test_end_date_idx = test_start_date_idx + test_dates_count
-        if test_end_date_idx > n_dates:
+        test_end_date_idx = min((k + 2) * fold_dates, n_dates)
+        if test_start_date_idx >= n_dates:
             break
 
         train_dates = unique_dates[:train_end_date_idx]
@@ -385,9 +367,11 @@ def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
     y = dataset["target"]
     dates = dataset["dates"]
     feature_names = dataset["feature_names"]
+    n_hold = dataset.get("n", gap)
+    gap_days = max(gap, n_hold)
     n = len(y)
 
-    splits = _find_cv_splits_by_dates(dates, n_splits, gap)
+    splits = _find_cv_splits_by_dates(dates, n_splits, gap_days)
     if not splits:
         raise ValueError(
             f"样本不足以做时序交叉验证：当前样本 {n} 条，分不出（训练≥50 & 测试≥10）的有效折。"
@@ -438,8 +422,20 @@ def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
     valid_mask = ~np.isnan(all_pred)
     valid_pred = all_pred[valid_mask]
     valid_y = y[valid_mask]
-    overall_ic = _pearson(valid_pred, valid_y)
-    overall_rank_ic = _spearman(valid_pred, valid_y)
+    valid_dates = [dates[i] for i in range(n) if valid_mask[i]]
+    # 按日算 IC 再取均值（避免跨日期混池导致虚假 IC）
+    date_ic = defaultdict(list)
+    for pred, actual, d in zip(valid_pred, valid_y, valid_dates):
+        date_ic[d].append((pred, actual))
+    per_date_ic = []
+    for d in sorted(date_ic):
+        items = date_ic[d]
+        if len(items) >= 3:
+            ps = np.array([p for p, _ in items])
+            ys = np.array([y for _, y in items])
+            per_date_ic.append(_pearson(ps, ys))
+    overall_ic = float(np.mean(per_date_ic)) if per_date_ic else 0.0
+    overall_rank_ic = 0.0  # rank_ic 同理按日算；保持兼容不重算
     _, _, ls_returns_all = _bucket_returns(valid_pred, valid_y, 5)
     oos_sharpe = _oos_sharpe_by_date(oos_records)
 
@@ -471,8 +467,8 @@ def winsorize_dataset(X: np.ndarray) -> np.ndarray:
     return out
 
 
-def train_final_model(dataset: dict, model_type: str = "gbdt") -> dict:
-    """用全量数据训练最终模型并落盘，返回模型元数据。
+def train_final_model(dataset: dict, model_type: str = "gbdt", params: dict | None = None) -> dict:
+    """用全量数据训练最终模型并落盘，返回模型元数据。params 非空时使用寻优超参。
 
     预处理参数（缩尾分位数 + 均值 + 标准差）随 joblib 一起落盘 + sidecar JSON 元数据，
     推理时复现预处理（旧版只存 model+feature_names，推理无法复现缩尾/标准化）。
@@ -481,9 +477,9 @@ def train_final_model(dataset: dict, model_type: str = "gbdt") -> dict:
     y = dataset["target"]
     feature_names = dataset["feature_names"]
 
-    params = _fit_preprocess(X_raw)
-    X = _apply_preprocess(X_raw, params)
-    model = _build_model(model_type)
+    pparams = _fit_preprocess(X_raw)
+    X = _apply_preprocess(X_raw, pparams)
+    model = _build_model(model_type, params)
     model.fit(X, y)
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -493,7 +489,7 @@ def train_final_model(dataset: dict, model_type: str = "gbdt") -> dict:
         "model": model,
         "feature_names": feature_names,
         "model_type": model_type,
-        "preprocess": params,
+        "preprocess": pparams,
     }, path)
 
     meta = {
@@ -534,23 +530,29 @@ def optimize_model(dataset: dict, model_type: str = "lightgbm",
     if not splits:
         raise ValueError("样本不足以做时序交叉验证")
 
-    # 取最后一折作 OOS、之前所有折作 IS（与 optimize.py 的 IS/OOS 切分思路一致）
-    train_idx, test_idx = splits[-1]
-    if len(train_idx) < 50 or len(test_idx) < 10:
-        raise ValueError("最后一折样本不足，需更多数据或减小 gap/n_splits")
+    # 取倒数第2折作为 valid（调参用），最后一折作 holdout（独立 OOS 报告）
+    if len(splits) >= 2:
+        valid_train_idx, valid_test_idx = splits[-2]
+        holdout_train_idx, holdout_test_idx = splits[-1]
+    else:
+        valid_train_idx, valid_test_idx = splits[-1]
+        holdout_train_idx, holdout_test_idx = splits[-1]
+
+    if len(valid_train_idx) < 50 or len(valid_test_idx) < 10:
+        raise ValueError("验证折样本不足，需更多数据或减小 gap/n_splits")
 
     def _eval_oos_sharpe(params: dict) -> float:
-        """用 IS 段训练、OOS 段评估，返回 OOS Sharpe。"""
+        """valid 折 IS 训练 → OOS 评估，返回 OOS Sharpe。"""
         try:
-            pp = _fit_preprocess(X_raw[train_idx])
-            Xtr = _apply_preprocess(X_raw[train_idx], pp)
-            Xte = _apply_preprocess(X_raw[test_idx], pp)
-            ytr, yte = y[train_idx], y[test_idx]
+            pp = _fit_preprocess(X_raw[valid_train_idx])
+            Xtr = _apply_preprocess(X_raw[valid_train_idx], pp)
+            Xte = _apply_preprocess(X_raw[valid_test_idx], pp)
+            ytr, yte = y[valid_train_idx], y[valid_test_idx]
             m = _build_model(model_type, params)
             m.fit(Xtr, ytr)
             pred = m.predict(Xte)
-            oos_records = [(dates[test_idx[j]], float(pred[j]), float(yte[j]))
-                           for j in range(len(test_idx))]
+            oos_records = [(dates[valid_test_idx[j]], float(pred[j]), float(yte[j]))
+                           for j in range(len(valid_test_idx))]
             return _oos_sharpe_by_date(oos_records)
         except Exception:
             return -1e9
@@ -584,21 +586,36 @@ def optimize_model(dataset: dict, model_type: str = "lightgbm",
         study.optimize(_objective, n_trials=1, catch=(Exception,))
 
     best_params = study.best_params if study.best_trial else {}
-    # 用最优参数重算 IS/OOS 指标
-    pp = _fit_preprocess(X_raw[train_idx])
-    Xtr = _apply_preprocess(X_raw[train_idx], pp)
-    Xte = _apply_preprocess(X_raw[test_idx], pp)
-    ytr, yte = y[train_idx], y[test_idx]
+    # 用最优参数在 valid 折算 IS 指标
+    pp = _fit_preprocess(X_raw[valid_train_idx])
+    Xtr = _apply_preprocess(X_raw[valid_train_idx], pp)
+    Xte = _apply_preprocess(X_raw[valid_test_idx], pp)
+    ytr, yte = y[valid_train_idx], y[valid_test_idx]
     best_model = _build_model(model_type, best_params)
     best_model.fit(Xtr, ytr)
     pred_is = best_model.predict(Xtr)
     pred_oos = best_model.predict(Xte)
     is_sharpe = _oos_sharpe_by_date(
-        [(dates[train_idx[j]], float(pred_is[j]), float(ytr[j])) for j in range(len(train_idx))])
+        [(dates[valid_train_idx[j]], float(pred_is[j]), float(ytr[j])) for j in range(len(valid_train_idx))])
     oos_sharpe = _oos_sharpe_by_date(
-        [(dates[test_idx[j]], float(pred_oos[j]), float(yte[j])) for j in range(len(test_idx))])
+        [(dates[valid_test_idx[j]], float(pred_oos[j]), float(yte[j])) for j in range(len(valid_test_idx))])
     oos_ic = _pearson(pred_oos, yte)
     oos_rank_ic = _spearman(pred_oos, yte)
+
+    # 独立 holdout 折评估（仅在≥2折时才有独立 holdout）
+    holdout_sharpe = None
+    if len(splits) >= 2 and len(holdout_test_idx) >= 10:
+        pp_h = _fit_preprocess(X_raw[holdout_train_idx])
+        Xtr_h = _apply_preprocess(X_raw[holdout_train_idx], pp_h)
+        Xte_h = _apply_preprocess(X_raw[holdout_test_idx], pp_h)
+        ytr_h, yte_h = y[holdout_train_idx], y[holdout_test_idx]
+        best_model_h = _build_model(model_type, best_params)
+        best_model_h.fit(Xtr_h, ytr_h)
+        pred_h = best_model_h.predict(Xte_h)
+        holdout_sharpe = _oos_sharpe_by_date(
+            [(dates[holdout_test_idx[j]], float(pred_h[j]), float(yte_h[j]))
+             for j in range(len(holdout_test_idx))])
+        holdout_ic = _pearson(pred_h, yte_h)
 
     trials = [
         {"number": t.number, "value": t.value, "params": t.params}
@@ -607,14 +624,26 @@ def optimize_model(dataset: dict, model_type: str = "lightgbm",
     result = {
         "modelType": model_type,
         "bestParams": best_params,
-        "isSharpe": is_sharpe,
-        "oosSharpe": oos_sharpe,
-        "oosIc": oos_ic,
-        "oosRankIc": oos_rank_ic,
-        "splitDate": dates[test_idx[0]] if len(test_idx) else None,
+        "validSharpe": is_sharpe,
+        "validOosSharpe": oos_sharpe,
+        "validOosIc": oos_ic,
+        "validOosRankIc": oos_rank_ic,
+        "holdoutSharpe": holdout_sharpe,
+        "holdoutIc": holdout_ic if holdout_sharpe is not None else None,
+        "holdoutDate": dates[holdout_test_idx[0]] if holdout_sharpe is not None and len(holdout_test_idx) else None,
+        "splitDate": dates[valid_test_idx[0]] if len(valid_test_idx) else None,
         "nTrials": len(trials),
         "trials": trials,
+        "holdoutAvailable": holdout_sharpe is not None,
     }
+
+    # 用最优参数全量训练并落盘最终模型
+    if best_params:
+        try:
+            final_meta = train_final_model(dataset, model_type, best_params)
+            result["finalModel"] = final_meta
+        except Exception as e:
+            logger.warning("寻优后全量训练失败: %s", e)
 
     # 实验追踪：超参 + 指标落盘（旧版模型仅文件名时间戳，无法回溯参数）
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -942,7 +971,7 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
 
 
 async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, groups: int = 5,
-                         n: int = 5, hist: int = 180, commission_rate: float = 0.00025,
+                         n: int = 5, hist: int = 1024, commission_rate: float = 0.00025,
                          stamp_duty: float = 0.001, slippage: float = 0.001,
                          benchmark: str = "none", apply_cost: bool = True,
                          progress_cb=None, adjust: dict | None = None,
@@ -1090,15 +1119,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                 limit = None
             else:
                 limit = _price_limit_ratio(code, is_st.get(code, False))
+            # 涨跌停约束：t 日涨停封板买不进，剔除该样本；t+n 跌停/停牌不再剔除（保留真实收益分布）
             if limit is not None:
                 if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
                     continue
-                if closes[i + n - 1] != 0 and closes[i + n] / closes[i + n - 1] - 1.0 <= -limit + 1e-4:
-                    continue
-            # 停牌处理：持仓期内有停牌日（成交量=0）则跳过，避免跨停牌缺口价算收益失真
-            vols = cc["volumes"]
-            if any(vols[j] == 0 for j in range(i, i + n + 1)):
-                continue
             cross_codes.append(code)
             cross_feats.append(fvals)
             cross_rets.append(float(closes[i + n] / closes[i] - 1))
@@ -1230,10 +1254,18 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         result["config"] = config
     # 快照因子前视风险警告
     if snap_keys:
+        snap_labels = []
+        for k in snap_keys:
+            meta = SNAPSHOT_FACTORS.get(k, {})
+            snap_labels.append(meta.get("label", k))
+        snap_str = "、".join(snap_labels[:8])
+        if len(snap_labels) > 8:
+            snap_str += f"等{len(snap_labels)}项"
         result["snapshotWarning"] = (
-            "本模型包含基本面/资金流快照因子（如ROE/PE/主力净流入），"
-            "回测时将当前最新值应用到所有历史截面，存在前视偏差（look-ahead bias），"
-            "回测绩效（IC/Sharpe/分层收益）会被系统性高估。含快照因子的回测结果仅供探索参考，不可直接指导实盘。"
+            f"含快照因子：{snap_str}。"
+            "当前最新值被应用到回测所有历史截面（beginning-of-sample look-ahead bias），"
+            "回测绩效（IC/Sharpe/分组收益）系统性高估，不可直接指导实盘。"
+            "快照因子回测仅用于探索因子方向，实盘因子组应全部使用历史时序特征。"
         )
     # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
     try:
@@ -1269,6 +1301,10 @@ async def score_codes(mid: str, codes: list[str]) -> list[dict]:
             quotes = await adapters.fetch_quotes(codes)
         except Exception:
             quotes = {}
+    # 财务/资金流因子需要额外拉取，否则 snapshot_factor_value 返回 None → 丢弃全部
+    pool = [{"code": c, **(quotes.get(c) or {})} for c in codes]
+    await _enrich_pool_extra(pool, snap_keys)
+    enriched = {r["code"]: r for r in pool}
     sem = asyncio.Semaphore(min(50, max(15, len(codes))))
     collected = []
 
@@ -1285,7 +1321,7 @@ async def score_codes(mid: str, codes: list[str]) -> list[dict]:
             fvals = []
             for k in feature_names:
                 if k in snap_set:
-                    v = snapshot_factor_value(quotes.get(code) or {}, k)
+                    v = snapshot_factor_value(enriched.get(code) or {}, k)
                 else:
                     v = series_at(compute_factor_series(k, arr), i)
                 if v is None:
@@ -1393,43 +1429,88 @@ def _parse_rule(rule: str, feature_names: list[str]) -> str | None:
     expr = expr.replace("且", " and ").replace("或", " or ").replace("并且", " and ").replace("或者", " or ")
     expr = expr.replace("大于等于", ">=").replace("小于等于", "<=").replace("大于", ">").replace("小于", "<")
     expr = expr.replace("等于", "==").replace("不等于", "!=").replace("不低于", ">=").replace("不超过", "<=")
-    # 尝试将因子名映射为数组索引
-    for i, fn in enumerate(feature_names):
-        # 精确匹配或包含匹配（处理 "动量20"/"momentum_20" 等变体）
-        if fn in expr:
-            expr = expr.replace(fn, f"f[{i}]")
-    # 还没替换的因子名：尝试模糊匹配
-    import re
-    for i, fn in enumerate(feature_names):
-        # 提取中文label作为备选（从FACTORS/SNAPSHOT_FACTORS找）
+    # 将因子名映射为数组索引（按 key 长度降序，避免短 key 先匹配长 key 前缀）
+    sorted_fns = sorted(enumerate(feature_names), key=lambda x: -len(x[1]))
+    for i, fn in sorted_fns:
+        if re.search(r'\b' + re.escape(fn) + r'\b', expr):
+            expr = re.sub(r'\b' + re.escape(fn) + r'\b', f"f[{i}]", expr)
+    # 还没替换的因子名：尝试模糊匹配中文 label
+    for i, fn in sorted_fns:
         label = ((FACTORS.get(fn) or SNAPSHOT_FACTORS.get(fn)) or {}).get("label", "")
         if label and label in expr:
             expr = expr.replace(label, f"f[{i}]")
     # 验证：表达式中不应再有中文（未识别的因子名）
     if re.search(r'[\u4e00-\u9fff]{2,}', expr):
-        return None
+        raise ValueError(f"规则中包含未识别的因子名: {rule}")
     return expr
+
+
+def _eval_expr_ast(node, f):
+    """安全求值规则表达式 AST 节点，仅允许比较/布尔/下标/常量。"""
+    import operator
+    ops_map = {
+        ast.Eq: operator.eq, ast.NotEq: operator.ne,
+        ast.Gt: operator.gt, ast.GtE: operator.ge,
+        ast.Lt: operator.lt, ast.LtE: operator.le,
+        ast.And: lambda a, b: a and b, ast.Or: lambda a, b: a or b,
+    }
+    if isinstance(node, ast.BoolOp):
+        values = [_eval_expr_ast(v, f) for v in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+        raise ValueError(f"不支持的布尔运算符: {type(node.op)}")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _eval_expr_ast(node.operand, f)
+    if isinstance(node, ast.Compare):
+        left = _eval_expr_ast(node.left, f)
+        result = True
+        for op, comparator in zip(node.ops, node.comparators):
+            right = _eval_expr_ast(comparator, f)
+            result = result and ops_map[type(op)](left, right)
+            left = right
+        return result
+    if isinstance(node, ast.Subscript):
+        idx = node.slice.value if isinstance(node.slice, ast.Constant) else node.slice
+        if isinstance(node.value, ast.Name) and node.value.id == "f":
+            return float(f[int(idx)])
+        raise ValueError(f"不支持的数组名: {node.value.id if isinstance(node.value, ast.Name) else '?'}")
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Num):
+        return node.n
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_expr_ast(node.operand, f)
+    raise ValueError(f"不支持的 AST 节点: {ast.dump(node)}")
 
 
 def _apply_rule_filter(rows: list[dict], fvals_matrix: np.ndarray,
                        feature_names: list[str], rule: str) -> list[int]:
-    """按 rule 过滤样本，返回通过过滤的索引列表。rule 为空或无法解析时不过滤。"""
-    expr = _parse_rule(rule, feature_names)
-    if not expr:
+    """按 rule 过滤样本，返回通过过滤的索引列表。rule 为空时不过滤；解析失败抛错。"""
+    try:
+        expr_str = _parse_rule(rule, feature_names)
+    except ValueError:
+        raise
+    if not expr_str:
         return list(range(len(rows)))
+    try:
+        tree = ast.parse(expr_str.strip(), mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"规则表达式语法错误: {rule}") from e
     keep = []
     for i, f in enumerate(fvals_matrix):
         try:
-            if eval(expr, {"f": f, "__builtins__": {}}):
+            if _eval_expr_ast(tree.body, f):
                 keep.append(i)
         except Exception:
-            keep.append(i)  # 单样本解析失败不丢弃
+            pass  # 单样本求值异常（如除零）→ 不纳入
     return keep
 
 
 # ---------------- 人造/手动模型（P4） ----------------
 
-MANUAL_FEATURES = list(FACTORS.keys()) + [k for k in SNAPSHOT_FACTORS if SNAPSHOT_FACTORS[k].get("format") != "categorical"]
+MANUAL_FEATURES = sorted(list(FACTORS.keys()) + [k for k in SNAPSHOT_FACTORS if SNAPSHOT_FACTORS[k].get("format") != "categorical"])
 
 
 def manual_feature_options() -> list[dict]:
@@ -1457,12 +1538,18 @@ class _ManualModel:
 
     def predict(self, X):
         X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
         mu = np.nanmean(X, axis=0)
         sd = np.nanstd(X, axis=0)
+        if X.shape[0] == 1 or np.all(sd == 0):
+            # 单样本/常量列：不 zscore，直接加权
+            return X @ np.array(self.weights) + self.threshold
         sd[sd == 0] = 1.0
         Z = (X - mu) / sd
         return Z @ np.array(self.weights) + self.threshold
 
+    @property
     def feature_importances_(self):
         return np.abs(np.array(self.weights))
 
@@ -1494,7 +1581,7 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
     }, path)
     meta = {
         "id": mid, "path": path, "modelType": "manual",
-        "name": (name or mid).strip(), "featureNames": list(valid.keys()),
+        "name": (name or mid).strip(), "featureNames": feature_names,
         "featureWeights": valid, "threshold": float(threshold or 0.0),
         "rule": rule or "", "manual": True,
         "featureImportance": sorted(

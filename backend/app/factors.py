@@ -697,12 +697,17 @@ def composite_score(rows: list[dict], specs: list[dict]) -> list[dict]:
 
 
 def bucket_index(value: float, sorted_values: list[float], groups: int) -> int:
-    """确定 value 在 sorted_values 分布中的分位组编号（0 = 最低组）。"""
+    """确定 value 在 sorted_values 分布中的分位组编号（0 = 最低组）。并列值分布均匀。"""
     n = len(sorted_values)
     if n == 0:
         return 0
-    pos = sum(1 for v in sorted_values if v <= value)
-    idx = int(pos * groups / n)
+    pos = sum(1 for v in sorted_values if v < value)
+    ties = sum(1 for v in sorted_values if v == value)
+    if ties > 1:
+        avg_pos = pos + (ties - 1) / 2.0
+    else:
+        avg_pos = float(pos)
+    idx = int(avg_pos * groups / max(n, 1))
     return min(idx, groups - 1)
 
 

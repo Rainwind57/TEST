@@ -76,29 +76,34 @@ async def run_intraday_backtest(cfg: IntradayConfig) -> dict:
 
     for i in range(cfg.signal_lookback, len(kline)):
         bar = kline[i]
-        price = bar["close"]
         bar_date = _bar_date(bar)
 
         if position:
-            # T+1：当日买入当日不能卖出，最早次日
             can_exit = bar_date != position["entry_date"]
             if can_exit:
-                if price / position["entry_price"] - 1 >= cfg.take_profit:
-                    _exit(position, bar, price, "take_profit")
+                bar_high = bar.get("high", bar["close"])
+                bar_low = bar.get("low", bar["close"])
+                if bar_high / position["entry_price"] - 1 >= cfg.take_profit:
+                    exit_price = position["entry_price"] * (1 + cfg.take_profit)
+                    _exit(position, bar, exit_price, "take_profit")
                     position = None
-                elif price / position["entry_price"] - 1 <= cfg.stop_loss:
-                    _exit(position, bar, price, "stop_loss")
+                elif bar_low / position["entry_price"] - 1 <= cfg.stop_loss:
+                    exit_price = position["entry_price"] * (1 + cfg.stop_loss)
+                    _exit(position, bar, exit_price, "stop_loss")
                     position = None
 
         if not position and trades_today.get(bar_date, 0) < cfg.max_trades:
             lookback_closes = closes[i - cfg.signal_lookback: i]
             if len(lookback_closes) >= 2 and lookback_closes[0] > 0:
-                mom = price / lookback_closes[0] - 1
+                mom = bar["close"] / lookback_closes[0] - 1
                 if mom >= cfg.entry_threshold:
+                    # 信号在 bar i 产生，成交用 bar i+1 的 open；若已是最后一根则用 close
+                    next_bar = kline[i + 1] if i + 1 < len(kline) else bar
+                    entry_price = next_bar.get("open", next_bar["close"])
                     position = {
-                        "entry_time": bar.get("datetime") or bar.get("date", ""),
-                        "entry_price": price, "shares": cfg.shares_per_trade,
-                        "entry_date": bar_date,
+                        "entry_time": next_bar.get("datetime") or next_bar.get("date", ""),
+                        "entry_price": entry_price, "shares": cfg.shares_per_trade,
+                        "entry_date": _bar_date(next_bar),
                     }
                     trades_today[bar_date] = trades_today.get(bar_date, 0) + 1
 
@@ -111,6 +116,19 @@ async def run_intraday_backtest(cfg: IntradayConfig) -> dict:
             position = None
 
     returns = [t.pnl / (t.entry_price * t.shares) for t in trades if t.entry_price * t.shares > 0]
+    # 跨日跳空检测（>3% 可能为除权除息，分钟线未复权）
+    div_warning = None
+    prev_date = None
+    prev_close = None
+    for bar in kline:
+        d = _bar_date(bar)
+        if prev_date and d != prev_date and prev_close and prev_close > 0:
+            gap = abs(bar["close"] / prev_close - 1)
+            if gap > 0.03:
+                div_warning = f"检测到 {prev_date}→{d} 跨日跳空 {gap*100:.1f}%，分钟线未复权，可能含除权除息影响"
+                break
+        prev_date = d
+        prev_close = bar["close"]
     metrics = {
         "nTrades": len(trades),
         "winRate": sum(1 for r in returns if r > 0) / len(returns) if returns else 0.0,
@@ -122,12 +140,15 @@ async def run_intraday_backtest(cfg: IntradayConfig) -> dict:
         "applyCost": cfg.applyCost,
         "tPlus1": True,
     }
-    return {
+    result = {
         "trades": [t.__dict__ for t in trades],
         "metrics": metrics,
         "nBars": len(kline),
         "period": cfg.period,
     }
+    if div_warning:
+        result["warning"] = div_warning
+    return result
 
 
 async def run_intraday_pool_backtest(codes: list[str], cfg: IntradayConfig) -> dict:
@@ -161,6 +182,17 @@ async def run_intraday_pool_backtest(codes: list[str], cfg: IntradayConfig) -> d
     returns = [t["pnl"] / (t["entry_price"] * t["shares"])
                for t in all_trades if t["entry_price"] * t["shares"] > 0]
     total_invest = sum(t["entry_price"] * t["shares"] for t in all_trades)
+    peak_invest = total_invest  # 多笔交易以峰值占用资金为分母更准确
+    if all_trades:
+        running = 0.0
+        peak_invest = 0.0
+        for t in sorted(all_trades, key=lambda x: x.get("entry_time", "")):
+            entry_amt = t["entry_price"] * t["shares"]
+            running += entry_amt
+            peak_invest = max(peak_invest, running)
+            # 粗略平仓减计（同股同量）
+            running -= entry_amt * 0.95  # 估算，实际很难精确追踪每一笔
+        peak_invest = max(peak_invest, total_invest * 0.3) if peak_invest == 0 else peak_invest
     cost_buy = (cfg.commissionRate + cfg.slippage) if cfg.applyCost else 0.0
     cost_sell = (cfg.commissionRate + cfg.stampDuty + cfg.slippage) if cfg.applyCost else 0.0
     metrics = {
@@ -170,7 +202,8 @@ async def run_intraday_pool_backtest(codes: list[str], cfg: IntradayConfig) -> d
         "winRate": sum(1 for r in returns if r > 0) / len(returns) if returns else 0.0,
         "totalPnl": sum(t["pnl"] for t in all_trades),
         "totalInvest": total_invest,
-        "totalReturn": (sum(t["pnl"] for t in all_trades) / total_invest) if total_invest > 0 else 0.0,
+        "peakInvest": peak_invest,
+        "totalReturn": (sum(t["pnl"] for t in all_trades) / peak_invest) if peak_invest > 0 else 0.0,
         "avgPnl": mean(returns) if returns else 0.0,
         "sharpe": sharpe_ratio(returns, periods_per_year=1) if returns else 0.0,
         "costRate": (cost_buy + cost_sell) if cfg.applyCost else 0.0,

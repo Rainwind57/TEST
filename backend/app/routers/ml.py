@@ -27,7 +27,7 @@ class EvalBody(BaseModel):
 
 
 @router.post("/evaluate")
-async def evaluate(body: EvalBody):
+async def evaluate(body: EvalBody, uid: int = Depends(require_user_id)):
     """同步评估（小数据集）。大数据集建议走 /api/jobs 异步提交。"""
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
@@ -47,7 +47,7 @@ async def evaluate(body: EvalBody):
     return result
 
 @router.post("/train")
-async def train(body: EvalBody):
+async def train(body: EvalBody, uid: int = Depends(require_user_id)):
     """构建数据集 + 训练最终模型并落盘。"""
     try:
         dataset = await ml.build_dataset(body.board, body.poolSize, body.n, body.hist,
@@ -70,7 +70,7 @@ async def train(body: EvalBody):
 
 
 @router.get("/models")
-def list_models():
+def list_models(uid: int = Depends(require_user_id)):
     return ml.list_models()
 
 
@@ -88,6 +88,7 @@ class OptimizeMlBody(BaseModel):
     assetClass: str = "a-share"  # a-share | future
     startDate: str | None = None  # 训练集起始日（分时段训练）
     endDate: str | None = None    # 训练集结束日
+    selectedFactors: list[str] | None = None  # 可选：指定因子子集
 
 
 @router.post("/optimize")
@@ -175,7 +176,7 @@ class ModelAdjustBody(BaseModel):
 
 
 @router.get("/models/{mid}/params")
-def get_model_params(mid: str):
+def get_model_params(mid: str, uid: int = Depends(require_user_id)):
     """查看已落盘模型的参数（特征重要性 + 超参 + 特征名），供人工调参参考。
 
     读取失败时返回结构化 500 而非让 worker 崩溃（旧版 load_model_meta 无条件
@@ -191,7 +192,7 @@ def get_model_params(mid: str):
 
 
 @router.post("/models/{mid}/adjust")
-def adjust_model(mid: str, body: ModelAdjustBody):
+def adjust_model(mid: str, body: ModelAdjustBody, uid: int = Depends(require_user_id)):
     """人工调整模型输出：覆盖特征权重 或 偏移预测阈值。
 
     调整配置落盘为中间结果（kind=ml_adjust），打分层/回测接口传 adjustId 即可生效，
@@ -262,7 +263,7 @@ class ScoreBody(BaseModel):
 
 
 @router.post("/score")
-async def score(body: ScoreBody):
+async def score(body: ScoreBody, uid: int = Depends(require_user_id)):
     """用落盘模型对候选池最新截面打分（打通 ML→选股：结果可加入自选/买入模拟盘）。
 
     adjustId/adjust 传调参配置时应用人工权重/阈值。
@@ -314,7 +315,7 @@ class MLBacktestBody(BaseModel):
 
 
 @router.post("/backtest")
-async def ml_backtest(body: MLBacktestBody):
+async def ml_backtest(body: MLBacktestBody, uid: int = Depends(require_user_id)):
     """ML 信号分层回测（打通 ML→回测，响应结构与 /api/select/backtest 一致，前端图表零成本复用）。
 
     adjustId/adjust 传调参配置时应用人工权重，验证调参后的模型表现。

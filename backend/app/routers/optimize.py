@@ -58,6 +58,6 @@ def optimize_backtest(body: OptimizeBody):
 def save_as_strategy(body: SaveStrategyBody, uid: int = Depends(require_user_id)):
     """把最优参数回写为策略。"""
     try:
-        return optimize.save_best_as_strategy(body.baseConfig, body.bestParams, body.name)
+        return optimize.save_best_as_strategy(body.baseConfig, body.bestParams, body.name, user_id=uid)
     except Exception as e:
         raise HTTPException(400, f"保存失败: {e}")

@@ -40,12 +40,15 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
         raise HTTPException(422, "有效组合样本不足，无法构建风格面板（需≥3只且历史≥30日）")
 
     prices = np.array([quotes.get(c, {}).get("price", 0) for c in codes_valid])
-    if weights is not None and len(weights) == len(codes_valid):
-        w = np.array([float(weights[codes_valid.index(c)]) for c in codes_valid])
+    if weights is not None:
+        w_map = {c: float(wt) for c, wt in zip(codes, weights) if c in set(codes_valid)}
+        w = np.array([w_map.get(c, 0.0) for c in codes_valid])
+        dropped = len(codes) - sum(1 for c in codes if c in set(codes_valid))
         if w.sum() <= 0:
             w = np.ones(len(codes_valid))
     else:
-        w = np.ones(len(codes_valid))  # 等权
+        w = np.ones(len(codes_valid))
+        dropped = 0
     mv = prices
     valid_mv = mv > 0
     if not valid_mv.any():
@@ -65,7 +68,7 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
     sigma_e = risk.estimate_specific_variances(stock_data, X, codes_valid, factor_returns)
     if sigma_e.size == 0 or np.all(sigma_e == 0):
         residuals = stock_returns - X @ factor_returns
-        sigma_e = np.var(residuals, ddof=max(1, len(residuals) - X.shape[1] - 1)) * np.ones(len(codes_valid))
+        sigma_e = np.var(residuals, ddof=X.shape[1] + 1) * np.ones(len(codes_valid))
 
     attr = risk.attribute_returns(weights_w, X, factor_returns, stock_returns)
     rdecomp = risk.risk_decomposition(weights_w, X, sigma_f, sigma_e)
@@ -73,8 +76,17 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
     sample_warning = (None if len(codes_valid) >= 30
                       else f"组合仅 {len(codes_valid)} 只（<30），风格回归自由度不足，结果仅供参考")
 
+    snapshot_warning = (
+        "风格因子中 turnover/ep/bp/size 使用当前最新值（快照），"
+        "应用到所有历史截面时存在前视偏差（look-ahead bias）。"
+        "因子暴露与风险分解仅供截面比较，不反映历史时序真实变化。"
+    )
+
+    dropped_codes = [c for c in codes if c not in set(codes_valid)] if weights is not None else []
     return {
         "holdings": [{"code": c, "weight": float(wt)} for c, wt in zip(codes_valid, weights_w)],
+        "droppedCodes": dropped_codes,
+        "snapshotWarning": snapshot_warning,
         "factorNames": factor_names,
         "exposures": attr["exposures"],
         "factorContribution": attr["factorContribution"],
@@ -96,7 +108,12 @@ async def attribution():
     if not positions:
         raise HTTPException(422, "当前无持仓，无法做风险归因")
     codes = [r["code"] for r in positions]
-    mv = {r["code"]: r["qty"] * r["avg_cost"] for r in positions}
+    try:
+        quotes = await adapters.fetch_tencent_quotes(codes)
+    except Exception:
+        quotes = {}
+    mv = {r["code"]: (quotes.get(r["code"], {}).get("price", 0) or r["avg_cost"]) * r["qty"]
+          for r in positions}
     weights = [float(mv[c]) for c in codes]
     return await _run_attribution(codes, weights)
 
