@@ -3,6 +3,7 @@ import asyncio
 import datetime
 import logging
 import math
+
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
@@ -373,7 +374,7 @@ class BacktestBody(BaseModel):
 
 
 @router.post("/backtest")
-async def run_backtest(body: BacktestBody):
+async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
     # 模型策略：指定 modelId 时走 ML 信号分层回测，响应结构与技术因子回测一致，
     # 前端图表零成本复用（打通”主回测页导入模型”，旧版 modelId 无门可入）。
     if body.modelId:
@@ -669,7 +670,7 @@ async def run_backtest(body: BacktestBody):
     # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
     try:
         from .. import reporting
-        reporting.store_backtest_report(result, config=body.model_dump())
+        reporting.store_backtest_report(result, config=body.model_dump(), user_id=uid)
     except Exception:
         pass
     return result

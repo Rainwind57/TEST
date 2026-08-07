@@ -6,6 +6,7 @@
 - 输出各风格因子暴露、贡献、残差波动
 """
 import numpy as np
+from collections import defaultdict
 from .factors import mean, std, zscore
 from .numpy_factors import kline_to_arrays, compute_factor_series, series_at
 
@@ -52,31 +53,42 @@ def build_style_panel(stock_data: list[dict], n: int = 1) -> tuple[np.ndarray, l
     if len(series) < 3:
         return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
 
-    ref = max(series, key=lambda s: len(s["closes"]))
-    ref_len = len(ref["closes"])
+    # 按日期对齐构建截面：收集所有日期，取公共区间内每日的因子值+收益
+    date_to_rows = defaultdict(lambda: {"rows": [], "rets": [], "codes": [], "d": ""})
+    all_dates = sorted({k["date"] for s in stock_data for k in s.get("kline", []) if k.get("date")})
+    if len(all_dates) < 30:
+        return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
+
+    date_to_idx = {d: i for i, d in enumerate(all_dates)}
+    for s in series:
+        kline = next((st["kline"] for st in stock_data if st["code"] == s["code"]), [])
+        for ki, kbar in enumerate(kline):
+            d = kbar.get("date", "")
+            if d not in date_to_idx:
+                continue
+            dt = date_to_idx[d]
+            if dt < 25 or dt + n >= len(all_dates):
+                continue
+            m = series_at(s["mom"], ki)
+            v = series_at(s["vol"], ki)
+            if m is None or v is None or s["closes"][ki] == 0:
+                continue
+            row = [m, v, s["turnover"], s["ep"], s["bp"], s["size"] or 0.0]
+            date_to_rows[d]["rows"].append(row)
+            date_to_rows[d]["rets"].append(s["closes"][ki + n] / s["closes"][ki] - 1.0)
+            date_to_rows[d]["codes"].append(s["code"])
+            date_to_rows[d]["d"] = d
+
     betas = []
     last_X = np.zeros((0, len(STYLE_FACTORS)))
     last_codes: list[str] = []
-    X_t = last_X
-    codes_t: list[str] = []
-    for t in range(25, ref_len - n):
-        rows, rets, codes_t = [], [], []
-        for s in series:
-            if t >= len(s["closes"]) or t + n >= len(s["closes"]):
-                continue
-            m = series_at(s["mom"], t)
-            v = series_at(s["vol"], t)
-            if m is None or v is None or s["closes"][t] == 0:
-                continue
-            row = [m, v, s["turnover"], s["ep"], s["bp"], s["size"] or 0.0]
-            rows.append(row)
-            rets.append(s["closes"][t + n] / s["closes"][t] - 1.0)
-            codes_t.append(s["code"])
-        if len(rows) < 10:
+    for d in sorted(date_to_rows):
+        entry = date_to_rows[d]
+        if len(entry["rows"]) < 10:
             continue
-        X_t = _zscore_cols(np.array(rows, dtype=np.float64))
-        betas.append(cross_section_regression(X_t, np.array(rets, dtype=np.float64)))
-        last_X, last_codes = X_t, codes_t
+        X_t = _zscore_cols(np.array(entry["rows"], dtype=np.float64))
+        betas.append(cross_section_regression(X_t, np.array(entry["rets"], dtype=np.float64)))
+        last_X, last_codes = X_t, entry["codes"]
 
     if not betas or last_X.size == 0:
         return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []

@@ -2,7 +2,11 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
+import logging
+
 from .. import optimize, jobs
+
+logger = logging.getLogger(__name__)
 from .auth import require_user_id
 
 router = APIRouter(prefix="/api/optimize", tags=["optimize"])
@@ -49,8 +53,8 @@ def optimize_backtest(body: OptimizeBody):
             "splitDate": result.get("splitDate"),
         }, name=f"寻优-{body.factor or body.modelId}")
         result["artifact"] = meta
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("寻优结果落盘失败: %s", e)
     return result
 
 

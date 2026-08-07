@@ -1289,30 +1289,84 @@ _TIME_SHARE_TTL = 60  # 秒（盘中高频刷新）
 async def fetch_time_share(code: str) -> list[dict]:
     """拉取当日分时数据（1分钟价格+成交量+均价黄线）。
 
-    优先用新浪 minute K 线 per="1", count=240，当日盘中数据。
-    返回 [{time, price, volume, avgPrice}]，按时间升序。无数据时返回 []。
+    优先新浪，失败/指数降级腾讯。返回 [{time, price, volume, avgPrice}]。无数据返回 []。
     """
     cache_key = code
     cached = _TIME_SHARE_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < _TIME_SHARE_TTL:
         return cached[1]
 
-    try:
-        url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-               f"CN_MarketData.getKLineData?symbol={code}&scale=1&datalen=240")
-        resp = await _http_get(url, 10, headers=_SINA_HEADERS)
-        arr = resp.json() or []
-    except Exception:
+    # 指数代码（sh000xxx/sz399xxx）新浪无分钟数据，直接走腾讯 fallback
+    is_index = code.startswith(("sh0", "sz3"))
+    out = []
+
+    if not is_index:
+        try:
+            url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                   f"CN_MarketData.getKLineData?symbol={code}&scale=1&datalen=240")
+            resp = await _http_get(url, 10, headers=_SINA_HEADERS)
+            arr = resp.json() or []
+        except Exception:
+            arr = []
+    else:
         arr = []
 
+    # 新浪失败 → 腾讯分时 fallback
+    if not arr:
+        try:
+            arr = await _fetch_tencent_minute(code)
+        except Exception:
+            arr = []
+
+    out = _parse_minute_bars(arr)
+    _TIME_SHARE_CACHE[cache_key] = (time.time(), out)
+    if not out:
+        logger.info("分时数据不可用 code=%s", code)
+    return out
+
+
+async def _fetch_tencent_minute(code: str) -> list[dict]:
+    """腾讯分时 API fallback：60 日分钟 K 线取最近 1 天。"""
+    secid = _to_secid(code)
+    url = (f"https://ifzq.gtimg.cn/appstock/app/minute/query?"
+           f"_var=min_data&code={secid}")
+    resp = await _http_get(url, 8)
+    text = resp.content.decode("gbk", errors="ignore")
+    # 腾讯返回格式: min_data={"code":"sh600000","data":{"2026-08-07":{"data":[...]}}}
+    try:
+        start = text.index("{")
+        end = text.rindex("}") + 1
+        obj = json.loads(text[start:end])
+        data = obj.get("data") or {}
+        today = sorted(data.keys())[-1] if data else ""
+        rows = data.get(today, {}).get("data", []) if today else []
+    except Exception:
+        return []
+    # 腾讯分时格式: "0930 12.50 1000" (time price volume)
     out = []
-    # 按当日过滤：A股一日恰240根1分钟K线，"最近240根"必混入昨日→过滤并当日归零均价
+    for item in rows:
+        parts = str(item).split()
+        if len(parts) >= 2:
+            try:
+                out.append({
+                    "day": f"{today} {parts[0][:2]}:{parts[0][2:4]}:00",
+                    "close": parts[1],
+                    "volume": parts[2] if len(parts) > 2 else "0",
+                })
+            except (ValueError, IndexError):
+                continue
+    return out
+
+
+def _parse_minute_bars(arr: list[dict]) -> list[dict]:
+    """从 [{day, close, volume}] 解析为 [{time, price, volume, avgPrice}]，当日过滤。"""
+    out = []
     today_str = datetime.date.today().isoformat()
     cum_amount = 0.0
     cum_vol = 0.0
     for row in arr:
         try:
-            day_str = row["day"][:10]  # "2026-08-07 09:30:00" → "2026-08-07"
+            day_str = row["day"][:10]
             if day_str != today_str:
                 continue
             prc = float(row["close"])
@@ -1328,9 +1382,8 @@ async def fetch_time_share(code: str) -> list[dict]:
             })
         except (KeyError, ValueError, TypeError):
             continue
-
-    _TIME_SHARE_CACHE[cache_key] = (time.time(), out)
     return out
+
 
 async def get_sector_exposures(codes: list[str]) -> list[list[float]]:
     """对一组股票代码返回行业哑变量矩阵，供选股中性化使用。"""

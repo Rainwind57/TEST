@@ -75,7 +75,8 @@ def _objective(trial: optuna.Trial, base: dict, full_hist: int, is_end_date: str
         return -1e9
 
 
-def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -> dict:
+def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None,
+                     cancel_event=None) -> dict:
     """对回测参数做贝叶斯寻优。
 
     base_config: 基础配置（board/factor/cost 等固定项）。
@@ -94,6 +95,8 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None) -
     study = optuna.create_study(direction="maximize",
                                 sampler=optuna.samplers.TPESampler(seed=42))
     for i in range(n_trials):
+        if cancel_event and cancel_event.is_set():
+            break
         if progress_cb:
             progress_cb(i + 1, n_trials)
         study.optimize(lambda t: _objective(t, base_config, full_hist, mid_date),

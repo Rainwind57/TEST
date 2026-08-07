@@ -336,7 +336,7 @@ async def ml_backtest(body: MLBacktestBody, uid: int = Depends(require_user_id))
                 "featureImportance": meta.get("featureImportance") or [],
                 "bestParams": meta.get("bestParams"),
             }
-        return await ml.backtest_model(
+        result = await ml.backtest_model(
             body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
             body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
             adjust=adjust, asset_class=body.assetClass,
@@ -344,6 +344,13 @@ async def ml_backtest(body: MLBacktestBody, uid: int = Depends(require_user_id))
             config=config,
             boards=body.boards,
         )
+        # 回测存档带 user_id
+        try:
+            from .. import reporting
+            reporting.store_backtest_report(result, config=config, user_id=uid)
+        except Exception:
+            pass
+        return result
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:

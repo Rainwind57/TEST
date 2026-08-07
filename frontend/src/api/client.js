@@ -74,9 +74,9 @@ export async function downloadGet(url, filename) {
 }
 
 function saveBlob(res, filename) {
-  // 校验响应类型：后端报错返回 JSON，不应下成损坏文件
+  // 检验输入为二进制载荷，输出为文件下载——仅 JSON 错误和纯文本错误需拦截
   const ct = res.headers['content-type'] || ''
-  if (ct.includes('json') || ct.includes('text/')) {
+  if (ct.includes('application/json') || ct.includes('text/plain')) {
     const txt = res.data.text()
     return txt.then((t) => {
       let msg = '下载失败'

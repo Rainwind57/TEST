@@ -514,7 +514,8 @@ def train_final_model(dataset: dict, model_type: str = "gbdt", params: dict | No
 
 def optimize_model(dataset: dict, model_type: str = "lightgbm",
                    n_splits: int = 5, gap: int = 5,
-                   n_trials: int = 30, progress_cb=None) -> dict:
+                   n_trials: int = 30, progress_cb=None,
+                   cancel_event=None) -> dict:
     """Optuna 对 ML 模型超参寻优（旧版 Optuna 仅接因子回测，ML 调参未闭环）。
 
     目标 = 时序 Walk-Forward 最后一折 OOS Sharpe（按调仓日聚合多空），
@@ -581,6 +582,9 @@ def optimize_model(dataset: dict, model_type: str = "lightgbm",
     study = optuna.create_study(direction="maximize",
                                 sampler=optuna.samplers.TPESampler(seed=42))
     for i in range(n_trials):
+        if cancel_event and cancel_event.is_set():
+            logger.info("ML 寻优被用户取消（已完成 %d/%d trials）", i, n_trials)
+            break
         if progress_cb:
             progress_cb(i + 1, n_trials)
         study.optimize(_objective, n_trials=1, catch=(Exception,))
@@ -1047,9 +1051,17 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         except Exception:
             bench_series = None
 
-    date_maps = {code: {row["date"]: idx for idx, row in enumerate(kl)} for code, kl in series.items()}
-    ref_code = max(series, key=lambda c: len(series[c]))
+    # 快照特征：仅对最近 60 个交易日沿用（避免历史截面用今日财报数据→前视）
     ref_dates = [row["date"] for row in series[ref_code]]
+    snapshot_cutoff_date = None
+    if snap_keys:
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        snapshot_cutoff_date = today_str
+        # 向前数 60 个交易日得到允许区间
+        past_dates = [d for d in ref_dates if d <= today_str]
+        if len(past_dates) >= 60:
+            snapshot_cutoff_date = past_dates[-60]
 
     code_cache = {}
     for code, kl in series.items():
@@ -1061,7 +1073,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             "kline": kl,
         }
 
-    # 快照特征（最新值作静态特征，所有调仓日同值；含前视风险，仅探索用）
+    # 快照特征（仅回测区间末端 60 日内有效，早期无法取当日值）
     row_by_code = {r["code"]: r for r in pool}
     snapshot_vals = {}
     if snap_keys:
@@ -1107,8 +1119,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                 fvals.append(v)
             if not ok or cc["closes"][i] == 0:
                 continue
-            # 快照特征（静态）
+            # 快照特征：仅在允许日期区间内生效
             if snap_keys:
+                if snapshot_cutoff_date and date_t < snapshot_cutoff_date:
+                    continue  # 快照因子为当前值，回溯到历史截面即前视，跳过
                 sv = snapshot_vals.get(code)
                 if not sv:
                     continue
@@ -1267,12 +1281,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             "回测绩效（IC/Sharpe/分组收益）系统性高估，不可直接指导实盘。"
             "快照因子回测仅用于探索因子方向，实盘因子组应全部使用历史时序特征。"
         )
-    # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
-    try:
-        from . import reporting
-        reporting.store_backtest_report(result, config=config)
-    except Exception:
-        pass
+    # 报告存档由路由层负责（带 user_id），此处跳过
     return result
 
 

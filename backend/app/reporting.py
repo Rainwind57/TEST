@@ -123,16 +123,10 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     if not model_meta and payload.get("factorLabel"):
         factor_key = payload.get("factorLabel", "")
         try:
-            from .factors import FACTORS
-            fdef = FACTORS.get(factor_key)
+            from .factors import FACTORS, SNAPSHOT_FACTORS
+            fdef = FACTORS.get(factor_key) or SNAPSHOT_FACTORS.get(factor_key)
         except Exception:
             fdef = None
-        if not fdef:
-            try:
-                from .ml import FACTORS as ML_FACTORS
-                fdef = ML_FACTORS.get(factor_key)
-            except Exception:
-                fdef = None
         if fdef:
             factor_html = (
                 f'<div class="card"><h3>因子说明</h3><table class="summary-table">'

@@ -131,12 +131,31 @@ async function runBacktest() {
   if (!gp || gp < 2) { toast('分组数需 ≥ 2'); return }
   if (!dn || dn < 1) { toast('持有天数需 ≥ 1'); return }
   if (!hs || hs < 60) { toast('历史长度需 ≥ 60'); return }
+  // 前置校验：groups×3 约束（最常见 422 根因，提前拦截减少无效请求）
+  if (artifactCodes.value.length > 0) {
+    if (artifactCodes.value.length < gp * 3) {
+      toast(`自选仅 ${artifactCodes.value.length} 只，但分组 ${gp} 有效样本需 ≥ ${gp * 3} 只（每组至少 3 只才有统计意义）。请减少分组数至 ≤ ${Math.floor(artifactCodes.value.length / 3)} 或增加自选股票。`)
+      return
+    }
+  } else {
+    if (ps < gp * 3) {
+      toast(`候选池 ${ps} 只 < 分组 ${gp} 所需 ${gp * 3} 只（groups×3）。请减少分组数 ≤ ${Math.floor(ps / 3)} 或扩大候选池。`)
+      return
+    }
+  }
   loading.value = true
   try {
-    // 长任务走 5 分钟超时，避免旧版 60s 默认超时误杀大股池/弱网回测
     result.value = await longTask('/select/backtest', backtestConfig())
   } catch (e) {
-    toast(e.message); result.value = null
+    const msg = e.message || ''
+    if (msg.includes('422') || msg.includes('样本不足')) {
+      toast(`回测失败：${msg}\n提示：减少分组数、扩大候选池或错峰重试。`)
+    } else if (msg.includes('502') || msg.includes('限流')) {
+      toast(`回测失败：行情上游限流。\n建议：切换到「全部A股」板块、减小候选池规模、或错峰（避开开盘/收盘高峰）重试。`)
+    } else {
+      toast(msg)
+    }
+    result.value = null
   } finally { loading.value = false }
 }
 

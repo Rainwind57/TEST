@@ -129,10 +129,16 @@ def evaluate_expression(expr: str, rows: list[dict]) -> list[float]:
         for r in rows:
             v = r.get(name)
             try:
-                vals.append(float(v) if v is not None else 0.0)
+                vals.append(float(v) if v is not None else np.nan)
             except (TypeError, ValueError):
-                vals.append(0.0)
-        columns[name] = np.array(vals, dtype=np.float64)
+                vals.append(np.nan)
+        col = np.array(vals, dtype=np.float64)
+        nan_mask = np.isnan(col)
+        if nan_mask.any() and not nan_mask.all():
+            col[nan_mask] = np.nanmedian(col)
+        elif nan_mask.all():
+            col[:] = 0.0
+        columns[name] = col
 
     def _eval(node):
         if isinstance(node, ast.Expression):
