@@ -44,6 +44,8 @@ async def evaluate(body: EvalBody, uid: int = Depends(require_user_id)):
         result = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, body.modelType, body.nSplits, body.gap)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    if dataset.get("snapshotWarning"):
+        result["snapshotWarning"] = dataset["snapshotWarning"]
     return result
 
 @router.post("/train")
@@ -66,7 +68,10 @@ async def train(body: EvalBody, uid: int = Depends(require_user_id)):
     except ValueError as e:
         raise HTTPException(422, str(e))
     meta = await loop.run_in_executor(None, ml.train_final_model, dataset, body.modelType)
-    return {"model": meta, "evaluation": eval_result}
+    result = {"model": meta, "evaluation": eval_result}
+    if dataset.get("snapshotWarning"):
+        result["snapshotWarning"] = dataset["snapshotWarning"]
+    return result
 
 
 @router.get("/models")
@@ -115,6 +120,8 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
             None, ml.optimize_model, dataset, body.modelType, body.nSplits, body.gap, body.nTrials)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    if dataset.get("snapshotWarning"):
+        result["snapshotWarning"] = dataset["snapshotWarning"]
     return result
 
 

@@ -1350,14 +1350,35 @@ async def _fetch_tencent_minute(code: str) -> list[dict]:
         obj = json.loads(text[start:end])
     except Exception:
         return []
-    # 从嵌套结构中提取数据：obj["data"] 可能是 {code: {日期: {data: [...]}}} 或 {日期: {data: [...]}}
+    # 从嵌套结构中提取数据：腾讯返回可能是多种嵌套格式：
+    # 格式A: {"sh600519": {"data": {"data": [...], "date": "20260810"}, ...}}
+    # 格式B: {"sh600519": {"20260810": {"data": [...]}}}
     raw_data = obj.get("data") or {}
     # 若最外层 key 是股票代码名（如 "sh600000"），再往内取一层
     if code in raw_data and isinstance(raw_data.get(code), dict):
         raw_data = raw_data[code]
-    # 取最新一个日期的分时数据
-    today = sorted(raw_data.keys())[-1] if raw_data else ""
-    rows = raw_data.get(today, {}).get("data", []) if today else []
+    # 腾讯返回可能再包一层 "data" key
+    import re
+    date_pat = re.compile(r"^\d{8}$|^\d{4}-\d{2}-\d{2}$")
+    if "data" in raw_data and isinstance(raw_data.get("data"), dict):
+        inner = raw_data["data"]
+        # 格式A特征：inner["data"] 是 list（bars 数组），inner["date"] 是日期字符串
+        if isinstance(inner.get("data"), list):
+            raw_data = inner
+        # 格式B特征：inner 的 key 是日期格式
+        elif any(date_pat.match(str(k)) for k in inner):
+            raw_data = inner
+    # 分两种情况取 rows 和 today：
+    if "data" in raw_data and isinstance(raw_data.get("data"), list):
+        # 格式A：bars 直接在 "data" 下，日期在 "date" 下
+        rows = raw_data["data"]
+        date_val = raw_data.get("date", "")
+        today = str(date_val) if date_val else ""
+    else:
+        # 格式B：日期作为 key
+        date_keys = [k for k in raw_data.keys() if date_pat.match(str(k))]
+        today = sorted(date_keys)[-1] if date_keys else ""
+        rows = raw_data.get(today, {}).get("data", []) if today else []
     # 统一日期格式为 YYYY-MM-DD（上游可能返回 YYYYMMDD 无连接符格式）
     if today and len(today) == 8 and today.isdigit():
         today_fmt = f"{today[:4]}-{today[4:6]}-{today[6:8]}"

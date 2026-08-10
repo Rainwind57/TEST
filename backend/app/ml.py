@@ -257,6 +257,27 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         meta_codes = [meta_codes[k] for k in keep]
         meta_dates = [meta_dates[k] for k in keep]
 
+    # 快照特征前视偏差截断：仅保留最近 60 个交易日样本（与回测侧一致）
+    snapshot_warning = None
+    if use_snapshot and snapshot_keys:
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        past_dates = sorted(set(d for d in meta_dates if d <= today_str))
+        cutoff = past_dates[-60] if len(past_dates) >= 60 else (past_dates[0] if past_dates else None)
+        if cutoff:
+            keep = [k for k, d in enumerate(meta_dates) if d >= cutoff]
+            dropped = len(rows) - len(keep)
+            if dropped > 0:
+                rows = [rows[k] for k in keep]
+                labels = [labels[k] for k in keep]
+                meta_codes = [meta_codes[k] for k in keep]
+                meta_dates = [meta_dates[k] for k in keep]
+                snapshot_warning = (
+                    f"快照因子（财务/资金流）仅最近 60 交易日有效，"
+                    f"已截断 {dropped} 条更早样本（截止日 {cutoff}），"
+                    f"避免历史截面使用当前财报数据导致前视偏差"
+                )
+
     return {
         "features": np.array(rows, dtype=np.float64),
         "target": np.array(labels, dtype=np.float64),
@@ -264,6 +285,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         "dates": meta_dates,
         "feature_names": sem_factor_keys + snapshot_keys,
         "n": n,
+        "snapshotWarning": snapshot_warning,
     }
 
 

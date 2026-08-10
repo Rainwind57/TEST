@@ -7,7 +7,7 @@
 用法：
     score = evaluate_expression("momentum - volatility * 0.5", rows)
     # rows: [{code, momentum, volatility, rsi, ...}, ...]
-    # 返回每行打分列表，NaN 视为 0
+    # 返回每行打分列表；含 NaN 的列按截面中位数填充（全 NaN 列填 0）
 """
 import ast
 import math
@@ -123,7 +123,9 @@ def validate_expression(expr: str) -> tuple[bool, str]:
 def evaluate_expression(expr: str, rows: list[dict]) -> list[float]:
     """对 rows 截面求值表达式，返回每行打分。
 
-    列引用从 row 字段取值；NaN 视为 0（避免传染整个表达式）。
+    列引用从 row 字段取值；含 NaN 的列按截面中位数填充（避免单值缺失把
+    整列传染归零，保留截面区分度），全 NaN 列填 0。最终结果里的 NaN/inf
+    也会清零。
     表达式非法时抛 ValueError。
     """
     ok, err = validate_expression(expr)

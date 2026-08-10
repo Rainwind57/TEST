@@ -119,10 +119,11 @@ def test_missing_column(rows):
 
 
 def test_nan_handled(rows):
-    """NaN 值视为 0。"""
+    """含 NaN 的列按截面中位数填充（避免单 NaN 把整列传染成 0）。"""
     rows_with_nan = [{"code": "c1", "momentum": float("nan")}] + rows
     out = fe.evaluate_expression("momentum", rows_with_nan)
-    assert out[0] == 0.0  # NaN → 0
+    # momentum=[NaN,0.1,0.3,-0.1]，中位数=0.1 → c1 填充为 0.1
+    assert out[0] == pytest.approx(0.1)
     assert len(out) == 4
 
 

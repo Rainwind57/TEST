@@ -45,19 +45,19 @@ def get_signal_config() -> dict:
     """读取盯盘信号引擎配置：rule=内置动量/RSI 规则；model=落盘 ML 模型打分。
     
     monitor_ranking 控制模型模式的排名口径：
-      - "isolated"（默认）：对 watchlist 各股孤立打分
-      - "full"：对全池排名后取 watchlist 子集的分位（与选股 score_latest 口径一致）
+      - "isolated"：对 watchlist 各股孤立打分
+      - "full"（默认）：对全池排名后取 watchlist 子集的分位（与选股 score_latest 口径一致）
     monitor_rule_factor 为规则模式的因子名（空=默认动量+RSI）
     """
     return {
         "mode": db.get_setting("monitor_mode", "rule"),
         "modelId": db.get_setting("monitor_model_id", ""),
-        "ranking": db.get_setting("monitor_ranking", "isolated"),
+        "ranking": db.get_setting("monitor_ranking", "full"),
         "ruleFactor": db.get_setting("monitor_rule_factor", ""),
     }
 
 
-def set_signal_config(mode: str, model_id: str = "", ranking: str = "isolated",
+def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
                      rule_factor: str = "") -> dict:
     if mode not in ("rule", "model"):
         raise ValueError("mode 必须为 rule 或 model")

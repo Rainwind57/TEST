@@ -70,12 +70,27 @@ def test_oos_sharpe_by_date_positive():
 
 
 def test_purged_walk_forward_split_ordering():
-    """训练区在前、测试区在后、中间有 gap（防泄漏）。"""
-    splits = ml.purged_walk_forward_split(100, n_splits=5, test_ratio=0.2, gap=5)
+    """训练区在前、测试区在后、中间有 gap（防泄漏）。
+
+    注意：接口已重构为按日期的 purged_walk_forward_split_by_dates，
+    以日历序列驱动切分（避免跨日泄漏）。切分保证 train 日期严格早于
+    test 日期且中间隔 gap_days 天，索引无重叠。
+    """
+    from datetime import date, timedelta
+    start = date(2024, 1, 1)
+    dates = [(start + timedelta(days=i)).isoformat() for i in range(100)]
+    splits = ml.purged_walk_forward_split_by_dates(dates, n_splits=5, test_ratio=0.2, gap_days=5)
     assert len(splits) > 0
+    all_idx = set(range(100))
     for train_idx, test_idx in splits:
         assert len(train_idx) > 0
-        assert train_idx.max() + 5 <= test_idx.min()
+        assert len(test_idx) > 0
+        # 索引无重叠
+        assert set(train_idx.tolist()).isdisjoint(set(test_idx.tolist()))
+        # train 日期严格早于 test 日期（gap 防泄漏）
+        train_dates = {dates[i] for i in train_idx}
+        test_dates = {dates[i] for i in test_idx}
+        assert max(train_dates) < min(test_dates)
 
 
 def _mk_klines(days: int = 120, start: str = "2024-01-01"):
@@ -134,7 +149,10 @@ def test_build_dataset_date_filter(monkeypatch):
 
 def test_purged_walk_forward_split_too_short():
     """样本不足返回空列表（不崩）。"""
-    splits = ml.purged_walk_forward_split(5, n_splits=5, gap=5)
+    from datetime import date, timedelta
+    start = date(2024, 1, 1)
+    dates = [(start + timedelta(days=i)).isoformat() for i in range(5)]
+    splits = ml.purged_walk_forward_split_by_dates(dates, n_splits=5, gap_days=5)
     assert splits == []
 
 
@@ -187,7 +205,9 @@ def test_optimize_model_end_to_end():
     }
     r = ml.optimize_model(dataset, model_type="lightgbm", n_splits=3, gap=2, n_trials=3)
     assert "bestParams" in r
-    assert "isSharpe" in r and "oosSharpe" in r
+    # optimize_model 返回 valid 打头指标（valid 折内 IS/OOS Sharpe），
+    # 旧键名 isSharpe/oosSharpe 已在重构中更名
+    assert "validSharpe" in r and "validOosSharpe" in r
     assert r["nTrials"] == 3
     files = glob.glob(os.path.join(ml.ML_DIR, "opt_*.json"))
     assert len(files) > 0

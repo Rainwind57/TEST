@@ -26,13 +26,41 @@ async def get_quote(codes: str, source: str = "tencent"):
 
 
 @router.get("/kline")
-async def get_kline(code: str, days: int = 500, forceRefresh: bool = False):
+async def get_kline(code: str, days: int = 500, forceRefresh: bool = False, freq: str = "D"):
     days = max(30, min(days, 2000))  # 防止 days=99999 导致的请求爆炸
     try:
         data = await adapters.fetch_kline(code, days, force_refresh=forceRefresh)
     except Exception as e:
         raise HTTPException(502, f"历史数据请求失败: {e}")
+    if freq in ("W", "M"):
+        data = _convert_kline_freq(data, freq)
     return {"code": code, "data": data}
+
+
+def _convert_kline_freq(daily: list[dict], freq: str) -> list[dict]:
+    """日K聚合成周K/月K。"""
+    from datetime import datetime
+    if not daily:
+        return []
+    grouped: dict[str, dict] = {}
+    for row in daily:
+        d = datetime.strptime(row["date"][:10], "%Y-%m-%d")
+        grp = d.strftime("%G-W%V") if freq == "W" else d.strftime("%Y-%m")
+        o = float(row["open"])
+        c = float(row["close"])
+        h = float(row["high"])
+        l = float(row["low"])
+        v = float(row["volume"])
+        if grp not in grouped:
+            grouped[grp] = {"open": o, "close": c, "high": h, "low": l, "volume": v, "date": row["date"]}
+        else:
+            g = grouped[grp]
+            g["close"] = c
+            g["high"] = max(g["high"], h)
+            g["low"] = min(g["low"], l)
+            g["volume"] += v
+            g["date"] = row["date"]
+    return [grouped[k] for k in sorted(grouped.keys())]
 
 
 @router.get("/stock/exists")

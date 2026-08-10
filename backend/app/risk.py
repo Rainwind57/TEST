@@ -265,9 +265,15 @@ def estimate_specific_variances(stock_data: list[dict], X: np.ndarray, codes: li
 
     用每只股票的时序残差 r_t - X_t @ factor_returns 算其方差，输出 (n_stocks,)。
     样本不足（<20）时退化为截面均值，避免单股方差估计失真。
+
+    因子维度对齐：_stock_style_row 仅重建风格因子行（6 列），因此逐股残差仅用
+    factor_returns 的风格因子部分（前 6 个元素），行业因子（快照常量）不参与
+    时序残差计算。
     """
     if X.size == 0 or not codes:
         return np.zeros(0)
+    n_style = len(STYLE_FACTORS)
+    style_fr = factor_returns[:n_style] if factor_returns.shape[0] >= n_style else factor_returns
     by_code = {s["code"]: s for s in stock_data}
     sigmas = np.zeros(len(codes))
     fallback_vals = []
@@ -292,7 +298,9 @@ def estimate_specific_variances(stock_data: list[dict], X: np.ndarray, codes: li
             continue
         Xt = _zscore_cols(np.array(xrows, dtype=np.float64))
         rt = np.array(rets, dtype=np.float64)
-        resid = rt - Xt @ factor_returns
+        if Xt.shape[1] != style_fr.shape[0]:
+            continue
+        resid = rt - Xt @ style_fr
         sigmas[i] = float(np.var(resid, ddof=Xt.shape[1] + 1))
         fallback_vals.append(sigmas[i])
     mean_v = float(np.mean(fallback_vals)) if fallback_vals else 0.0

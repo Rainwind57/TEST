@@ -94,7 +94,10 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
                                              boards=cfg.boards,
                                              selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(jobs.get_executor(), ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
+            result = await loop.run_in_executor(jobs.get_executor(), ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
+            if dataset.get("snapshotWarning"):
+                result["snapshotWarning"] = dataset["snapshotWarning"]
+            return result
         jobs.submit(jid, _run())
     elif kind == "ml-train":
         async def _run():
@@ -106,7 +109,10 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             loop = asyncio.get_running_loop()
             ev = await loop.run_in_executor(jobs.get_executor(), ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
             meta = await loop.run_in_executor(jobs.get_executor(), ml.train_final_model, dataset, cfg.modelType)
-            return {"model": meta, "evaluation": ev}
+            result = {"model": meta, "evaluation": ev}
+            if dataset.get("snapshotWarning"):
+                result["snapshotWarning"] = dataset["snapshotWarning"]
+            return result
         jobs.submit(jid, _run())
     elif kind == "ml-optimize":
         async def _run():
@@ -116,8 +122,11 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
                                              boards=cfg.boards,
                                              selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 jobs.get_executor(), ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)
+            if dataset.get("snapshotWarning"):
+                result["snapshotWarning"] = dataset["snapshotWarning"]
+            return result
         jobs.submit(jid, _run())
     else:  # ml-backtest
         from .ml import MLBacktestBody

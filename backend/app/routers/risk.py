@@ -70,7 +70,10 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
     sigma_e = risk.estimate_specific_variances(stock_data, X, codes_valid, factor_returns)
     if sigma_e.size == 0 or np.all(sigma_e == 0):
         residuals = stock_returns - X @ factor_returns
-        sigma_e = np.var(residuals, ddof=X.shape[1] + 1) * np.ones(len(codes_valid))
+        # ddof 不能超过样本数，否则 np.var 返回 NaN；行业因子多时 ddof 可能偏大
+        safe_ddof = min(X.shape[1] + 1, max(1, len(residuals) - 1))
+        sigma_e_scalar = np.var(residuals, ddof=safe_ddof)
+        sigma_e = np.full(len(codes_valid), max(sigma_e_scalar, 1e-12))
 
     attr = risk.attribute_returns(weights_w, X, factor_returns, stock_returns)
     rdecomp = risk.risk_decomposition(weights_w, X, sigma_f, sigma_e)
