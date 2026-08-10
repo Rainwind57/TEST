@@ -35,7 +35,7 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
             cfg = sel.BacktestBody(**body.config)
         except Exception as e:
             raise HTTPException(400, f"config 字段不匹配: {e}")
-        jid = jobs.create_job("backtest", body.config)
+        jid = jobs.create_job("backtest", body.config, user_id=uid)
         jobs.submit(jid, sel.run_backtest(cfg))
         return {"jobId": jid, "status": "pending"}
 
@@ -44,8 +44,8 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
             cfg = sel.SelectBody(**body.config)
         except Exception as e:
             raise HTTPException(400, f"config 字段不匹配: {e}")
-        jid = jobs.create_job("select", body.config)
-        jobs.submit(jid, sel.run_select(cfg))
+        jid = jobs.create_job("select", body.config, user_id=uid)
+        jobs.submit(jid, sel.run_select(cfg, uid=uid))
         return {"jobId": jid, "status": "pending"}
 
     if body.kind == "factor-regression":
@@ -53,12 +53,12 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
             cfg = sel.FactorRegressionBody(**body.config)
         except Exception as e:
             raise HTTPException(400, f"config 字段不匹配: {e}")
-        jid = jobs.create_job("factor-regression", body.config)
+        jid = jobs.create_job("factor-regression", body.config, user_id=uid)
         jobs.submit(jid, sel.run_factor_regression(cfg))
         return {"jobId": jid, "status": "pending"}
 
     if body.kind in ("ml-evaluate", "ml-train", "ml-backtest", "ml-optimize"):
-        return _submit_ml_job(body.kind, body.config)
+        return _submit_ml_job(body.kind, body.config, uid)
 
     # optimize：同步函数（内部自建 event loop），放线程池避免阻塞主 loop
     try:
@@ -67,7 +67,7 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
         raise HTTPException(400, f"config 字段不匹配: {e}")
     config = body.config
     n_trials = cfg.nTrials
-    jid = jobs.create_job("optimize", config)
+    jid = jobs.create_job("optimize", config, user_id=uid)
 
     async def _run_optimize():
         loop = asyncio.get_running_loop()
@@ -78,13 +78,13 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
     return {"jobId": jid, "status": "pending"}
 
 
-def _submit_ml_job(kind: str, config: dict) -> dict:
+def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
     """ML 评估/训练/回测/寻优异步提交。"""
     try:
         cfg = EvalBody(**config) if kind != "ml-backtest" else None
     except Exception as e:
         raise HTTPException(400, f"config 字段不匹配: {e}")
-    jid = jobs.create_job(kind, config)
+    jid = jobs.create_job(kind, config, user_id=uid)
 
     if kind == "ml-evaluate":
         async def _run():
@@ -94,7 +94,7 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
                                              boards=cfg.boards,
                                              selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
+            return await loop.run_in_executor(jobs.get_executor(), ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
         jobs.submit(jid, _run())
     elif kind == "ml-train":
         async def _run():
@@ -104,8 +104,8 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
                                              boards=cfg.boards,
                                              selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
-            ev = await loop.run_in_executor(None, ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
-            meta = await loop.run_in_executor(None, ml.train_final_model, dataset, cfg.modelType)
+            ev = await loop.run_in_executor(jobs.get_executor(), ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
+            meta = await loop.run_in_executor(jobs.get_executor(), ml.train_final_model, dataset, cfg.modelType)
             return {"model": meta, "evaluation": ev}
         jobs.submit(jid, _run())
     elif kind == "ml-optimize":
@@ -117,7 +117,7 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
                                              selected_factors=getattr(cfg, 'selectedFactors', None))
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)
+                jobs.get_executor(), ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)
         jobs.submit(jid, _run())
     else:  # ml-backtest
         from .ml import MLBacktestBody
@@ -137,12 +137,12 @@ def _submit_ml_job(kind: str, config: dict) -> dict:
 
 @router.get("")
 def list_jobs(limit: int = 50, uid: int = Depends(require_user_id)):
-    return jobs.list_jobs(max(1, min(limit, 200)))
+    return jobs.list_jobs(max(1, min(limit, 200)), user_id=uid)
 
 
 @router.get("/{jid}")
 def get_job(jid: str, uid: int = Depends(require_user_id)):
-    j = jobs.get_job(jid)
+    j = jobs.get_job(jid, user_id=uid)
     if not j:
         raise HTTPException(404, "任务不存在")
     return j
@@ -150,6 +150,9 @@ def get_job(jid: str, uid: int = Depends(require_user_id)):
 
 @router.delete("/{jid}")
 def cancel_job(jid: str, uid: int = Depends(require_user_id)):
+    j = jobs.get_job(jid, user_id=uid)
+    if not j:
+        raise HTTPException(404, "任务不存在或已完成")
     if not jobs.cancel(jid):
         raise HTTPException(404, "任务不存在或已完成")
     return {"ok": True}

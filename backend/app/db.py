@@ -73,6 +73,7 @@ def init_db():
         open REAL, close REAL, high REAL, low REAL, volume REAL,
         PRIMARY KEY (code, date)
     )""")
+    _ensure_column(cur, "kline_cache", "adjust", "TEXT DEFAULT ''")
     cur.execute("""CREATE TABLE IF NOT EXISTS saved_strategies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -117,6 +118,7 @@ def init_db():
         created_at TEXT NOT NULL,
         finished_at TEXT
     )""")
+    _ensure_column(cur, "jobs", "user_id", "INTEGER DEFAULT 0")
     # 调度器运行记录：旧版 _last_run/_last_signals 纯内存，重启即丢、无法审计。
     cur.execute("""CREATE TABLE IF NOT EXISTS scheduler_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,22 +173,40 @@ def reset_portfolio():
 def get_cached_kline(code: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT date, open, close, high, low, volume FROM kline_cache WHERE code = ? ORDER BY date",
+        "SELECT date, open, close, high, low, volume, adjust FROM kline_cache WHERE code = ? ORDER BY date",
         (code,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def upsert_kline(code: str, rows: list[dict]):
+def get_cached_kline_adjust(code: str) -> str:
+    """返回缓存中该股票的复权标记，空字符串表示无标记或旧数据。"""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT adjust FROM kline_cache WHERE code = ? LIMIT 1", (code,)
+    ).fetchone()
+    conn.close()
+    return row["adjust"] if row else ""
+
+
+def upsert_kline(code: str, rows: list[dict], adjust: str = ""):
     if not rows:
         return
     conn = get_conn()
     conn.executemany(
-        "INSERT OR REPLACE INTO kline_cache (code, date, open, close, high, low, volume) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [(code, r["date"], r["open"], r["close"], r["high"], r["low"], r["volume"]) for r in rows]
+        "INSERT OR REPLACE INTO kline_cache (code, date, open, close, high, low, volume, adjust) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(code, r["date"], r["open"], r["close"], r["high"], r["low"], r["volume"], adjust) for r in rows]
     )
+    conn.commit()
+    conn.close()
+
+
+def clear_kline_cache(code: str):
+    """清除单只股票的K线缓存（复权基准漂移时整表重写前调用）。"""
+    conn = get_conn()
+    conn.execute("DELETE FROM kline_cache WHERE code = ?", (code,))
     conn.commit()
     conn.close()
 
@@ -381,29 +401,40 @@ def _parse_backtest_run(row):
 
 # ---------------- 异步任务（jobs 表） ----------------
 
-def create_job_row(jid: str, kind: str, config: dict) -> None:
+def create_job_row(jid: str, kind: str, config: dict, user_id: int = 0) -> None:
     conn = get_conn()
     conn.execute(
-        "INSERT INTO jobs (id, kind, config, status, progress, message, created_at) "
-        "VALUES (?, ?, ?, 'pending', 0, '', ?)",
-        (jid, kind, _json_dumps(config), datetime.datetime.now().isoformat())
+        "INSERT INTO jobs (id, kind, config, status, progress, message, created_at, user_id) "
+        "VALUES (?, ?, ?, 'pending', 0, '', ?, ?)",
+        (jid, kind, _json_dumps(config), datetime.datetime.now().isoformat(), user_id)
     )
     conn.commit()
     conn.close()
 
 
-def get_job_row(jid: str) -> dict | None:
+def get_job_row(jid: str, user_id: int | None = None) -> dict | None:
     conn = get_conn()
-    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (jid,)).fetchone()
+    if user_id is not None:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE id = ? AND user_id = ?", (jid, user_id)
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (jid,)).fetchone()
     conn.close()
     return _parse_job_row(row) if row else None
 
 
-def list_job_rows(limit: int = 50) -> list[dict]:
+def list_job_rows(limit: int = 50, user_id: int | None = None) -> list[dict]:
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 200)),)
-    ).fetchall()
+    if user_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, max(1, min(limit, 200)))
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 200)),)
+        ).fetchall()
     conn.close()
     return [_parse_job_row(r) for r in rows]
 

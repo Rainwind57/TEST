@@ -1,5 +1,5 @@
 """因子截面与单因子回归路由。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import adapters
@@ -7,6 +7,7 @@ from ..factors import (
     FACTORS, SNAPSHOT_FACTORS, snapshot_factor_value, pearson, spearman,
     REGRESSION_METHODS, fit_regression, poly_predict,
 )
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api", tags=["factor"])
 
@@ -77,7 +78,7 @@ def list_regression_methods():
 
 
 @router.post("/regression")
-async def run_regression(body: RegressionBody):
+async def run_regression(body: RegressionBody, uid: int = Depends(require_user_id)):
     if body.factor not in FACTORS:
         raise HTTPException(400, "未知因子类型")
     if body.method not in REGRESSION_METHODS:

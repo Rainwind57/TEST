@@ -10,8 +10,6 @@ IS（早期段）做参数搜索、OOS（晚期段）做样本外验证，最终
 import asyncio
 import datetime
 
-import optuna
-
 from . import adapters, db
 from .routers import selection as sel
 
@@ -42,7 +40,7 @@ async def _mid_date(board: str, hist: int, boards: list[str] | None = None) -> s
     return None
 
 
-def _objective(trial: optuna.Trial, base: dict, full_hist: int, is_end_date: str | None) -> float:
+def _objective(trial, base: dict, full_hist: int, is_end_date: str | None) -> float:
     """单次试验：用 IS 区间（早期段，endDate=中点）跑回测，返回 Sharpe（越大越好）。"""
     cfg = {
         "board": base["board"],
@@ -82,6 +80,11 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None,
     base_config: 基础配置（board/factor/cost 等固定项）。
     返回 {best_params, is_metrics, oos_metrics, splitDate, trials}。
     """
+    try:
+        import optuna
+    except ImportError:
+        raise ImportError("optuna 未安装，请执行: pip install optuna>=4.0")
+
     full_hist = max(120, base_config["hist"])
 
     loop = asyncio.new_event_loop()

@@ -36,7 +36,7 @@ class SaveStrategyBody(BaseModel):
 
 
 @router.post("/backtest")
-def optimize_backtest(body: OptimizeBody):
+def optimize_backtest(body: OptimizeBody, uid: int = Depends(require_user_id)):
     """同步寻优（小试验数）。大数据建议走 /api/jobs。"""
     try:
         result = optimize.optimize_backtest(body.model_dump(), body.nTrials)

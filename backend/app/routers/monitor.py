@@ -1,8 +1,9 @@
 """盯盘看板路由：调度器开关、状态、信号、净值。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import scheduler, db
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/monitor", tags=["monitor"])
 
@@ -34,7 +35,7 @@ def get_signal_config():
 
 
 @router.post("/config")
-def set_signal_config(body: SignalConfigBody):
+def set_signal_config(body: SignalConfigBody, uid: int = Depends(require_user_id)):
     """设置盯盘信号引擎：rule 规则或指定 ML 模型（modelId 必填）。
     
     模型模式：ranking=isolated 对各股孤立打分，ranking=full 对全池排名后取分位（与选股口径一致）。
@@ -47,7 +48,7 @@ def set_signal_config(body: SignalConfigBody):
 
 
 @router.post("/toggle")
-async def toggle(body: ToggleBody):
+async def toggle(body: ToggleBody, uid: int = Depends(require_user_id)):
     # async 必须：AsyncIOScheduler.start() 需运行中事件循环，
     # 旧版同步路由在线程池跑 → get_event_loop() 抛错 → 前端 network error
     if body.enabled:
@@ -58,7 +59,7 @@ async def toggle(body: ToggleBody):
 
 
 @router.post("/scan")
-async def scan(force: bool = False):
+async def scan(force: bool = False, uid: int = Depends(require_user_id)):
     """立即手动扫描一次盯盘信号（无需等待交易日 15:10 的 cron）。
 
     force=true 时跳过交易日判断，任意时刻均可验证扫描逻辑。
@@ -82,7 +83,7 @@ class AutoTradeBody(BaseModel):
 
 
 @router.post("/auto-trade")
-def set_auto_trade(body: AutoTradeBody):
+def set_auto_trade(body: AutoTradeBody, uid: int = Depends(require_user_id)):
     db.set_setting("auto_trade", "1" if body.enabled else "0")
     return {"autoTrade": body.enabled}
 

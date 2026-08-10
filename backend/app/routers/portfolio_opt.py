@@ -29,7 +29,7 @@ class OptBody(BaseModel):
 
 
 @router.post("")
-def optimize(body: OptBody):
+def optimize(body: OptBody, uid: int = Depends(require_user_id)):
     mu = np.array(body.mu, dtype=np.float64)
     cov = np.array(body.cov, dtype=np.float64)
     if mu.ndim != 1 or cov.ndim != 2 or mu.shape[0] != cov.shape[0] != cov.shape[1]:
@@ -85,20 +85,48 @@ async def apply_to_portfolio(body: ApplyBody, uid: int = Depends(require_user_id
     total = body.totalAssets if body.totalAssets else (cash + market_value)
 
     applied = []
-    for code, wi in zip(body.codes, w):
+    target_by_code = {code: float(wi) for code, wi in zip(body.codes, w)}
+    # 先卖再买：释放持仓超出目标权重的部分
+    for code, qty in positions.items():
         price = quotes.get(code, {}).get("price", 0)
         if price <= 0:
-            applied.append({"code": code, "weight": float(wi), "error": "无行情"})
             continue
-        qty = int(total * float(wi) / price / 100) * 100  # 整手
-        if qty <= 0:
-            applied.append({"code": code, "weight": float(wi), "error": "金额不足 1 手"})
+        if code not in target_by_code:
+            # 调出组合 → 全卖
+            try:
+                await place_order(OrderBody(code=code, side="sell", qty=qty))
+                applied.append({"code": code, "side": "sell", "qty": qty, "reason": "调出组合"})
+            except Exception as e:
+                applied.append({"code": code, "side": "sell", "error": str(e)})
+
+    for code, wi in target_by_code.items():
+        price = quotes.get(code, {}).get("price", 0)
+        if price <= 0:
+            applied.append({"code": code, "weight": wi, "error": "无行情"})
             continue
-        try:
-            await place_order(OrderBody(code=code, side="buy", qty=qty))
-            applied.append({"code": code, "qty": qty, "weight": float(wi)})
-        except Exception as e:
-            applied.append({"code": code, "weight": float(wi), "error": str(e)})
+        target_qty = int(total * wi / price / 100) * 100
+        current_qty = positions.get(code, 0)
+        if target_qty < current_qty:
+            sell_qty = min(current_qty - target_qty, current_qty)
+            sell_qty = max(100, sell_qty // 100 * 100)
+            if sell_qty >= 100:
+                try:
+                    await place_order(OrderBody(code=code, side="sell", qty=sell_qty))
+                    applied.append({"code": code, "side": "sell", "qty": sell_qty, "weight": wi})
+                except Exception as e:
+                    applied.append({"code": code, "weight": wi, "error": str(e)})
+        elif target_qty > current_qty:
+            buy_qty = target_qty - current_qty
+            if buy_qty < 100:
+                applied.append({"code": code, "weight": wi, "error": "调整量不足 1 手"})
+                continue
+            try:
+                await place_order(OrderBody(code=code, side="buy", qty=buy_qty))
+                applied.append({"code": code, "side": "buy", "qty": buy_qty, "weight": wi})
+            except Exception as e:
+                applied.append({"code": code, "weight": wi, "error": str(e)})
+        else:
+            applied.append({"code": code, "weight": wi, "action": "hold"})
     return {"applied": applied, "totalAssets": total}
 
 
@@ -108,7 +136,7 @@ class EstimateBody(BaseModel):
 
 
 @router.post("/estimate")
-async def estimate_mu_cov(body: EstimateBody):
+async def estimate_mu_cov(body: EstimateBody, uid: int = Depends(require_user_id)):
     """从历史 K 线自动估计 mu（年化预期收益）+ cov（年化协方差），
     取消用户手工粘贴矩阵。mu=日收益均值×252，cov=日收益协方差×252。"""
     if len(body.codes) < 2:

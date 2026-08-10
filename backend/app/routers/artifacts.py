@@ -25,17 +25,17 @@ def save_artifact(body: SaveBody, uid: int = Depends(require_user_id)):
         raise HTTPException(400, "payload 不能为空")
     if not body.kind.strip():
         raise HTTPException(400, "kind 不能为空")
-    return artifacts.save_artifact(body.kind.strip(), body.payload, body.name.strip())
+    return artifacts.save_artifact(body.kind.strip(), body.payload, body.name.strip(), user_id=uid)
 
 
 @router.get("")
 def list_artifacts(kind: str | None = None, limit: int = 100, uid: int = Depends(require_user_id)):
-    return artifacts.list_artifacts(kind, max(1, min(limit, 500)))
+    return artifacts.list_artifacts(kind, max(1, min(limit, 500)), user_id=uid)
 
 
 @router.get("/{aid}")
 def get_artifact(aid: str, uid: int = Depends(require_user_id)):
-    rec = artifacts.load_artifact(aid)
+    rec = artifacts.load_artifact(aid, user_id=uid)
     if not rec:
         raise HTTPException(404, "中间结果不存在")
     return rec
@@ -43,6 +43,6 @@ def get_artifact(aid: str, uid: int = Depends(require_user_id)):
 
 @router.delete("/{aid}")
 def remove_artifact(aid: str, uid: int = Depends(require_user_id)):
-    if not artifacts.delete_artifact(aid):
+    if not artifacts.delete_artifact(aid, user_id=uid):
         raise HTTPException(404, "中间结果不存在")
     return {"ok": True}

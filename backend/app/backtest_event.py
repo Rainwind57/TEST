@@ -87,6 +87,7 @@ class EventBacktest:
             self._date_idx_by_code[code] = {row["date"]: i for i, row in enumerate(kline)}
             # 涨跌停：A 股普通股 ±10%（ST ±5%，此处近似 10%）
             self._limit_by_code[code] = self._compute_limits(kline)
+        self._sorted_dates_by_code = {c: sorted(d.keys()) for c, d in self._date_idx_by_code.items()}
 
     def _compute_limits(self, kline: list[dict]) -> dict[str, tuple[float, float]]:
         """逐日涨跌停价：基于前收盘 ±10%（A 股规则近似）。"""
@@ -117,20 +118,24 @@ class EventBacktest:
         prev_date = None
         for di, date in enumerate(ref_dates):
             is_last = (di == len(ref_dates) - 1)
-            # 1. 撮合昨日挂单（T+1：今日撮合昨日提交的订单）；最后一日强制撮合
+            # 1. 撮合昨日挂单（T+1：今日撮合昨日提交的订单）；最后一日用收盘价撮合
             if self._pending_orders:
                 self._match_orders(date, is_last_date=is_last)
             # 2. 生成今日信号 → 入挂单队列（明日撮合）
-            state = {
-                "date": date, "prev_date": prev_date,
-                "cash": self._cash, "positions": {c: {"qty": p.qty, "avg_cost": p.avg_cost}
-                                                   for c, p in self._positions.items()},
-                "market_data": self._market_snapshot(date),
-            }
-            new_orders = signal_fn(date, prev_date, state)
-            for o in new_orders:
-                o.created_at = date
-                self.submit_order(o)
+            # 最后一日不生成新信号：末日信号用当日收盘因子却撮合在当日开盘属反向前视
+            if not is_last:
+                state = {
+                    "date": date, "prev_date": prev_date,
+                    "cash": self._cash, "positions": {c: {"qty": p.qty, "avg_cost": p.avg_cost}
+                                                       for c, p in self._positions.items()},
+                    "pending_orders": [{"code": o.code, "side": o.side, "qty": o.qty}
+                                       for o in self._pending_orders],
+                    "market_data": self._market_snapshot(date),
+                }
+                new_orders = signal_fn(date, prev_date, state)
+                for o in new_orders:
+                    o.created_at = date
+                    self.submit_order(o)
             # 3. 更新净值
             mv = self._market_value(date)
             self._equity_curve.append({"date": date, "cash": self._cash,
@@ -168,8 +173,9 @@ class EventBacktest:
     def _match_orders(self, date: str, is_last_date: bool = False):
         """撮合待挂单订单：涨跌停/流动性/部分成交。
 
-        撮合价 = 当日 open（次日开盘成交，T+1 语义）。
-        涨跌停递延（非撤单），最后交易日强制以 open 撮合。
+        撮合价 = 当日 open（次日开盘成交，T+1 语义）；
+        最后交易日用当日 close（避免末日信号用收盘因子成交在开盘的反向前视）。
+        涨跌停递延（非撤单），最后交易日强制撮合。
         流动性：单股成交 <= volume * max_pct，超量递延。
         """
         snap = self._market_snapshot(date)
@@ -180,7 +186,7 @@ class EventBacktest:
             if not s or s["open"] is None or s["volume"] is None:
                 still_pending.append(order)
                 continue
-            price = s["open"]
+            price = s["close"] if is_last_date else s["open"]
             upper, lower = s["upper_limit"], s["lower_limit"]
             # 涨跌停约束：递延而非撤单；最后交易日强制撮合
             if order.side == "buy" and upper is not None and price >= upper:
@@ -214,17 +220,20 @@ class EventBacktest:
                 if filled_qty <= 0:
                     continue
             # 部分成交：记录成交、扣减剩余量递延
-            self._apply_fill(order, code, order.side, filled_qty, exec_price, date)
+            self._apply_fill(order, code, order.side, filled_qty, exec_price, date, slip)
             if filled_qty < order.qty:
                 order.qty -= filled_qty
                 still_pending.append(order)
         self._pending_orders = still_pending
 
     def _apply_fill(self, order: Order, code: str, side: str, qty: int,
-                    price: float, date: str):
-        """应用成交：更新持仓/现金/记录。含现金校验与单股权重上限。"""
-        self._fills.append(Fill(code=code, side=side, filled_qty=qty,
-                               avg_price=price, slippage=order.limit_price or 0.0, date=date))
+                    price: float, date: str, slippage: float = 0.0):
+        """应用成交：更新持仓/现金/记录。含现金校验与单股权重上限。
+
+        关键：先校验所有约束（现金/持仓上限），仅在成交有效后才记录 fill，
+        避免资金不足/超限时留下幽灵成交记录。
+        """
+        executed_qty = qty
         if side == "buy":
             per_share = price
             if self.config.apply_cost:
@@ -232,30 +241,30 @@ class EventBacktest:
             max_affordable = int(self._cash / per_share) if per_share > 0 else 0
             if max_affordable <= 0:
                 return
-            qty = min(qty, max_affordable)
+            executed_qty = min(executed_qty, max_affordable)
             total_assets = self._cash + self._market_value(date)
             max_position_qty = int(total_assets * self.config.max_position_pct / price) if price > 0 else 0
             pos = self._positions.get(code)
             current_qty = pos.qty if pos else 0
-            qty = min(qty, max(0, max_position_qty - current_qty))
-            if qty <= 0:
+            executed_qty = min(executed_qty, max(0, max_position_qty - current_qty))
+            if executed_qty <= 0:
                 return
-            amount = qty * per_share
+            amount = executed_qty * per_share
             self._cash -= amount
             pos = self._positions.setdefault(code, Position(code=code))
-            new_qty = pos.qty + qty
-            pos.avg_cost = (pos.avg_cost * pos.qty + price * qty) / new_qty if new_qty else 0
+            new_qty = pos.qty + executed_qty
+            pos.avg_cost = (pos.avg_cost * pos.qty + price * executed_qty) / new_qty if new_qty else 0
             pos.qty = new_qty
-            pos.bought_dates.append((date, qty))
+            pos.bought_dates.append((date, executed_qty))
         else:  # sell
-            amount = qty * price
+            amount = executed_qty * price
             if self.config.apply_cost:
                 amount *= (1 - self.config.commission_rate - self.config.stamp_duty)
             self._cash += amount
             pos = self._positions.get(code)
             if pos:
-                pos.qty -= qty
-                remaining = qty
+                pos.qty -= executed_qty
+                remaining = executed_qty
                 while remaining > 0 and pos.bought_dates:
                     batch_date, batch_qty = pos.bought_dates[0]
                     if batch_qty <= remaining:
@@ -266,27 +275,25 @@ class EventBacktest:
                         remaining = 0
                 if pos.qty <= 0:
                     del self._positions[code]
+        self._fills.append(Fill(code=code, side=side, filled_qty=executed_qty,
+                               avg_price=price, slippage=slippage, date=date))
 
     def _market_value(self, date: str) -> float:
         """持仓市值（用当日 close 估值；停牌日沿用最后有效收盘价）。"""
         mv = 0.0
         for code, pos in self._positions.items():
-            idx = self._date_idx_by_code[code].get(date)
             closes = self._arr_by_code[code]["close"]
-            if idx is None:
-                # 停牌/无行情：沿用在日期之前最近的收盘价
-                all_dates = sorted(self._date_idx_by_code[code].keys())
-                prev = None
-                for d in all_dates:
-                    if d > date:
-                        break
-                    prev = self._date_idx_by_code[code][d]
-                if prev is not None:
-                    price = float(closes[prev])
-                    mv += price * pos.qty
+            # 停牌/无行情：二分查找日期之前最近的交易日
+            if date not in self._date_idx_by_code[code]:
+                dates_sorted = self._sorted_dates_by_code[code]
+                import bisect
+                i = bisect.bisect_left(dates_sorted, date) - 1
+                if i >= 0:
+                    idx = self._date_idx_by_code[code][dates_sorted[i]]
+                    mv += float(closes[idx]) * pos.qty
                 continue
-            price = float(closes[idx])
-            mv += price * pos.qty
+            idx = self._date_idx_by_code[code][date]
+            mv += float(closes[idx]) * pos.qty
         return mv
 
     def _result(self) -> dict:

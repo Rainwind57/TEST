@@ -1,9 +1,10 @@
 """行情与自选股路由。"""
 import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import adapters, db
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api", tags=["quote"])
 
@@ -64,7 +65,7 @@ def get_watchlist():
 
 
 @router.post("/watchlist")
-def add_watchlist(body: WatchAddBody):
+def add_watchlist(body: WatchAddBody, uid: int = Depends(require_user_id)):
     code = body.code.strip().lower()
     if not db.is_tradable(code):
         raise HTTPException(400, f"无法添加非交易标的（{code} 为指数/ETF），请选择可交易个股")
@@ -81,7 +82,7 @@ def add_watchlist(body: WatchAddBody):
 
 
 @router.delete("/watchlist/{code}")
-def delete_watchlist(code: str):
+def delete_watchlist(code: str, uid: int = Depends(require_user_id)):
     conn = db.get_conn()
     conn.execute("DELETE FROM watchlist WHERE code = ?", (code,))
     conn.commit()

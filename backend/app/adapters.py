@@ -418,6 +418,7 @@ async def fetch_market_list(board: str = "all", limit: int = 300, sort_field: st
     # （选股 vs 回测/ML 对同一“沪深300”含义不同的历史 bug）
     if board in ("hs300", "zz500"):
         index_code = {"hs300": "sh000300", "zz500": "sh000905"}[board]
+        cache_key = f"{board}:{limit}:{sort_field}"
         codes = await fetch_index_constituents(index_code)
         if not codes:
             _market_status["degraded"] = True
@@ -549,18 +550,27 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     三级缓存：内存(L1, 300s) → SQLite 磁盘(L2) → 网络。已有足够历史时直接返回缓存，
     仅在缓存不足或强制刷新时回源，回源后增量写盘。重复回测可减少 90%+ 网络请求。
     bj 代码中部分 8xxxxx（如 830799）腾讯 fqkline 返回空 day，自动降级到东财日K。
+
+    前复权基准漂移防护：缓存写盘时记录 adjust='qfq'，读取时若标记不一致则清空旧缓存后
+    全量重拉，避免除权后新价格+旧基准 = 虚假跳空。
     """
-    cache_key = f"{code}:{days}"
+    ADJUST_FLAG = "qfq"
+    cache_key = code  # 按股票缓存全量，与 days 无关，提升命中率
     if not force_refresh:
         cached = _kline_cache.get(cache_key)
         if cached and time.time() - cached[0] < KLINE_CACHE_TTL:
-            _kline_cache.move_to_end(cache_key)  # LRU 命中提升
-            return cached[1]
+            _kline_cache.move_to_end(cache_key)
+            full = cached[1]
+            return full[-days:] if len(full) > days else full
+
+        cached_adjust = db.get_cached_kline_adjust(code)
+        if cached_adjust and cached_adjust != ADJUST_FLAG:
+            db.clear_kline_cache(code)
 
         disk_rows = db.get_cached_kline(code)
         if len(disk_rows) >= days and not _kline_stale(disk_rows):
-            result = disk_rows[-days:]  # 裁剪到请求长度（旧版静默放大返回全量）
-            _kline_cache_set(cache_key, (time.time(), result))
+            result = disk_rows[-days:]
+            _kline_cache_set(cache_key, (time.time(), disk_rows))
             return result
 
     url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
@@ -585,10 +595,11 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     # 所有调用都拿到空数据，单次网络抖动被放大成 5 分钟故障。
     if not kline:
         return []
-    db.upsert_kline(code, kline)
+    db.upsert_kline(code, kline, adjust=ADJUST_FLAG)
     merged = db.get_cached_kline(code)
-    result = merged[-days:]
-    _kline_cache_set(cache_key, (time.time(), result))
+    # 内存缓存存全量（与 days 无关），返回时裁剪
+    _kline_cache_set(cache_key, (time.time(), merged))
+    result = merged[-days:] if len(merged) > days else merged
     return result
 
 

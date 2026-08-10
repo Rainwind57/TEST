@@ -1052,6 +1052,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             bench_series = None
 
     # 快照特征：仅对最近 60 个交易日沿用（避免历史截面用今日财报数据→前视）
+    ref_code = max(series, key=lambda c: len(series[c]))
     ref_dates = [row["date"] for row in series[ref_code]]
     snapshot_cutoff_date = None
     if snap_keys:
@@ -1068,6 +1069,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         arr = kline_to_arrays(kl)
         code_cache[code] = {
             "closes": arr["close"],
+            "opens": arr["open"] if "open" in arr else arr["close"],
             "volumes": arr["volume"],
             "smap": {k: compute_factor_series(k, arr) for k in tech_keys},
             "kline": kl,
@@ -1096,6 +1098,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
 
     bench_date_idx = {row["date"]: idx for idx, row in enumerate(bench_series)} if bench_series else {}
 
+    date_maps = {code: {row["date"]: i for i, row in enumerate(kl)} for code, kl in series.items()}
+
     for t in range(60, len(ref_dates) - n, max(1, n)):
         date_t = ref_dates[t]
         # 验证区间过滤（分时段验证：调仓日只落在 [start_date, end_date] 内）
@@ -1103,7 +1107,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             continue
         if end_date and date_t > end_date:
             continue
-        cross_feats, cross_codes, cross_rets = [], [], []
+        cross_feats, cross_codes, cross_rets, ic_rets = [], [], [], []
         for code in series:
             i = date_maps[code].get(date_t)
             if i is None or i < 20 or i + n >= len(code_cache[code]["kline"]):
@@ -1137,9 +1141,15 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             if limit is not None:
                 if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
                     continue
+            # T+1 入场：IC 用信号日收盘→未来收盘（衡量预测力）；P&L 用次日开盘→未来收盘（可实盘）
+            ic_ret = float(closes[i + n] / closes[i] - 1)
+            opens = cc.get("opens", closes)
+            t1_entry = float(opens[i + 1]) if i + 1 < len(opens) else float(closes[i])
+            t1_ret = float(closes[i + n] / t1_entry - 1) if t1_entry > 0 else ic_ret
             cross_codes.append(code)
             cross_feats.append(fvals)
-            cross_rets.append(float(closes[i + n] / closes[i] - 1))
+            cross_rets.append(t1_ret)
+            ic_rets.append(ic_ret)
         if len(cross_codes) < groups * 2:
             continue
 
@@ -1159,12 +1169,13 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                 cross_codes = [cross_codes[i] for i in keep_idx]
                 cross_feats = [cross_feats[i] for i in keep_idx]
                 cross_rets = [cross_rets[i] for i in keep_idx]
+                ic_rets = [ic_rets[i] for i in keep_idx]
                 preds = [preds[i] for i in keep_idx]
         if len(cross_codes) < groups * 2:
             continue
 
-        ic = _pearson(preds, cross_rets)
-        rank_ic = _spearman(preds, cross_rets)
+        ic = _pearson(preds, ic_rets)
+        rank_ic = _spearman(preds, ic_rets)
         ic_series.append({"date": date_t, "ic": ic, "rankIc": rank_ic, "sample": len(cross_codes)})
 
         sorted_preds = sorted(preds)

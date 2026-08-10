@@ -49,9 +49,18 @@ _SAFE_FUNCS = {
     "abs": np.abs, "max": np.maximum, "min": np.minimum,
     "log": np.log, "exp": np.exp, "sqrt": np.sqrt,
     "sign": np.sign, "clip": np.clip,
-    "mean": np.mean, "std": np.std, "sum": np.sum,
+    "cross_mean": np.mean, "cross_std": np.std, "cross_sum": np.sum,
     "rank": lambda a: _rank(a),
     "zscore": lambda a: _zscore(a),
+}
+
+# 每个安全函数的期望参数个数（不包含隐含 self）：用于校验调用参数数
+_SAFE_FUNC_ARITY = {
+    "abs": 1, "max": 2, "min": 2,
+    "log": 1, "exp": 1, "sqrt": 1,
+    "sign": 1, "clip": 3,
+    "cross_mean": 1, "cross_std": 1, "cross_sum": 1,
+    "rank": 1, "zscore": 1,
 }
 
 
@@ -105,6 +114,9 @@ def validate_expression(expr: str) -> tuple[bool, str]:
                 return False, f"不允许的函数: {node.func.id}"
             if node.keywords:
                 return False, "不允许关键字参数"
+            expected = _SAFE_FUNC_ARITY.get(node.func.id)
+            if expected is not None and len(node.args) != expected:
+                return False, f"函数 {node.func.id} 需要 {expected} 个参数，实际传了 {len(node.args)} 个"
     return True, ""
 
 
@@ -131,7 +143,7 @@ def evaluate_expression(expr: str, rows: list[dict]) -> list[float]:
             try:
                 vals.append(float(v) if v is not None else np.nan)
             except (TypeError, ValueError):
-                vals.append(np.nan)
+                raise ValueError(f"因子 '{name}' 的值 '{v}' 无法转为数值（可能是类别因子），请勿在表达式中使用字符串类型的因子")
         col = np.array(vals, dtype=np.float64)
         nan_mask = np.isnan(col)
         if nan_mask.any() and not nan_mask.all():
@@ -148,7 +160,9 @@ def evaluate_expression(expr: str, rows: list[dict]) -> list[float]:
         if isinstance(node, ast.Name):
             if node.id in _SAFE_FUNCS:
                 return _SAFE_FUNCS[node.id]
-            return columns.get(node.id, np.zeros(len(rows)))
+            if node.id not in columns:
+                raise ValueError(f"因子 '{node.id}' 不存在，请检查拼写。可用的因子: {list(columns.keys())}")
+            return columns[node.id]
         if isinstance(node, ast.UnaryOp):
             return _UNARY_OPS[type(node.op)](_eval(node.operand))
         if isinstance(node, ast.BinOp):
@@ -160,7 +174,12 @@ def evaluate_expression(expr: str, rows: list[dict]) -> list[float]:
         raise ValueError(f"不支持的节点: {type(node).__name__}")
 
     # NaN / inf → 0
-    result = _eval(tree.body)
+    try:
+        result = _eval(tree.body)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"表达式求值内部错误: {e}") from e
     arr = np.asarray(result, dtype=np.float64)
     if arr.ndim == 0:  # 常量表达式
         arr = np.full(len(rows), float(arr))

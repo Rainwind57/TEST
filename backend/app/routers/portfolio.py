@@ -9,6 +9,9 @@ from .auth import require_user_id
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
+COMMISSION = 0.00025   # 万 2.5 佣金（单边）
+STAMP_DUTY = 0.001     # 千 1 印花税（卖出单边）
+
 
 class OrderBody(BaseModel):
     code: str
@@ -99,23 +102,25 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
     pos = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
 
     if body.side == "buy":
-        if amount > cash:
+        cost = amount * COMMISSION
+        if amount + cost > cash:
             conn.close()
-            raise HTTPException(422, "资金不足")
-        new_cash = cash - amount
+            raise HTTPException(422, f"资金不足（含佣金{COMMISSION:.2%}）")
+        new_cash = cash - amount - cost
         if pos:
             new_qty = pos["qty"] + body.qty
-            new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount) / new_qty
+            new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount + cost) / new_qty
             cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ? WHERE code = ?",
                         (new_qty, new_avg_cost, q["name"], code))
         else:
             cur.execute("INSERT INTO positions (code, name, qty, avg_cost) VALUES (?, ?, ?, ?)",
-                        (code, q["name"], body.qty, price))
+                        (code, q["name"], body.qty, price + cost / body.qty))
     else:
         if not pos or pos["qty"] < body.qty:
             conn.close()
             raise HTTPException(422, "持仓不足")
-        new_cash = cash + amount
+        cost = amount * (COMMISSION + STAMP_DUTY)
+        new_cash = cash + amount - cost
         remain = pos["qty"] - body.qty
         if remain <= 0:
             cur.execute("DELETE FROM positions WHERE code = ?", (code,))

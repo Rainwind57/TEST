@@ -4,9 +4,11 @@
 （如选股结果、ML 打分 topN、组合优化输出），打通"选股→组合→风险"链路。
 """
 import asyncio
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import numpy as np
+
+from .auth import require_user_id
 
 from .. import adapters, db, risk
 
@@ -120,7 +122,7 @@ async def attribution():
 
 
 @router.post("/attribution")
-async def attribution_custom(body: AttributionBody):
+async def attribution_custom(body: AttributionBody, uid: int = Depends(require_user_id)):
     """对传入的任意组合做风险归因（打通：选股结果/ML打分/组合优化 → 风险）。"""
     return await _run_attribution(body.codes, body.weights)
 

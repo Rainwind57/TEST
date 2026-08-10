@@ -143,7 +143,7 @@ def wr_series(kline_arr: dict, n: int = 14) -> np.ndarray:
         hh = np.max(high[i - n + 1: i + 1])
         ll = np.min(low[i - n + 1: i + 1])
         if hh == ll:
-            out[i] = 0.0
+            out[i] = np.nan
         else:
             out[i] = (hh - close[i]) / (hh - ll) * 100.0
     return out

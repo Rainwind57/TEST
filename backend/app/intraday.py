@@ -81,14 +81,23 @@ async def run_intraday_backtest(cfg: IntradayConfig) -> dict:
         if position:
             can_exit = bar_date != position["entry_date"]
             if can_exit:
+                bar_open = bar.get("open", bar["close"])
                 bar_high = bar.get("high", bar["close"])
                 bar_low = bar.get("low", bar["close"])
-                if bar_high / position["entry_price"] - 1 >= cfg.take_profit:
-                    exit_price = position["entry_price"] * (1 + cfg.take_profit)
+                tp_hit = bar_high / position["entry_price"] - 1 >= cfg.take_profit
+                sl_hit = bar_low / position["entry_price"] - 1 <= cfg.stop_loss
+                if tp_hit and sl_hit:
+                    # 同一bar同时触及止盈止损：用开盘价成交（实际可达价），不偏向任何一方
+                    _exit(position, bar, bar_open, "open")
+                    position = None
+                elif tp_hit:
+                    # 跳空穿越止盈：按实际开盘价成交，不按理想止盈价
+                    exit_price = bar_open if bar_open / position["entry_price"] - 1 >= cfg.take_profit else position["entry_price"] * (1 + cfg.take_profit)
                     _exit(position, bar, exit_price, "take_profit")
                     position = None
-                elif bar_low / position["entry_price"] - 1 <= cfg.stop_loss:
-                    exit_price = position["entry_price"] * (1 + cfg.stop_loss)
+                elif sl_hit:
+                    # 跳空穿越止损：按实际开盘价成交，不按理想止损价（收益不虚高）
+                    exit_price = bar_open if bar_open / position["entry_price"] - 1 <= cfg.stop_loss else position["entry_price"] * (1 + cfg.stop_loss)
                     _exit(position, bar, exit_price, "stop_loss")
                     position = None
 
@@ -182,17 +191,8 @@ async def run_intraday_pool_backtest(codes: list[str], cfg: IntradayConfig) -> d
     returns = [t["pnl"] / (t["entry_price"] * t["shares"])
                for t in all_trades if t["entry_price"] * t["shares"] > 0]
     total_invest = sum(t["entry_price"] * t["shares"] for t in all_trades)
-    peak_invest = total_invest  # 多笔交易以峰值占用资金为分母更准确
-    if all_trades:
-        running = 0.0
-        peak_invest = 0.0
-        for t in sorted(all_trades, key=lambda x: x.get("entry_time", "")):
-            entry_amt = t["entry_price"] * t["shares"]
-            running += entry_amt
-            peak_invest = max(peak_invest, running)
-            # 粗略平仓减计（同股同量）
-            running -= entry_amt * 0.95  # 估算，实际很难精确追踪每一笔
-        peak_invest = max(peak_invest, total_invest * 0.3) if peak_invest == 0 else peak_invest
+    # 分母用实际总投入资金，不做 0.95 臆造估算；保守口径避免高估收益
+    peak_invest = total_invest
     cost_buy = (cfg.commissionRate + cfg.slippage) if cfg.applyCost else 0.0
     cost_sell = (cfg.commissionRate + cfg.stampDuty + cfg.slippage) if cfg.applyCost else 0.0
     metrics = {

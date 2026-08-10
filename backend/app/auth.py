@@ -15,19 +15,47 @@ from collections import defaultdict, deque
 
 from . import db
 
-# 登录撞库防护：每 IP 5 次/分钟，超过则锁定
-_LOGIN_ATTEMPTS: dict[str, deque] = defaultdict(deque)
+# 登录撞库防护：双层限流 —— 按 IP + 按账号
+_LOGIN_ATTEMPTS_IP: dict[str, deque] = defaultdict(deque)
+_LOGIN_ATTEMPTS_USER: dict[str, deque] = defaultdict(deque)
 _LOGIN_MAX_ATTEMPTS = 5
 _LOGIN_WINDOW = 60.0
 
+# 注册防刷：每 IP 每小时最多 3 次注册
+_REGISTER_ATTEMPTS: dict[str, deque] = defaultdict(deque)
+_REGISTER_MAX = 3
+_REGISTER_WINDOW = 3600.0
 
-def _check_login_rate(ip: str) -> bool:
-    """检查登录频率，超限返回 False。"""
+
+def _check_login_rate(client_ip: str, username: str) -> str | None:
+    """检查登录频率，返回 None 表示放行，否则返回错误消息。按 IP + 按账号双层校验。"""
     now = time.time()
-    dq = _LOGIN_ATTEMPTS[ip]
-    while dq and now - dq[0] > _LOGIN_WINDOW:
+    for label, dq, limit in [
+        (f"IP {client_ip}", _LOGIN_ATTEMPTS_IP[client_ip], _LOGIN_MAX_ATTEMPTS),
+        (f"账号 {username}", _LOGIN_ATTEMPTS_USER[username], _LOGIN_MAX_ATTEMPTS),
+    ]:
+        while dq and now - dq[0] > _LOGIN_WINDOW:
+            dq.popleft()
+        if len(dq) >= limit:
+            return f"{label} 登录请求过于频繁，请稍后重试"
+    _LOGIN_ATTEMPTS_IP[client_ip].append(now)
+    _LOGIN_ATTEMPTS_USER[username].append(now)
+    return None
+
+
+def _clear_login_rate(client_ip: str, username: str) -> None:
+    """登录成功后清除该用户的撞库计数器。"""
+    _LOGIN_ATTEMPTS_IP.pop(client_ip, None)
+    _LOGIN_ATTEMPTS_USER.pop(username, None)
+
+
+def _check_register_rate(client_ip: str) -> bool:
+    """检查注册频率，超限返回 False。"""
+    now = time.time()
+    dq = _REGISTER_ATTEMPTS[client_ip]
+    while dq and now - dq[0] > _REGISTER_WINDOW:
         dq.popleft()
-    if len(dq) >= _LOGIN_MAX_ATTEMPTS:
+    if len(dq) >= _REGISTER_MAX:
         return False
     dq.append(now)
     return True
@@ -108,7 +136,9 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
-def register_user(username: str, password: str) -> dict:
+def register_user(username: str, password: str, client_ip: str = "") -> dict:
+    if client_ip and not _check_register_rate(client_ip):
+        raise ValueError("注册过于频繁，请稍后再试")
     if not username or len(username) < 3:
         raise ValueError("用户名至少 3 个字符")
     if len(password) < 6:
@@ -132,8 +162,10 @@ def register_user(username: str, password: str) -> dict:
 
 
 def login_user(username: str, password: str, client_ip: str = "") -> dict:
-    if client_ip and not _check_login_rate(client_ip):
-        raise ValueError("登录尝试次数过多，请稍后再试")
+    if client_ip:
+        err = _check_login_rate(client_ip, username)
+        if err:
+            raise ValueError(err)
     conn = db.get_conn()
     row = conn.execute("SELECT id, username, password, salt FROM users WHERE username = ?",
                       (username,)).fetchone()
@@ -142,6 +174,8 @@ def login_user(username: str, password: str, client_ip: str = "") -> dict:
         raise ValueError("用户不存在或密码错误")
     if not hmac.compare_digest(_hash_password(password, row["salt"]), row["password"]):
         raise ValueError("用户不存在或密码错误")
+    if client_ip:
+        _clear_login_rate(client_ip, username)
     return {"id": row["id"], "username": row["username"], "token": _make_token(row["id"], row["username"])}
 
 

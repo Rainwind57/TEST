@@ -21,19 +21,19 @@ _JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 MAX_JOBS = 200  # 库内 job 上限，防无限增长
 
 
-def create_job(kind: str, config: dict) -> str:
+def create_job(kind: str, config: dict, user_id: int = 0) -> str:
     import uuid
     jid = uuid.uuid4().hex[:12]
-    db.create_job_row(jid, kind, config)
+    db.create_job_row(jid, kind, config, user_id=user_id)
     return jid
 
 
-def get_job(jid: str) -> dict | None:
-    return db.get_job_row(jid)
+def get_job(jid: str, user_id: int | None = None) -> dict | None:
+    return db.get_job_row(jid, user_id=user_id)
 
 
-def list_jobs(limit: int = 50) -> list[dict]:
-    return db.list_job_rows(limit)
+def list_jobs(limit: int = 50, user_id: int | None = None) -> list[dict]:
+    return db.list_job_rows(limit, user_id=user_id)
 
 
 def update_job(jid: str, **fields):
@@ -67,6 +67,8 @@ def _runner(jid: str, coro, cancel_ev: threading.Event | None = None):
         except Exception as e:
             update_job(jid, status="error", error=str(e),
                        finished_at=datetime.datetime.now().isoformat())
+        finally:
+            _cleanup_job(jid)
     return wrapper
 
 
@@ -81,12 +83,25 @@ def cancel(jid: str) -> bool:
     t = _tasks.get(jid)
     if t and not t.done():
         t.cancel()
-        ev = _cancel_events.pop(jid, None)
+        ev = _cancel_events.get(jid)
         if ev:
             ev.set()
+        # 不要 pop cancel_ev — 留给 _runner wrapper 在任务终结后清理；
+        # 否则 is_cancelled() 在 cancel→Task 实际退出之间会失效
+        _cleanup_scheduled[jid] = True
         update_job(jid, status="cancelled", finished_at=datetime.datetime.now().isoformat())
         return True
     return False
+
+
+_cleanup_scheduled: dict[str, bool] = {}
+
+
+def _cleanup_job(jid: str):
+    """任务终结时清理内存资源（cancel_ev + task handle）。"""
+    _cancel_events.pop(jid, None)
+    _tasks.pop(jid, None)
+    _cleanup_scheduled.pop(jid, None)
 
 
 def get_executor() -> ThreadPoolExecutor:

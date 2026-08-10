@@ -142,8 +142,12 @@ async def _fetch_technical_values(codes: list[str], keys: list[str], hist: int =
 
 
 @router.post("")
-async def run_select(body: SelectBody):
+async def select_stocks(body: SelectBody, uid: int = Depends(require_user_id)):
     # ML 模型选股：指定 modelId 时直接用模型预测分排名（打通 ML→选股→模拟盘/盯盘）
+    return await run_select(body, uid=uid)
+
+
+async def run_select(body: SelectBody, uid: int = 0):
     if body.modelId:
         adjust = body.adjust or None
         if body.adjustId and not adjust:
@@ -174,7 +178,7 @@ async def run_select(body: SelectBody):
                 "codes": [r["code"] for r in rows[: max(1, body.topN)]],
                 "rows": rows[: max(1, body.topN)],
                 "config": body.model_dump(),
-            }, name=f"ML选股-{body.modelId}")
+            }, name=f"ML选股-{body.modelId}", user_id=uid)
             result["artifact"] = meta
         return result
 
@@ -310,19 +314,23 @@ async def run_select(body: SelectBody):
     for uf_key, uf in uf_defs.items():
         definition = uf["definition"] or {}
         if uf["kind"] == "expression":
-            # 表达式因子：用安全 AST 引擎对已计算出的因子列求值（momentum - volatility*0.5 等）
             from .. import factor_expr
             expr = definition.get("expression") or ""
-            scores = factor_expr.evaluate_expression(expr, scored_rows) if expr else [0.0] * len(scored_rows)
+            try:
+                scores = factor_expr.evaluate_expression(expr, scored_rows) if expr else [0.0] * len(scored_rows)
+            except ValueError as e:
+                raise HTTPException(400, f"表达式因子 '{uf_key}' 求值失败: {e}")
         else:
             scores = compute_user_factor_scores(scored_rows, definition)
         for idx, row in enumerate(scored_rows):
             row[uf_key] = scores[idx]
 
-    # P1-6 表达式引擎：传 expression 时用安全 AST 求值，替代固定规格 composite_score
     from .. import factor_expr
     if body.expression:
-        scores = factor_expr.evaluate_expression(body.expression, scored_rows)
+        try:
+            scores = factor_expr.evaluate_expression(body.expression, scored_rows)
+        except ValueError as e:
+            raise HTTPException(400, f"表达式求值失败: {e}")
         for idx, row in enumerate(scored_rows):
             row["score"] = scores[idx]
             row["factorDetail"] = {"expression": body.expression}
@@ -346,7 +354,7 @@ async def run_select(body: SelectBody):
             "codes": top_codes,
             "rows": scored[: max(1, body.topN)],
             "config": body.model_dump(),
-        }, name=f"选股-{body.board}")
+        }, name=f"选股-{body.board}", user_id=uid)
         result["artifact"] = meta
     return result
 
@@ -403,7 +411,7 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
             if body.saveArtifact:
                 from .. import artifacts
                 meta = artifacts.save_artifact("backtest", res,
-                                               name=f"ML回测-{body.modelId}")
+                                               name=f"ML回测-{body.modelId}", user_id=uid)
                 res["artifact"] = meta
             return res
         except FileNotFoundError as e:
@@ -443,6 +451,12 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
             "候选池为空：上游行情列表获取失败或被限流（非参数问题）。"
             "请稍后重试，或先到行情页确认列表可加载。",
         )
+
+    # 过滤 ST/退市/次新股：减少生存偏差对回测收益的系统性高估
+    if body.assetClass != "future":
+        pool = [r for r in pool if not ("ST" in (r.get("name") or "") or "*ST" in (r.get("name") or ""))]
+        if not pool:
+            raise HTTPException(422, "候选池过滤后为空：ST/退市股已全部排除，请放宽板块范围")
 
     codes = [row["code"] for row in pool]
     is_st = {} if body.assetClass == "future" else {
@@ -677,7 +691,7 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
         result["longShortNote"] = "多空组合需同时做多Top组和做空Bottom组。A股散户做空个股需融券/股指期货，本回测绩效不可直接实盘，仅供研究参考。"
     if body.saveArtifact:
         from .. import artifacts
-        meta = artifacts.save_artifact("backtest", result, name=f"回测-{body.factor}")
+        meta = artifacts.save_artifact("backtest", result, name=f"回测-{body.factor}", user_id=uid)
         result["artifact"] = meta
     # P10：回测完成自动存档（生成 HTML 报告 + 登记历史记录），失败不阻塞主流程
     try:
@@ -711,7 +725,7 @@ class EventBacktestBody(BaseModel):
 
 
 @router.post("/backtest-event")
-async def run_event_backtest(body: EventBacktestBody):
+async def run_event_backtest(body: EventBacktestBody, uid: int = Depends(require_user_id)):
     """事件驱动回测：逐 bar 撮合 + T+1 + 涨跌停 + 流动性约束（P1-9）。"""
     try:
         pool = await adapters.fetch_market_list(body.board, body.poolSize)
@@ -805,6 +819,30 @@ def ols_regression_local(xs: list[float], ys: list[float]) -> dict:
     return {"a": a, "b": b}
 
 
+def _newey_west_se(series: list[float], max_lag: int | None = None) -> float:
+    """Newey-West 自相关一致标准误。
+
+    校正时序回归系数 t 统计量的自相关偏误，避免 t 值系统性高估。
+    截断滞后 τ = max_lag 或 floor(T^(1/3))。
+    """
+    T = len(series)
+    if T < 2:
+        return 0.0
+    m = mean(series)
+    var = sum((x - m) ** 2 for x in series) / T
+    if var == 0:
+        return 0.0
+    if max_lag is None:
+        max_lag = max(1, int(T ** (1 / 3)))
+    max_lag = min(max_lag, T - 1)
+    nw = var
+    for lag in range(1, max_lag + 1):
+        w = 1.0 - lag / (max_lag + 1.0)
+        cov = sum((series[t] - m) * (series[t - lag] - m) for t in range(lag, T)) / T
+        nw += 2.0 * w * cov
+    return math.sqrt(max(nw, 0.0) / T)
+
+
 class FactorRegressionBody(BaseModel):
     board: str = "all"
     boards: list[str] | None = None
@@ -815,7 +853,7 @@ class FactorRegressionBody(BaseModel):
 
 
 @router.post("/factor-regression")
-async def run_factor_regression(body: FactorRegressionBody):
+async def run_factor_regression(body: FactorRegressionBody, uid: int = Depends(require_user_id)):
     """多因子横截面回归（Fama-MacBeth 风格）：每个再平衡日用截面因子暴露对未来收益做多元回归，
     得到各因子的时序收益率，据此评估因子长期是否显著有效（均值/t 统计量/胜率）。"""
     keys = list(dict.fromkeys(k for k in body.factors if k in FACTORS))
@@ -870,6 +908,7 @@ async def run_factor_regression(body: FactorRegressionBody):
         arr = kline_to_arrays(kl)
         fr_cache[code] = {
             "closes": arr["close"],
+            "opens": arr["open"] if "open" in arr else arr["close"],
             "volumes": arr["volume"],
             "series": {k: compute_factor_series(k, arr) for k in keys},
             "kline": kl,
@@ -902,7 +941,10 @@ async def run_factor_regression(body: FactorRegressionBody):
             vols = cc["volumes"]
             if any(vols[j] == 0 for j in range(i, i + n + 1)):
                 continue
-            fret = closes[i + n] / closes[i] - 1
+            # T+1 入场收益：用次日开盘买入，可实盘复现
+            opens = cc["opens"]
+            t1_entry = float(opens[i + 1]) if i + 1 < len(opens) else float(closes[i])
+            fret = float(closes[i + n] / t1_entry - 1) if t1_entry > 0 else 0.0
             xs_rows.append(fvs)
             ys.append(fret)
         if len(xs_rows) < min_sample:
@@ -924,7 +966,9 @@ async def run_factor_regression(body: FactorRegressionBody):
         vals = [p["coefs"][k] for p in periods]
         m = mean(vals)
         s = std(vals) if len(vals) > 1 else 0.0
-        t_stat = 0.0 if s == 0 else m / (s / math.sqrt(len(vals)))
+        # Newey-West 自相关校正：时序列回归系数非独立，OLS t 值偏乐观
+        se = _newey_west_se(vals) if len(vals) > 1 else s
+        t_stat = 0.0 if (se or 0) == 0 else m / se
         pos_rate = sum(1 for v in vals if v > 0) / len(vals)
         summary.append({
             "key": k, "label": FACTORS[k]["label"],

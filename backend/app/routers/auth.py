@@ -13,9 +13,10 @@ class Credentials(BaseModel):
 
 
 @router.post("/register")
-def register(body: Credentials):
+def register(body: Credentials, request: Request):
     try:
-        return auth.register_user(body.username, body.password)
+        ip = request.client.host if request.client else ""
+        return auth.register_user(body.username, body.password, client_ip=ip)
     except ValueError as e:
         raise HTTPException(400, str(e))
 

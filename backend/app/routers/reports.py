@@ -34,7 +34,7 @@ def _payload_from_body(body: ExportBody) -> dict:
 
 
 @router.post("/backtest")
-def export_backtest(body: ExportBody):
+def export_backtest(body: ExportBody, uid: int = Depends(require_user_id)):
     """回测报告导出：html（含图表）/ excel / pdf。"""
     payload = _payload_from_body(body)
     fmt = body.format
@@ -105,14 +105,14 @@ def regenerate_report(run_id: int, fmt: str = "html", uid: int = Depends(require
 @router.delete("/runs/{run_id}")
 def delete_report(run_id: int, uid: int = Depends(require_user_id)):
     run = _get_run(run_id, uid)
+    if not db.delete_backtest_run(run_id, user_id=uid):
+        raise HTTPException(404, "报告记录不存在")
     path = run.get("report_path")
     if path:
         try:
             os.remove(os.path.join(reporting.REPORT_DIR, path))
         except OSError:
             pass
-    if not db.delete_backtest_run(run_id, user_id=uid):
-        raise HTTPException(404, "报告记录不存在")
     return {"ok": True}
 
 

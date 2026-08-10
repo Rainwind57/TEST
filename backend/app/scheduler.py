@@ -403,6 +403,8 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
 
     # 买单：等权分配，最多 5 笔
     max_buy = min(len(buy_signals), 5)
+    COMM = 0.00025   # 佣金
+    STAMP = 0.001    # 印花税
     if max_buy > 0:
         per_buy_cash = min(cash * 0.2, cash / max_buy)
         for sig in buy_signals[:max_buy]:
@@ -417,23 +419,24 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             if qty < 100:
                 continue
             amount = q["price"] * qty
+            cost = amount * COMM
             conn = db.get_conn()
             cur = conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
             cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-            if amount > cur_cash:
+            if amount + cost > cur_cash:
                 conn.close()
                 continue
-            new_cash = cur_cash - amount
+            new_cash = cur_cash - amount - cost
             existing = cur.execute("SELECT * FROM positions WHERE code = ?", (sig["code"],)).fetchone()
             if existing:
                 new_qty = existing["qty"] + qty
-                new_avg = (existing["avg_cost"] * existing["qty"] + amount) / new_qty
+                new_avg = (existing["avg_cost"] * existing["qty"] + amount + cost) / new_qty
                 cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=? WHERE code=?",
                            (new_qty, new_avg, q["name"], sig["code"]))
             else:
                 cur.execute("INSERT INTO positions (code, name, qty, avg_cost) VALUES (?, ?, ?, ?)",
-                           (sig["code"], q["name"], qty, q["price"]))
+                           (sig["code"], q["name"], qty, q["price"] + cost / qty))
             cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
             cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "buy", sig["code"],
@@ -466,7 +469,8 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             conn.close()
             continue
         cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
-        new_cash = cur_cash + amount
+        sell_cost = amount * (COMM + STAMP)
+        new_cash = cur_cash + amount - sell_cost
         remain = cur_pos["qty"] - sell_qty
         if remain <= 0:
             cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))

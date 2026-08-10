@@ -7,6 +7,7 @@ import io
 import os
 import datetime
 import logging
+import uuid
 
 from . import db
 
@@ -45,6 +46,10 @@ def _echarts_script_tag() -> str:
 REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
 
+
+def _htmlescape(s: str) -> str:
+    """HTML 实体转义：防止用户输入注入脚本。"""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
 
 def _fmt(v, pct=False):
     if v is None:
@@ -104,19 +109,19 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     warnings = []
     sw = payload.get("snapshotWarning", "")
     if sw:
-        warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 前视偏差警告：{sw}</div>')
+        warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 前视偏差警告：{_htmlescape(sw)}</div>')
     sb = payload.get("survivorshipBiasWarning", "")
     if sb:
-        warnings.append(f'<div class="warn-banner">⚠️ 生存偏差：{sb}</div>')
+        warnings.append(f'<div class="warn-banner">⚠️ 生存偏差：{_htmlescape(sb)}</div>')
     lo = payload.get("longOnly", True)
     if lo:
         note = payload.get("longOnlyNote", "")
         if note:
-            warnings.append(f'<div class="info-banner">📌 {note}</div>')
+            warnings.append(f'<div class="info-banner">📌 {_htmlescape(note)}</div>')
     else:
         note = payload.get("longShortNote", "")
         if note:
-            warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ {note}</div>')
+            warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ {_htmlescape(note)}</div>')
 
     model_meta = payload.get("_modelMeta")
 
@@ -200,8 +205,8 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
         f'{model_html}'
         f'<div class="card"><h3>回测概要</h3><table class="summary-table">'
         f'<tr><td>调仓方式</td><td colspan="3">{rebalance_desc}</td></tr>'
-        f'<tr><td>策略来源</td><td>{strategy_kind}</td>'
-        f'<td>策略名/模型ID</td><td>{strategy_name}</td></tr>'
+    f'<tr><td>策略来源</td><td>{_htmlescape(strategy_kind)}</td>'
+    f'<td>策略名/模型ID</td><td>{_htmlescape(strategy_name)}</td></tr>'
         f'<tr><td>回测区间</td><td>{start} ~ {end}</td>'
         f'<td>历史长度(hist)</td><td>{hist_val}</td></tr>'
         f'<tr><td>持有期(n)</td><td>{n_val}</td>'
@@ -554,7 +559,7 @@ def store_backtest_report(result: dict, config: dict | None = None,
             return None
         html = render_html(payload)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"report_{ts}.html"
+        fname = f"report_{ts}_{uuid.uuid4().hex[:6]}.html"
         path = os.path.join(REPORT_DIR, fname)
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)

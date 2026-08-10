@@ -1,8 +1,9 @@
 """分钟级回测路由：单股日内策略回测。"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from .. import intraday
+from .auth import require_user_id
 
 router = APIRouter(prefix="/api/intraday", tags=["intraday"])
 
@@ -26,7 +27,7 @@ class IntradayBody(BaseModel):
 
 
 @router.post("/backtest")
-async def backtest(body: IntradayBody):
+async def backtest(body: IntradayBody, uid: int = Depends(require_user_id)):
     if not body.code and not body.codes:
         raise HTTPException(400, "code（单股）或 codes（组合）至少提供一个")
     if body.takeProfit <= 0:
