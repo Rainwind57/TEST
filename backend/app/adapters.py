@@ -1332,16 +1332,26 @@ async def _fetch_tencent_minute(code: str) -> list[dict]:
            f"_var=min_data&code={secid}")
     resp = await _http_get(url, 8)
     text = resp.content.decode("gbk", errors="ignore")
-    # 腾讯返回格式: min_data={"code":"sh600000","data":{"2026-08-07":{"data":[...]}}}
+    # 腾讯返回格式: min_data={"code":"sh600000","data":{"20260807":{"data":[...]}}}
     try:
         start = text.index("{")
         end = text.rindex("}") + 1
         obj = json.loads(text[start:end])
-        data = obj.get("data") or {}
-        today = sorted(data.keys())[-1] if data else ""
-        rows = data.get(today, {}).get("data", []) if today else []
     except Exception:
         return []
+    # 从嵌套结构中提取数据：obj["data"] 可能是 {code: {日期: {data: [...]}}} 或 {日期: {data: [...]}}
+    raw_data = obj.get("data") or {}
+    # 若最外层 key 是股票代码名（如 "sh600000"），再往内取一层
+    if code in raw_data and isinstance(raw_data.get(code), dict):
+        raw_data = raw_data[code]
+    # 取最新一个日期的分时数据
+    today = sorted(raw_data.keys())[-1] if raw_data else ""
+    rows = raw_data.get(today, {}).get("data", []) if today else []
+    # 统一日期格式为 YYYY-MM-DD（上游可能返回 YYYYMMDD 无连接符格式）
+    if today and len(today) == 8 and today.isdigit():
+        today_fmt = f"{today[:4]}-{today[4:6]}-{today[6:8]}"
+    else:
+        today_fmt = today
     # 腾讯分时格式: "0930 12.50 1000" (time price volume)
     out = []
     for item in rows:
@@ -1349,7 +1359,7 @@ async def _fetch_tencent_minute(code: str) -> list[dict]:
         if len(parts) >= 2:
             try:
                 out.append({
-                    "day": f"{today} {parts[0][:2]}:{parts[0][2:4]}:00",
+                    "day": f"{today_fmt} {parts[0][:2]}:{parts[0][2:4]}:00",
                     "close": parts[1],
                     "volume": parts[2] if len(parts) > 2 else "0",
                 })
@@ -1367,7 +1377,10 @@ def _parse_minute_bars(arr: list[dict]) -> list[dict]:
     for row in arr:
         try:
             day_str = row["day"][:10]
-            if day_str != today_str:
+            # 统一无连接符格式 (20260807) 与 ISO 格式 (2026-08-07) 的比对
+            day_str_norm = day_str.replace("-", "")
+            today_norm = today_str.replace("-", "")
+            if day_str_norm != today_norm:
                 continue
             prc = float(row["close"])
             vol = float(row["volume"])

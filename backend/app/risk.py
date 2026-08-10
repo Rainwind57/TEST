@@ -1,9 +1,12 @@
 """Barra 风格风险模型：多因子方差分解归因。
 
-简化版（不依赖外部 Barra 数据）：
 - 风格因子：动量、波动率、市值、估值（PE/PB 倒数）、换手率
-- 对组合收益做因子回归，分解为 风格贡献 + 残差（特质风险）
+- 行业因子：申万行业哑变量（动态从行情源拉取）
+- 对组合收益做因子回归，分解为 风格贡献 + 行业贡献 + 残差（特质风险）
 - 输出各风格因子暴露、贡献、残差波动
+
+注意：turnover/ep/bp/size 仍用当日快照（数据源不提供历史时序），
+前视风险已在 snapshotWarning 中明示。行业因子使用最新分类，同样属快照。
 """
 import numpy as np
 from collections import defaultdict
@@ -21,14 +24,63 @@ STYLE_LABELS = {
     "ep": "盈利收益率", "bp": "账面市值比", "size": "市值(对数)",
 }
 
+# 行业因子：动态填充，构建面板时根据 sector_map 确定
+INDUSTRY_FACTORS: list[str] = []
+INDUSTRY_LABELS: dict[str, str] = {}
 
-def build_style_panel(stock_data: list[dict], n: int = 1) -> tuple[np.ndarray, list[str], np.ndarray, list[str]]:
+
+async def _build_industry_factors(codes: list[str]) -> dict[str, list[float]]:
+    """拉取行业映射并构建行业哑变量列定义。
+
+    返回 {code: [dummy_values...]}；INDUSTRY_FACTORS / INDUSTRY_LABELS 被填充。
+    失败时返回空 dict，行业因子被跳过（退化为纯风格模型）。
+    """
+    global INDUSTRY_FACTORS, INDUSTRY_LABELS
+    try:
+        from . import adapters
+        sector_map = await adapters.fetch_sector_map()
+        if not sector_map:
+            return {}
+        unique = sorted(set(s for s in sector_map.values() if s))
+        if not unique:
+            return {}
+        INDUSTRY_FACTORS = [f"industry_{i}" for i in range(len(unique))]
+        INDUSTRY_LABELS = {f"industry_{i}": s for i, s in enumerate(unique)}
+        idx = {s: i for i, s in enumerate(unique)}
+        out = {}
+        for code in codes:
+            s = sector_map.get(code, "")
+            row = [0.0] * len(unique)
+            if s in idx:
+                row[idx[s]] = 1.0
+            out[code] = row
+        return out
+    except Exception:
+        INDUSTRY_FACTORS = []
+        INDUSTRY_LABELS = {}
+        return {}
+
+
+def all_factor_names() -> list[str]:
+    """当前完整因子名列表：风格 + 行业。"""
+    return STYLE_FACTORS + INDUSTRY_FACTORS
+
+
+def all_factor_labels() -> dict[str, str]:
+    """当前完整因子 label 映射。"""
+    out = dict(STYLE_LABELS)
+    out.update(INDUSTRY_LABELS)
+    return out
+
+
+async def build_style_panel(stock_data: list[dict], n: int = 1) -> tuple[np.ndarray, list[str], np.ndarray, list[str]]:
     """Fama-MacBeth 时序面板：对每个历史截面回归得因子收益 beta_t。
 
     返回 (betas, factor_names, last_X, last_codes)：
     - betas: (n_periods, n_factors) 因子收益时序，用于估计因子收益协方差
     - last_X / last_codes: 最新截面暴露矩阵，用于组合归因
     turnover/ep/bp/size 无历史时序，用最新快照近似（已知简化）。
+    行业因子使用最新分类映射到所有历史截面（快照）。
     """
     import math
     series = []
@@ -51,17 +103,21 @@ def build_style_panel(stock_data: list[dict], n: int = 1) -> tuple[np.ndarray, l
                        "turnover": turnover, "ep": 1.0 / pe, "bp": 1.0 / pb,
                        "size": s_size})
     if len(series) < 3:
-        return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
+        return np.zeros((0, 0)), all_factor_names(), np.zeros((0, 0)), []
+
+    # 行业哑变量（快照）：对所有 series 中的 code 一次性构建
+    industry_dummies = await _build_industry_factors([s["code"] for s in series])
 
     # 按日期对齐构建截面：收集所有日期，取公共区间内每日的因子值+收益
     date_to_rows = defaultdict(lambda: {"rows": [], "rets": [], "codes": [], "d": ""})
     all_dates = sorted({k["date"] for s in stock_data for k in s.get("kline", []) if k.get("date")})
     if len(all_dates) < 30:
-        return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
+        return np.zeros((0, 0)), all_factor_names(), np.zeros((0, 0)), []
 
     date_to_idx = {d: i for i, d in enumerate(all_dates)}
     for s in series:
         kline = next((st["kline"] for st in stock_data if st["code"] == s["code"]), [])
+        ind_row = industry_dummies.get(s["code"], [])
         for ki, kbar in enumerate(kline):
             d = kbar.get("date", "")
             if d not in date_to_idx:
@@ -73,26 +129,32 @@ def build_style_panel(stock_data: list[dict], n: int = 1) -> tuple[np.ndarray, l
             v = series_at(s["vol"], ki)
             if m is None or v is None or s["closes"][ki] == 0:
                 continue
-            row = [m, v, s["turnover"], s["ep"], s["bp"], s["size"] or 0.0]
+            row = [m, v, s["turnover"], s["ep"], s["bp"], s["size"] or 0.0] + ind_row
             date_to_rows[d]["rows"].append(row)
             date_to_rows[d]["rets"].append(s["closes"][ki + n] / s["closes"][ki] - 1.0)
             date_to_rows[d]["codes"].append(s["code"])
             date_to_rows[d]["d"] = d
 
     betas = []
-    last_X = np.zeros((0, len(STYLE_FACTORS)))
+    last_X = np.zeros((0, len(all_factor_names())))
     last_codes: list[str] = []
     for d in sorted(date_to_rows):
         entry = date_to_rows[d]
         if len(entry["rows"]) < 10:
             continue
-        X_t = _zscore_cols(np.array(entry["rows"], dtype=np.float64))
+        raw = np.array(entry["rows"], dtype=np.float64)
+        X_t_style = _zscore_cols(raw[:, :len(STYLE_FACTORS)])
+        if INDUSTRY_FACTORS:
+            X_t_ind = raw[:, len(STYLE_FACTORS):]
+            X_t = np.column_stack([X_t_style, X_t_ind])
+        else:
+            X_t = X_t_style
         betas.append(cross_section_regression(X_t, np.array(entry["rets"], dtype=np.float64)))
         last_X, last_codes = X_t, entry["codes"]
 
     if not betas or last_X.size == 0:
-        return np.zeros((0, 0)), STYLE_FACTORS, np.zeros((0, 0)), []
-    return np.array(betas, dtype=np.float64), STYLE_FACTORS, last_X, last_codes
+        return np.zeros((0, 0)), all_factor_names(), np.zeros((0, 0)), []
+    return np.array(betas, dtype=np.float64), all_factor_names(), last_X, last_codes
 
 
 def _zscore_cols(X: np.ndarray) -> np.ndarray:
@@ -231,7 +293,7 @@ def estimate_specific_variances(stock_data: list[dict], X: np.ndarray, codes: li
         Xt = _zscore_cols(np.array(xrows, dtype=np.float64))
         rt = np.array(rets, dtype=np.float64)
         resid = rt - Xt @ factor_returns
-        sigmas[i] = float(np.var(resid, ddof=k + 1))
+        sigmas[i] = float(np.var(resid, ddof=Xt.shape[1] + 1))
         fallback_vals.append(sigmas[i])
     mean_v = float(np.mean(fallback_vals)) if fallback_vals else 0.0
     sigmas = np.where(sigmas > 0, sigmas, mean_v)

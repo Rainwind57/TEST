@@ -17,6 +17,11 @@ const modelId = ref('')
 const modelOptions = ref([])
 const savingCfg = ref(false)
 const scanning = ref(false)
+// 盯盘评分口径：isolated=孤立打分 / full=全池排名分位（与选股口径一致）
+const ranking = ref('isolated')
+// 自动调仓开关：默认关闭，开启后信号触发自动买卖
+const autoTrade = ref(false)
+const savingAutoTrade = ref(false)
 
 async function loadStatus() {
   try {
@@ -27,8 +32,16 @@ async function loadStatus() {
     if (s.config) {
       mode.value = s.config.mode || 'rule'
       modelId.value = s.config.modelId || ''
+      ranking.value = s.config.ranking || 'isolated'
     }
   } catch (e) { toast(e.message) }
+}
+
+async function loadAutoTrade() {
+  try {
+    const r = await api.get('/monitor/auto-trade')
+    autoTrade.value = !!r.autoTrade
+  } catch (e) { /* 静默，旧后端可能无此接口 */ }
 }
 
 async function loadModels() {
@@ -40,10 +53,24 @@ async function saveConfig() {
   if (mode.value === 'model' && !modelId.value) { toast('模型模式下请先选择模型'); return }
   savingCfg.value = true
   try {
-    const cfg = await api.post('/monitor/config', { mode: mode.value, modelId: modelId.value })
-    toast(cfg.mode === 'model' ? `信号引擎已切换为模型 ${cfg.modelId}` : '信号引擎已切换为内置规则')
+    const cfg = await api.post('/monitor/config', {
+      mode: mode.value,
+      modelId: modelId.value,
+      ranking: ranking.value
+    })
+    toast(cfg.mode === 'model' ? `信号引擎已切换为模型 ${cfg.modelId}（口径：${cfg.ranking === 'full' ? '全池排名' : '孤立打分'}）` : '信号引擎已切换为内置规则')
   } catch (e) { toast(e.message) }
   finally { savingCfg.value = false }
+}
+
+async function toggleAutoTrade() {
+  savingAutoTrade.value = true
+  try {
+    const r = await api.post('/monitor/auto-trade', { enabled: autoTrade.value })
+    autoTrade.value = r.autoTrade
+    toast(autoTrade.value ? '自动调仓已开启：信号将自动生成买卖单（模拟盘）' : '自动调仓已关闭')
+  } catch (e) { toast(e.message); autoTrade.value = !autoTrade.value }
+  finally { savingAutoTrade.value = false }
 }
 
 async function loadEquity() {
@@ -74,7 +101,7 @@ async function scanNow() {
 }
 
 async function refresh() {
-  await Promise.all([loadStatus(), loadEquity()])
+  await Promise.all([loadStatus(), loadEquity(), loadAutoTrade()])
 }
 
 const equityOption = computed(() => {
@@ -104,7 +131,7 @@ onMounted(() => { refresh(); loadModels() })
         <span class="hint" v-else>已关闭</span>
       </div>
       <div class="warn-box">
-        自动调仓仅限模拟盘，默认开启（重启保持状态）。交易日历基于K线数据动态推断，非周末且不在节假日则执行。
+        自动调仓仅限模拟盘，默认关闭。交易日历基于K线数据动态推断，非周末且不在节假日则执行。
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>信号引擎</label>
@@ -119,12 +146,26 @@ onMounted(() => { refresh(); loadModels() })
             <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ m.id }}</option>
           </select>
         </div>
+        <div v-if="mode === 'model'" class="field"><label>评分口径</label>
+          <select v-model="ranking" :title="ranking === 'full' ? '全池排名分位，与选股口径一致' : '各股孤立打分'">
+            <option value="isolated">孤立打分</option>
+            <option value="full">全池排名分位</option>
+          </select>
+        </div>
         <button class="btn-ghost" :disabled="savingCfg" @click="saveConfig">{{ savingCfg ? '保存中…' : '保存配置' }}</button>
         <button class="btn-ghost" :disabled="scanning" @click="scanNow">{{ scanning ? '扫描中…' : '立即扫描' }}</button>
         <button class="btn-primary" :disabled="loading" @click="toggle">
           {{ enabled ? '停止调度' : '开启调度' }}
         </button>
         <button class="btn-ghost" @click="refresh">刷新</button>
+      </div>
+      <div class="auto-trade-row">
+        <label class="switch-label">
+          <input type="checkbox" v-model="autoTrade" :disabled="savingAutoTrade" @change="toggleAutoTrade" />
+          <span>自动调仓</span>
+        </label>
+        <span class="hint" v-if="autoTrade">已开启：信号将自动生成买卖单（模拟盘）</span>
+        <span class="hint" v-else>未开启：仅生成信号，不自动下单</span>
       </div>
       <div v-if="lastRun" class="status-row">
         <span>上次执行：{{ lastRun.task }} · {{ fmtTime(lastRun.ts) }}</span>
@@ -170,4 +211,7 @@ onMounted(() => { refresh(); loadModels() })
 .tag { background: var(--accent); color: white; padding: 2px 8px; border-radius: 8px; font-size: 12px; }
 .muted { color: var(--text-mute); }
 .empty-hint { color: var(--text-mute); font-size: 13px; padding: 16px 0; }
+.auto-trade-row { margin-top: 12px; display: flex; align-items: center; gap: 12px; font-size: 13px; }
+.switch-label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.switch-label input { width: 16px; height: 16px; cursor: pointer; }
 </style>

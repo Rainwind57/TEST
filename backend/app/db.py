@@ -8,10 +8,11 @@ INIT_CASH = 1_000_000.0
 
 DEFAULT_CODES = ["sh600519", "sz000001", "sz300750", "sh601318"]
 
-# 不可交易代码黑名单：以 sh/sz 前缀 + 数字段判定
+# 不可交易代码过滤：仅排除指数（sh000xxx/sz399xxx）和 ETF（sh51xxxx/sh56xxxx/sh58xxxx/sz15xxxx）
 import re as _re
-_INDEX_PATTERN = _re.compile(r"^(sh|sz)0{3,4}\d{2,3}$")
-_ETF_PATTERN = _re.compile(r"^(sh|sz)5[0-9]{4}$")
+_INDEX_PATTERN = _re.compile(r"^(sh000|sz399)\d{3,4}$")
+# ETF：沪市 51/56/58 开头 6 位，深市 15 开头 6 位
+_ETF_PATTERN = _re.compile(r"^(sh5[168]|sz15)\d{4}$")
 
 
 def is_tradable(code: str) -> bool:

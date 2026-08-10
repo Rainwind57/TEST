@@ -129,18 +129,33 @@ async def estimate_mu_cov(body: EstimateBody):
         raise HTTPException(422, "有效股票历史不足，请增大 hist 或更换代码")
 
     codes_valid = [c for c in body.codes if c in series]
-    min_len = min(len(series[c]) for c in codes_valid)
-    closes = {c: [k["close"] for k in series[c][:min_len]] for c in codes_valid}
+    # 按日期对齐而非按序列头部对齐：各股上市/停牌日期不一致时，头部截断会错位
+    # 收集 (code → {date: close})，取所有股票公共交易日，按日期重排收益序列
+    date_close = {c: {k["date"]: k["close"] for k in series[c] if k.get("date") and k.get("close")} for c in codes_valid}
+    common_dates = sorted(set.intersection(*[set(d.keys()) for d in date_close.values()])) if date_close else []
+    if len(common_dates) < 30:
+        raise HTTPException(422, "公共交易日不足，各股历史区间差异过大")
 
     ret_matrix = []
-    for i in range(1, min_len):
-        if any(closes[c][i - 1] == 0 for c in codes_valid):
+    prev_close = {c: date_close[c][common_dates[0]] for c in codes_valid}
+    for d in common_dates[1:]:
+        row = []
+        skip = False
+        for c in codes_valid:
+            pc = prev_close.get(c)
+            cc = date_close[c].get(d)
+            if not pc or not cc:
+                skip = True
+                break
+            row.append(cc / pc - 1)
+            prev_close[c] = cc
+        if skip:
             continue
-        ret_matrix.append([closes[c][i] / closes[c][i - 1] - 1 for c in codes_valid])
+        ret_matrix.append(row)
     if len(ret_matrix) < 20:
         raise HTTPException(422, "有效收益样本不足")
 
     R = np.array(ret_matrix, dtype=np.float64)
     mu = R.mean(axis=0) * 252
     cov = np.cov(R, rowvar=False) * 252
-    return {"codes": codes_valid, "mu": mu.tolist(), "cov": cov.tolist()}
+    return {"codes": codes_valid, "mu": mu.tolist(), "cov": cov.tolist(), "alignedDays": len(ret_matrix)}

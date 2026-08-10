@@ -96,4 +96,10 @@ async def get_timeshare(code: str):
         data = await adapters.fetch_time_share(code)
     except Exception as e:
         raise HTTPException(502, f"分时数据请求失败: {e}")
+    if not data:
+        import datetime
+        now = datetime.datetime.now()
+        is_trading = now.weekday() < 5 and datetime.time(9, 15) <= now.time() <= datetime.time(15, 0)
+        hint = "当日分时数据为空，可能原因：非交易日、盘前盘后时段、或数据源暂不可用" if not is_trading else "当日暂无分时数据，请确认股票代码有效且处于交易时段"
+        return {"code": code, "data": data, "warning": hint}
     return {"code": code, "data": data}

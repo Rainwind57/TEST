@@ -388,6 +388,18 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
                 boards=body.boards,
             )
             res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
+            # 注入模型元数据到 config，使报告 HTML 能渲染模型详情块
+            try:
+                from .. import ml as _ml_mod
+                mb = _ml_mod._load_model(body.modelId)
+                res["config"]["_modelMeta"] = {
+                    "modelType": mb.get("model_type", "gbdt"),
+                    "featureNames": mb.get("feature_names", []),
+                    "bestParams": mb.get("preprocess", {}).get("params", {}),
+                    "featureImportance": mb.get("importance", []),
+                }
+            except Exception:
+                pass
             if body.saveArtifact:
                 from .. import artifacts
                 meta = artifacts.save_artifact("backtest", res,
@@ -958,18 +970,23 @@ async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
     if body.action == "buy":
         if not body.totalCash or body.totalCash <= 0:
             raise HTTPException(400, "请提供买入总资金 totalCash")
-        per_code_cash = body.totalCash / len(body.codes)
         codes = [c.strip().lower() for c in body.codes if db.is_tradable(c.strip().lower())]
         if not codes:
             return {"ok": False, "results": [], "reason": "所有代码均为不可交易标的（指数/ETF）"}
+        # 按排名权重分配资金：排名越靠前权重越高（单调递减），分母用过滤后股票数
+        n_codes = len(codes)
+        # 排名权重：rank 1 权重最高 = n_codes，rank N 权重 = 1，总和 = n_codes*(n_codes+1)/2
+        rank_weights = [n_codes - i for i in range(n_codes)]
+        total_weight = sum(rank_weights)
         quotes = await adapters.fetch_tencent_quotes(codes)
         results = []
         bought_codes = []
-        for code in codes:
+        for idx, code in enumerate(codes):
             q = quotes.get(code)
             if not q or not q.get("price"):
                 results.append({"code": code, "ok": False, "reason": "无行情"})
                 continue
+            per_code_cash = body.totalCash * rank_weights[idx] / total_weight
             qty = int(per_code_cash / q["price"] // 100) * 100
             if qty <= 0:
                 results.append({"code": code, "ok": False, "reason": "资金不足一手"})

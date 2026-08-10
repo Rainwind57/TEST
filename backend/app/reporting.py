@@ -118,19 +118,27 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
         if note:
             warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ {note}</div>')
 
+    model_meta = payload.get("_modelMeta")
+
     # 因子说明块（技术因子回测无模型详情时，补充因子定义/方向/逻辑）
     factor_html = ""
     if not model_meta and payload.get("factorLabel"):
-        factor_key = payload.get("factorLabel", "")
+        factor_label = payload.get("factorLabel", "")
+        factor_display_label = factor_label
         try:
             from .factors import FACTORS, SNAPSHOT_FACTORS
+            # 优先用 config 中的英文因子 key 查表，退化为按中文 label 遍历匹配
+            factor_key = cfg.get("factor", "")
             fdef = FACTORS.get(factor_key) or SNAPSHOT_FACTORS.get(factor_key)
+            if not fdef:
+                all_factors = {**FACTORS, **SNAPSHOT_FACTORS}
+                fdef = next((v for v in all_factors.values() if v.get("label") == factor_label), None)
         except Exception:
             fdef = None
         if fdef:
             factor_html = (
                 f'<div class="card"><h3>因子说明</h3><table class="summary-table">'
-                f'<tr><td>因子名称</td><td>{fdef.get("label", factor_key)}</td>'
+                f'<tr><td>因子名称</td><td>{fdef.get("label", factor_display_label)}</td>'
                 f'<td>方向</td><td>{fdef.get("direction", "-")}</td></tr>'
                 f'<tr><td>分组</td><td>{fdef.get("group", "-")}</td>'
                 f'<td>窗口</td><td>{fdef.get("window", "-")}</td></tr>'
@@ -138,7 +146,6 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
             )
 
     # 模型详情块
-    model_meta = payload.get("_modelMeta")
     model_html = ""
     if model_meta:
         model_type = model_meta.get("modelType", "gbdt")

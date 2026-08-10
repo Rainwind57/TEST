@@ -13,6 +13,7 @@ const klineData = ref([])
 const klineDays = ref(500)
 const klineFreq = ref('D')
 const timeshareData = ref([])
+const timeshareWarning = ref('')
 let timer = null
 let refreshing = false
 
@@ -144,11 +145,12 @@ async function loadKline() {
 }
 
 async function loadTimeshare() {
-  if (!store.activeCode) { timeshareData.value = []; return }
+  if (!store.activeCode) { timeshareData.value = []; timeshareWarning.value = ''; return }
   try {
     const res = await api.get('/timeshare', { params: { code: store.activeCode } })
-    timeshareData.value = res.data
-  } catch (e) { timeshareData.value = [] }
+    timeshareData.value = res.data || []
+    timeshareWarning.value = res.warning || ''
+  } catch (e) { timeshareData.value = []; timeshareWarning.value = e.message || '分时数据请求失败' }
 }
 
 const klineOption = computed(() => {
@@ -387,7 +389,7 @@ onUnmounted(() => clearInterval(timer))
       </div>
       <template v-if="klineFreq === '分时'">
         <EChart v-if="timeshareData.length" :option="timeshareOption" height="520px" />
-        <div v-else class="empty-hint">暂无分时数据</div>
+        <div v-else class="empty-hint">{{ timeshareWarning || '暂无分时数据' }}</div>
       </template>
       <template v-else>
         <EChart v-if="klineData.length" :option="klineOption" :height="chartHeight + 'px'" />

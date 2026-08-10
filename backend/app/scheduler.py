@@ -10,6 +10,7 @@
 """
 import asyncio
 import datetime
+import logging
 import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -18,6 +19,8 @@ from . import db, adapters
 from .routers import portfolio as pf
 from .factors import FACTORS
 from .numpy_factors import kline_to_arrays, compute_factor_series, series_at
+
+logger = logging.getLogger(__name__)
 
 _scheduler: AsyncIOScheduler | None = None
 _enabled = False
@@ -437,6 +440,8 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
                         q["name"], qty, q["price"], amount))
             conn.commit()
             conn.close()
+            # 记录净值快照，保持 equity_history 连续
+            _record_auto_equity()
 
     # 卖单：平仓全平，减仓卖 50%，最多 5 笔
     max_sell = min(len(sell_signals), 5)
@@ -473,5 +478,27 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
                     pos.get("name", sig["code"]), sell_qty, price, amount))
         conn.commit()
         conn.close()
+        _record_auto_equity()
 
     db.log_scheduler_run("auto_trade", True, {"buyCount": max_buy, "sellCount": max_sell})
+
+
+def _record_auto_equity():
+    """自动调仓后记录净值快照，保持 equity_history 与手工下单一致。"""
+    try:
+        conn = db.get_conn()
+        state = conn.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()
+        if not state:
+            conn.close()
+            return
+        cash = state["cash"]
+        positions = conn.execute("SELECT code, qty, avg_cost FROM positions").fetchall()
+        # 自动调仓时用最近交易价估算市值（无需额外网络请求）
+        mkt_val = sum(p["avg_cost"] * p["qty"] for p in positions)
+        total = cash + mkt_val
+        conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
+                     (datetime.datetime.now().isoformat(), total))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass

@@ -35,7 +35,7 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
             return {"code": code, "quote": quotes.get(code, {}), "kline": kline}
     stock_data = await asyncio.gather(*(one(c) for c in codes))
 
-    betas, factor_names, X, codes_valid = risk.build_style_panel(stock_data)
+    betas, factor_names, X, codes_valid = await risk.build_style_panel(stock_data)
     if X.size == 0 or betas.size == 0:
         raise HTTPException(422, "有效组合样本不足，无法构建风格面板（需≥3只且历史≥30日）")
 
@@ -88,6 +88,7 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
         "droppedCodes": dropped_codes,
         "snapshotWarning": snapshot_warning,
         "factorNames": factor_names,
+        "factorLabels": risk.all_factor_labels(),
         "exposures": attr["exposures"],
         "factorContribution": attr["factorContribution"],
         "totalReturn": attr["total"],

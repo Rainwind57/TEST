@@ -2,6 +2,10 @@
 
 job 元数据持久化到 SQLite（jobs 表），重启后历史可查、多 worker 可共享；
 asyncio Task 句柄仅存内存（重启即丢，asyncio 固有限制，对已入库的终态记录无影响）。
+
+取消机制：cancel() 同时触发 Task.cancel()（向 coro 投递 CancelledError）
+和置 cancel_ev。coro 应在长时间循环中调用 is_cancelled(jid) 轮询，
+避免长时间同步阻塞段无法及时响应取消。
 """
 import asyncio
 import datetime
@@ -36,6 +40,15 @@ def update_job(jid: str, **fields):
     db.update_job_row(jid, **fields)
     if fields.get("status") in ("done", "error", "cancelled"):
         db.prune_old_jobs(MAX_JOBS)
+
+
+def is_cancelled(jid: str) -> bool:
+    """长任务在循环中调用，检查是否被取消。
+
+    返回 True 时应主动 raise asyncio.CancelledError() 或 break。
+    """
+    ev = _cancel_events.get(jid)
+    return bool(ev and ev.is_set())
 
 
 def _runner(jid: str, coro, cancel_ev: threading.Event | None = None):
