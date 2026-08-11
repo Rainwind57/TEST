@@ -1122,7 +1122,14 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
 
     date_maps = {code: {row["date"]: i for i, row in enumerate(kl)} for code, kl in series.items()}
 
-    for t in range(60, len(ref_dates) - n, max(1, n)):
+    # 长历史自适应步长：最多 200 个调仓日，n<10 时调仓密度足够；过密则自动扩大步长
+    total_dates = len(ref_dates) - 60 - n
+    step = max(n, total_dates // max(1, min(200, total_dates // 3)))
+    step = max(1, min(step, 60))  # 步长上限 60 交易日
+    if progress_cb:
+        progress_cb(0, (total_dates // step) + 1)
+    rebalance_idx = 0
+    for t in range(60, len(ref_dates) - n, step):
         date_t = ref_dates[t]
         # 验证区间过滤（分时段验证：调仓日只落在 [start_date, end_date] 内）
         if start_date and date_t < start_date:
@@ -1226,6 +1233,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                 if bi is not None and bi + n < len(bench_series):
                     bc = [row["close"] for row in bench_series]
                     bench_by_date[date_t] = bc[bi + n] / bc[bi] - 1
+
+        rebalance_idx += 1
+        if progress_cb and rebalance_idx % 10 == 0:
+            progress_cb(rebalance_idx, (total_dates // step) + 1)
 
     if not ic_series:
         raise ValueError(

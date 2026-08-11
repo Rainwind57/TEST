@@ -1294,139 +1294,74 @@ async def fetch_future_kline(code: str, days: int = 150) -> list[dict]:
 # ---------------- 分时图 ----------------
 
 _TIME_SHARE_CACHE: dict[str, tuple[float, list]] = {}
-_TIME_SHARE_TTL = 60  # 秒（盘中高频刷新）
+_TIME_SHARE_TTL = 30  # 秒（盘中高频刷新，每30s更新一次）
 
 
 async def fetch_time_share(code: str) -> list[dict]:
-    """拉取当日分时数据（1分钟价格+成交量+均价黄线）。
-
-    优先新浪，失败/指数降级腾讯。返回 [{time, price, volume, avgPrice}]。无数据返回 []。
-    """
+    """拉取当日分时数据。优先 1min（个股细腻），空则回退 5min（指数兼容）。"""
     cache_key = code
     cached = _TIME_SHARE_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < _TIME_SHARE_TTL:
         return cached[1]
 
-    # 指数代码（sh000xxx/sz399xxx）新浪无分钟数据，直接走腾讯 fallback
-    is_index = code.startswith(("sh0", "sz3"))
-    out = []
-
-    if not is_index:
+    arr = []
+    for scale, datalen in ((1, 240), (5, 48)):
         try:
             url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-                   f"CN_MarketData.getKLineData?symbol={code}&scale=1&datalen=240")
+                   f"CN_MarketData.getKLineData?symbol={code}&scale={scale}&datalen={datalen}")
             resp = await _http_get(url, 10, headers=_SINA_HEADERS)
             arr = resp.json() or []
+            if arr:
+                break
         except Exception:
-            arr = []
-    else:
-        arr = []
-
-    # 新浪失败 → 腾讯分时 fallback
-    if not arr:
-        try:
-            arr = await _fetch_tencent_minute(code)
-        except Exception:
-            arr = []
+            continue
 
     out = _parse_minute_bars(arr)
-    _TIME_SHARE_CACHE[cache_key] = (time.time(), out)
+    if out:
+        _TIME_SHARE_CACHE[cache_key] = (time.time(), out)
+    elif cached:
+        return cached[1]
     if not out:
-        logger.info("分时数据不可用 code=%s", code)
-    return out
-
-
-async def _fetch_tencent_minute(code: str) -> list[dict]:
-    """腾讯分时 API fallback：60 日分钟 K 线取最近 1 天。"""
-    secid = _to_secid(code)
-    url = (f"https://ifzq.gtimg.cn/appstock/app/minute/query?"
-           f"_var=min_data&code={secid}")
-    resp = await _http_get(url, 8)
-    text = resp.content.decode("gbk", errors="ignore")
-    # 腾讯返回格式: min_data={"code":"sh600000","data":{"20260807":{"data":[...]}}}
-    try:
-        start = text.index("{")
-        end = text.rindex("}") + 1
-        obj = json.loads(text[start:end])
-    except Exception:
-        return []
-    # 从嵌套结构中提取数据：腾讯返回可能是多种嵌套格式：
-    # 格式A: {"sh600519": {"data": {"data": [...], "date": "20260810"}, ...}}
-    # 格式B: {"sh600519": {"20260810": {"data": [...]}}}
-    raw_data = obj.get("data") or {}
-    # 若最外层 key 是股票代码名（如 "sh600000"），再往内取一层
-    if code in raw_data and isinstance(raw_data.get(code), dict):
-        raw_data = raw_data[code]
-    # 腾讯返回可能再包一层 "data" key
-    import re
-    date_pat = re.compile(r"^\d{8}$|^\d{4}-\d{2}-\d{2}$")
-    if "data" in raw_data and isinstance(raw_data.get("data"), dict):
-        inner = raw_data["data"]
-        # 格式A特征：inner["data"] 是 list（bars 数组），inner["date"] 是日期字符串
-        if isinstance(inner.get("data"), list):
-            raw_data = inner
-        # 格式B特征：inner 的 key 是日期格式
-        elif any(date_pat.match(str(k)) for k in inner):
-            raw_data = inner
-    # 分两种情况取 rows 和 today：
-    if "data" in raw_data and isinstance(raw_data.get("data"), list):
-        # 格式A：bars 直接在 "data" 下，日期在 "date" 下
-        rows = raw_data["data"]
-        date_val = raw_data.get("date", "")
-        today = str(date_val) if date_val else ""
-    else:
-        # 格式B：日期作为 key
-        date_keys = [k for k in raw_data.keys() if date_pat.match(str(k))]
-        today = sorted(date_keys)[-1] if date_keys else ""
-        rows = raw_data.get(today, {}).get("data", []) if today else []
-    # 统一日期格式为 YYYY-MM-DD（上游可能返回 YYYYMMDD 无连接符格式）
-    if today and len(today) == 8 and today.isdigit():
-        today_fmt = f"{today[:4]}-{today[4:6]}-{today[6:8]}"
-    else:
-        today_fmt = today
-    # 腾讯分时格式: "0930 12.50 1000" (time price volume)
-    out = []
-    for item in rows:
-        parts = str(item).split()
-        if len(parts) >= 2:
-            try:
-                out.append({
-                    "day": f"{today_fmt} {parts[0][:2]}:{parts[0][2:4]}:00",
-                    "close": parts[1],
-                    "volume": parts[2] if len(parts) > 2 else "0",
-                })
-            except (ValueError, IndexError):
-                continue
+        logger.info("分时数据不可用 code=%s (len=%d)", code, len(arr))
     return out
 
 
 def _parse_minute_bars(arr: list[dict]) -> list[dict]:
-    """从 [{day, close, volume}] 解析为 [{time, price, volume, avgPrice}]，当日过滤。"""
+    """从 Sina [{day, open, close, high, low, volume}] 解析分时数据，当日过滤 + 均价累积。"""
     out = []
-    today_str = datetime.date.today().isoformat()
+    today_str = datetime.date.today().isoformat().replace("-", "")
     cum_amount = 0.0
     cum_vol = 0.0
+    open_price = None
     for row in arr:
         try:
-            day_str = row["day"][:10]
-            # 统一无连接符格式 (20260807) 与 ISO 格式 (2026-08-07) 的比对
-            day_str_norm = day_str.replace("-", "")
-            today_norm = today_str.replace("-", "")
-            if day_str_norm != today_norm:
+            day_str = row.get("day", "")[:10].replace("-", "")
+            if day_str != today_str:
                 continue
             prc = float(row["close"])
             vol = float(row["volume"])
+            if open_price is None:
+                open_price = float(row["open"])  # 第一根 bar 的 open = 09:30 开盘价
             cum_amount += prc * vol
             cum_vol += vol
             avg = cum_amount / cum_vol if cum_vol > 0 else prc
+            time_str = row["day"].split(" ")[-1][:5]
             out.append({
-                "time": row["day"].split(" ")[-1][:5],
+                "time": time_str,
                 "price": prc,
                 "volume": vol,
                 "avgPrice": round(avg, 2),
             })
         except (KeyError, ValueError, TypeError):
             continue
+    # 补上 09:30 开盘价（Sina 5min K 线首根 close 时间为 09:35）
+    if out and open_price is not None:
+        out.insert(0, {
+            "time": "09:30",
+            "price": open_price,
+            "volume": 0,
+            "avgPrice": open_price,
+        })
     return out
 
 
