@@ -68,18 +68,26 @@ def _empty_pool_error(board: str, pool_size: int) -> ValueError:
     )
 
 
-async def _kline_retry(kline_fn, code: str, days: int, attempts: int = 3) -> list[dict]:
-    """K 线拉取带重试：上游限流/超时返回空或抛错时快速重试，
-    避免回测/打分高并发场景下单次网络抖动静默丢票。"""
+async def _kline_retry(kline_fn, code: str, days: int, attempts: int = 3,
+                      delay: float = 0.5) -> list[dict]:
+    """K线拉取带指数退避重试。空结果也重试（上游限流常返回空而非抛错）。"""
+    last_error = None
     for attempt in range(attempts):
         try:
             kl = await kline_fn(code, days)
             if kl:
                 return kl
-        except Exception:
-            pass
+            # 上游限流返回空也重试（旧版把空当作成功直接返回，单次限流就丢票）
+            if attempt == attempts - 1:
+                return []
+        except Exception as e:
+            last_error = e
+            if "Expecting value" in str(e) or "JSON" in str(type(e).__name__):
+                return []
         if attempt < attempts - 1:
-            await asyncio.sleep(0.3 * (attempt + 1))
+            await asyncio.sleep(delay * (2 ** attempt))
+    if last_error:
+        logger.warning("K线拉取失败 code=%s days=%s error=%s", code, days, last_error)
     return []
 
 # 需要额外拉取的快照因子（行情快照 row 不自带，须调财务/资金流接口）
@@ -114,7 +122,7 @@ async def _enrich_pool_extra(pool: list[dict], snap_keys: list[str]) -> None:
                 except Exception:
                     fin = {}
                 for k, f in _FIN_TO_FIELD.items():
-                    row[k] = fin.get(f)
+                    row[k] = fin.get(f) if fin.get(f) is not None else 0.0
             if need_mf:
                 if "main_net_pct" in snap_keys:
                     try:
@@ -685,9 +693,27 @@ def list_models() -> list[dict]:
     out = []
     if not os.path.isdir(ML_DIR):
         return out
+    from .numpy_factors import _FACTOR_SERIES_FN as _KNOWN_FACTORS
+    from .factors import SNAPSHOT_FACTORS as _SNAPSHOT
+    _valid_set = set(_KNOWN_FACTORS) | (set(_SNAPSHOT) - {"sector"})
     for f in sorted(os.listdir(ML_DIR), reverse=True):
         if f.endswith(".joblib"):
-            out.append({"id": f.replace(".joblib", ""), "file": f})
+            mid = f.replace(".joblib", "")
+            entry = {"id": mid, "file": f}
+            try:
+                meta = load_model_meta(mid)
+                if meta:
+                    entry["modelType"] = meta.get("modelType", "gbdt")
+                    fns = meta.get("featureNames", [])
+                    entry["featureNames"] = fns
+                    entry["nFeatures"] = len(fns)
+                    unknown = [k for k in fns if k not in _valid_set]
+                    entry["computable"] = len(unknown) == 0
+                    if unknown:
+                        entry["unknownFeatures"] = unknown[:8]
+            except Exception:
+                pass
+            out.append(entry)
     return out
 
 
@@ -927,6 +953,17 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
     # sector 为类别因子不可作数值特征：从快照集合剔除，避免历史模型含 sector 时特征长度不匹配
     snap_set = set(SNAPSHOT_FACTORS) - {"sector"}
 
+    # 校验技术因子名可计算（同 backtest_model）
+    from .numpy_factors import _FACTOR_SERIES_FN as _KNOWN_FACTORS
+    tech_keys = [k for k in feature_names if k not in snap_set]
+    unknown_tech = [k for k in tech_keys if k not in _KNOWN_FACTORS]
+    if unknown_tech:
+        raise ValueError(
+            f"模型中包含 {len(unknown_tech)} 个无法从K线实时计算的特征: {unknown_tech[:8]}..."
+            f"（总数 {len(tech_keys)} 个技术因子）。"
+            f"请使用包含真实因子名的模型，或重新训练时选择具体因子。"
+        )
+
     if asset_class == "future":
         pool = [{"code": c, "name": c} for c in adapters.FUTURE_UNIVERSE[:pool_size]]
         kline_fn = adapters.fetch_future_kline
@@ -934,8 +971,6 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
     else:
         pool = await adapters.fetch_market_list_multi(_resolve_boards(board, boards), pool_size)
         kline_fn = adapters.fetch_kline
-        # 推理侧与训练侧同构：feature_names 含财务/资金流字段时需拉取填充 row
-        # 旧版直接引用未定义的 snap_keys 抛 NameError，使 score_latest 完全不可用
         snap_keys = [k for k in feature_names if k in snap_set]
     if not pool:
         raise _empty_pool_error(board, pool_size)
@@ -996,8 +1031,8 @@ async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
     return rows
 
 
-async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, groups: int = 5,
-                         n: int = 5, hist: int = 1024, commission_rate: float = 0.00025,
+async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, groups: int = 3,
+                         n: int = 3, hist: int = 1024, commission_rate: float = 0.00025,
                          stamp_duty: float = 0.001, slippage: float = 0.001,
                          benchmark: str = "none", apply_cost: bool = True,
                          progress_cb=None, adjust: dict | None = None,
@@ -1015,10 +1050,26 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
     snap_set = set(SNAPSHOT_FACTORS) - {"sector"}
     tech_keys = [k for k in feature_names if k not in snap_set]
 
+    # 校验技术因子名可计算：泛化特征（f0/f1...）无法用 compute_factor_series 从 K 线实时计算，
+    # 早报错比拉完 150 只 K 线后逐日发现全量 tech_none 强得多
+    from .numpy_factors import _FACTOR_SERIES_FN as _KNOWN_FACTORS
+    unknown_tech = [k for k in tech_keys if k not in _KNOWN_FACTORS]
+    if unknown_tech:
+        raise ValueError(
+            f"模型中包含 {len(unknown_tech)} 个无法从K线实时计算的特征: {unknown_tech[:8]}..."
+            f"（总数 {len(tech_keys)} 个技术因子）。"
+            f"这类泛化特征（如 f0/f1）缺少与量价因子的映射关系，"
+            f"无法在回测中为历史截面对应日期计算因子值。"
+            f"请使用包含真实因子名（如 momentum/rsi/volatility）的模型，"
+            f"或重新训练时选择具体因子。"
+        )
+
     groups = max(2, min(10, groups))
     n = max(1, n)
-    # 历史钳制：内置长周期因子需要足够窗口（momentum120 / dist_52w_high 240 日）
+    # 历史钳制：内置长周期因子需要足够窗口（momentum120 / dist_52w_high 240 日）；
+    # 上限 1500 日（约 6 年）：超过此值 Sina API 返回 null，Tencent 降级返回格式异常
     hist = max(int(hist), min_hist_for_ml(n))
+    hist = min(hist, 1500)
 
     bench_code = BENCHMARKS.get(benchmark)
     if benchmark != "none" and bench_code is None:
@@ -1045,7 +1096,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         for r in pool
     }
     # 并发上限收紧 + 单票重试：上游限流时 50 并发极易被掐，10~12 并发 + 3 次重试稳得多
-    sem = asyncio.Semaphore(min(12, max(8, len(codes))))
+    sem = asyncio.Semaphore(min(4, max(3, len(codes))))
     fetch_fail = 0
 
     async def fetch_one(code):
@@ -1085,6 +1136,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
         past_dates = [d for d in ref_dates if d <= today_str]
         if len(past_dates) >= 60:
             snapshot_cutoff_date = past_dates[-60]
+        # 含快照因子的模型：若未显式指定 start_date，自动从快照生效日起步，
+        # 避免 96%+ 调仓日因前视跳过无意义遍历（大幅减少耗时且不丢有效截面）
+        if not start_date and snapshot_cutoff_date:
+            start_date = snapshot_cutoff_date
 
     code_cache = {}
     for code, kl in series.items():
@@ -1106,7 +1161,9 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
             if not r:
                 continue
             sv = [snapshot_factor_value(r, k) for k in snap_keys]
-            snapshot_vals[code] = sv if not any(v is None for v in sv) else None
+            # 缺失快照值用 0.0 填充：财务 API 偶发失败不应导致整只股票被丢弃
+            sv_filled = [v if v is not None else 0.0 for v in sv]
+            snapshot_vals[code] = sv_filled
 
     cost_rate = round_trip_cost_rate(commission_rate, stamp_duty, slippage) if apply_cost else 0.0
 
@@ -1158,7 +1215,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 60, grou
                     continue  # 快照因子为当前值，回溯到历史截面即前视，跳过
                 sv = snapshot_vals.get(code)
                 if not sv:
-                    continue
+                    # 缺失时用 0.0 填充（与 enrich 侧对齐，财务 API 偶发故障不丢票）
+                    sv = [0.0] * len(snap_keys)
                 fvals.extend(sv)
             # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（期货无涨跌停，跳过）
             closes = cc["closes"]

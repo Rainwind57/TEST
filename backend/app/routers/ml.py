@@ -305,9 +305,9 @@ class MLBacktestBody(BaseModel):
     modelId: str
     board: str = "all"
     boards: list[str] | None = None  # 多板块 OR 组合，优先于 board
-    poolSize: int = 60
-    groups: int = 5
-    n: int = 5
+    poolSize: int = 150
+    groups: int = 3
+    n: int = 3
     hist: int = 180
     commissionRate: float = 0.00025
     stampDuty: float = 0.001

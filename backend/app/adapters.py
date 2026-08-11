@@ -573,23 +573,10 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
             _kline_cache_set(cache_key, (time.time(), disk_rows))
             return result
 
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
-    resp = await _http_get(url, 10)
-    data = resp.json()
-    stock_data = (data or {}).get("data", {}).get(code, {})
-    arr = stock_data.get("qfqday") or stock_data.get("day") or []
-    kline = [
-        {"date": row[0], "open": float(row[1]), "close": float(row[2]),
-         "high": float(row[3]), "low": float(row[4]), "volume": float(row[5])}
-        for row in arr
-    ]
-
-    # 北交所：腾讯 8xxxxx 空 day、920xxx 仅当日一根 → 先降级新浪日K（920xxx 全历史），
-    # 仍空再东财日K兜底（东财 secid=0.xxxx 对 920xxx 无数据、对 8xxxxx 有旧历史）
-    if code.startswith("bj") and len(kline) < min(20, days):
-        kline = await _fetch_sina_kline(code, days)
-        if not kline:
-            kline = await _fetch_eastmoney_kline(code, days)
+    # 主源 Sina（当前环境稳定），Sina 空则降级腾讯
+    kline = await _fetch_sina_kline(code, days)
+    if not kline:
+        kline = await _fetch_tencent_kline_inner(code, days)
 
     # 空结果禁止写缓存：旧版把限流返回的空 K 线也落盘+入内存缓存，此后 300s 内
     # 所有调用都拿到空数据，单次网络抖动被放大成 5 分钟故障。
@@ -603,8 +590,33 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     return result
 
 
+async def _fetch_tencent_kline_inner(code: str, days: int) -> list[dict]:
+    """腾讯 K 线（备源）。不可用时返回空。上限 2000 日防超时。"""
+    days = min(days, 1500)
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
+    try:
+        resp = await _http_get(url, 10)
+        data = resp.json()
+    except Exception:
+        return []
+    if not data or not isinstance(data, dict):
+        return []
+    stock_data = data.get("data", {}).get(code, {})
+    arr = stock_data if isinstance(stock_data, list) else (stock_data.get("qfqday") or stock_data.get("day") or [])
+    kline = []
+    for row in arr if isinstance(arr, list) else []:
+        try:
+            kline.append({"date": row[0], "open": float(row[1]), "close": float(row[2]),
+                         "high": float(row[3]), "low": float(row[4]), "volume": float(row[5])})
+        except (IndexError, ValueError, TypeError):
+            continue
+    return kline
+
+
 async def _fetch_sina_kline(code: str, days: int) -> list[dict]:
-    """新浪日K线（北交所主力源：920xxx 全历史，腾讯仅当日；8xxxxx 数据止于换码前）。"""
+    """新浪日K线（北交所主力源：920xxx 全历史，腾讯仅当日；8xxxxx 数据止于换码前）。
+    上限 1500 日：超过此值新浪返回 null（非数组），实测阈值在 1500~2000 之间。"""
+    days = min(days, 1500)
     url = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
            f"?symbol={code}&scale=240&ma=no&datalen={max(1, days)}")
     try:
@@ -781,7 +793,10 @@ async def fetch_finance_summary(code: str) -> dict:
            f"&filter=(SECUCODE%3D%22{pure}.{market.upper()}%22)"
            f"&p=1&ps=4&sr=-1&st=REPORT_DATE")
     resp = await _http_get(url, 10)
-    rows = (resp.json() or {}).get("result", {}).get("data", [])
+    body = resp.json()
+    if not isinstance(body, dict):
+        return {}
+    rows = (body.get("result") or {}).get("data") or []
     if not rows:
         return {}
     r = rows[0]

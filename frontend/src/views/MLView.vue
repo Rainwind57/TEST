@@ -12,8 +12,8 @@ const research = useResearchStore()
 const router = useRouter()
 
 const boards = ref(['all'])
-const poolSize = ref(80)
-const n = ref(5)
+const poolSize = ref(150)
+const n = ref(3)
 const hist = ref(500)
 const modelType = ref('gbdt')
 const nSplits = ref(5)
@@ -508,15 +508,21 @@ onUnmounted(() => { pollActive = false })
       </div>
       <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」「创建人造模型」或导入模型文件</div>
       <table v-else class="data-table">
-        <thead><tr><th>模型ID</th><th>文件</th><th>操作</th></tr></thead>
+        <thead><tr><th>模型ID</th><th>类型</th><th>因子数</th><th>可回测</th><th>操作</th></tr></thead>
         <tbody>
-          <tr v-for="m in models" :key="m.id">
-            <td>{{ m.id }}</td><td class="muted">{{ m.file }}</td>
+          <tr v-for="m in models" :key="m.id" :class="{ 'row-disabled': m.computable === false }">
             <td>
-              <button class="btn-ghost sm" :disabled="scoring===m.id" @click="runScore(m)">{{ scoring===m.id ? '打分中…' : '打分选股' }}</button>
-              <button class="btn-ghost sm" :disabled="btLoading===m.id" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
+              {{ m.id }}
+              <span v-if="m.computable === false" class="badge-warn" :title="'未知特征: ' + (m.unknownFeatures||[]).join(', ')">因子不可计算</span>
+            </td>
+            <td class="muted">{{ m.modelType || '?' }}</td>
+            <td class="muted">{{ m.nFeatures ?? '?' }}</td>
+            <td><span :class="m.computable === false ? 'tag-fail' : 'tag-ok'">{{ m.computable === false ? '否' : '是' }}</span></td>
+            <td>
+              <button class="btn-ghost sm" :disabled="scoring===m.id || !m.computable" :title="!m.computable ? '模型因子不可从K线计算，无法回测' : ''" @click="runScore(m)">{{ scoring===m.id ? '打分中…' : '打分选股' }}</button>
+              <button class="btn-ghost sm" :disabled="btLoading===m.id || !m.computable" :title="!m.computable ? '模型因子不可从K线计算，无法回测' : ''" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
               <button class="btn-ghost sm" @click="openAdjust(m)">{{ adjustPanel===m.id ? '收起调参' : '调参' }}</button>
-              <button class="btn-ghost sm" @click="gotoBacktest(m)">去主回测</button>
+              <button class="btn-ghost sm" :disabled="!m.computable" :title="!m.computable ? '模型因子不可从K线计算，无法回测' : ''" @click="gotoBacktest(m)">去主回测</button>
               <button class="btn-ghost sm danger" @click="deleteModel(m.id)">删除</button>
             </td>
           </tr>
@@ -638,6 +644,11 @@ onUnmounted(() => { pollActive = false })
 .factor-group { margin-bottom: 10px; }
 .factor-group-title { font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
 .factor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 4px; }
+/* 模型可回测状态标记 */
+.row-disabled td { opacity: 0.55; }
+.badge-warn { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; background: rgba(255,107,107,.15); color: #ff6b6b; font-size: 10px; font-weight: 600; }
+.tag-ok { color: #22c55e; font-weight: 600; font-size: 12px; }
+.tag-fail { color: #ff6b6b; font-weight: 600; font-size: 12px; }
 .factor-checkbox { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }
 .factor-checkbox input { margin: 0; }
 .panel-toolbar { display: flex; align-items: center; gap: 14px; margin-top: 12px; }

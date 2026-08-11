@@ -362,11 +362,11 @@ async def run_select(body: SelectBody, uid: int = 0):
 class BacktestBody(BaseModel):
     board: str = "all"
     boards: list[str] | None = None   # 多板块 OR 组合，优先于 board
-    poolSize: int = 60
+    poolSize: int = 150
     factor: str = "momentum"
     modelId: str | None = None      # ML 模型 ID：指定时走 ML 信号分层回测（与技术因子二选一）
-    groups: int = 5
-    n: int = 5
+    groups: int = 3
+    n: int = 3
     hist: int = 180
     commissionRate: float = 0.00025   # 佣金费率（万 2.5，单边）
     stampDuty: float = 0.001          # 印花税（千 1，卖出单边）
@@ -385,10 +385,15 @@ class BacktestBody(BaseModel):
 async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
     # 模型策略：指定 modelId 时走 ML 信号分层回测，响应结构与技术因子回测一致，
     # 前端图表零成本复用（打通”主回测页导入模型”，旧版 modelId 无门可入）。
+    # hist 钳制：下限 min_hist_for_ml 在 ml.backtest_model 内部处理；上限 1500 防 datalen
+    # 过大导致 Sina API 返回 null/异常，先在此处钳制避免 body.hist 极大值传入
+    clamped_hist = max(60, min(body.hist, 1500))
+    if body.startDate:
+        clamped_hist = min(clamped_hist + 240, 1500)
     if body.modelId:
         try:
             res = await ml.backtest_model(
-                body.modelId, body.board, body.poolSize, body.groups, body.n, body.hist,
+                body.modelId, body.board, body.poolSize, body.groups, body.n, clamped_hist,
                 body.commissionRate, body.stampDuty, body.slippage, body.benchmark, body.applyCost,
                 asset_class=body.assetClass,
                 start_date=body.startDate, end_date=body.endDate,
@@ -424,11 +429,7 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
         raise HTTPException(400, "分层回测目前仅支持技术类(量价)因子")
     groups = max(2, min(10, body.groups))
     n = max(1, body.n)
-    hist = max(60, body.hist)
-    # 起止日对齐：给定 startDate 时取数窗口需额外覆盖前置暖机（因子计算窗口+回测起点），
-    # 避免用户选了 2020-01-01 但 hist=180 只拉到最近半年、startDate 形同虚设
-    if body.startDate:
-        hist = max(hist, hist + 240)
+    hist = clamped_hist
 
     bench_code = BENCHMARKS.get(body.benchmark)
     if body.benchmark != "none" and bench_code is None:
@@ -463,15 +464,20 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
         r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
         for r in pool
     }
-    # 回测 K 线并发随池大小自适应（旧版固定 15）
-    sem = asyncio.Semaphore(min(50, max(15, len(codes))))
+    # 回测 K 线并发限速：外部行情源通常限制连接数，固定 8 避免 60 只同时触发限流
+    sem = asyncio.Semaphore(4)
     fetch_fail = 0
+    fetch_errors: list[str] = []
 
     async def fetch_one(code):
         nonlocal fetch_fail
         async with sem:
             kline_fn = adapters.fetch_future_kline if body.assetClass == "future" else adapters.fetch_kline
-            kline = await ml._kline_retry(kline_fn, code, hist)
+            try:
+                kline = await ml._kline_retry(kline_fn, code, hist, attempts=5, delay=1.0)
+            except Exception as e:
+                kline = []
+                fetch_errors.append(f"{code}: {e}")
             if not kline:
                 fetch_fail += 1
             return code, kline
@@ -489,7 +495,8 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
         raise HTTPException(
             422,
             f"有效股票样本不足：候选池 {len(pool)} 只，K线拉取失败 {fetch_fail} 只，"
-            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只（需≥{groups * 3}）。{hint}",
+            f"历史不足被剔除 {len(pool) - len(series) - fetch_fail} 只，K线≥40日的仅 {len(series)} 只（需≥{groups * 3}）。{hint}"
+            + (f" 首个上游错误：{fetch_errors[0]}" if fetch_errors else ""),
         )
 
     bench_series = None
