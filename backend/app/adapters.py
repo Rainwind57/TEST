@@ -1313,23 +1313,34 @@ _TIME_SHARE_TTL = 30  # 秒（盘中高频刷新，每30s更新一次）
 
 
 async def fetch_time_share(code: str) -> list[dict]:
-    """拉取当日分时数据。优先 1min（个股细腻），空则回退 5min（指数兼容）。"""
+    """拉取当日分时数据。优先 1min（240根），失败则多档 datalen 重试；
+    都不行才回退 5min（48根）。避免 scale=1 偶发空响应直接降级到 5min。"""
     cache_key = code
     cached = _TIME_SHARE_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < _TIME_SHARE_TTL:
         return cached[1]
 
     arr = []
-    for scale, datalen in ((1, 240), (5, 48)):
+    # 1min 多档 datalen 重试：Sina 偶发空响应不是数据不存在而是瞬时限流
+    for datalen in (240, 120, 60):
         try:
             url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-                   f"CN_MarketData.getKLineData?symbol={code}&scale={scale}&datalen={datalen}")
+                   f"CN_MarketData.getKLineData?symbol={code}&scale=1&datalen={datalen}")
             resp = await _http_get(url, 10, headers=_SINA_HEADERS)
             arr = resp.json() or []
             if arr:
                 break
         except Exception:
             continue
+    # 1min 全失败才回退 5min
+    if not arr:
+        try:
+            url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                   f"CN_MarketData.getKLineData?symbol={code}&scale=5&datalen=48")
+            resp = await _http_get(url, 10, headers=_SINA_HEADERS)
+            arr = resp.json() or []
+        except Exception:
+            pass
 
     out = _parse_minute_bars(arr)
     if out:
