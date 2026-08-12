@@ -11,9 +11,10 @@ export function useToast() {
     action.value = opts.action || null
     visible.value = true
     clearTimeout(timer)
-    // 错误类（带 action 或 persistent）不自动消失，需用户手动关闭；普通提示 1.8s
-    if (!opts.action && !opts.persistent) {
-      timer = setTimeout(() => { visible.value = false }, opts.duration || 1800)
+    // duration 为 0 时永不自动消失；有 action 默认 10s 后消失，可传 persistent:true 阻止
+    const dur = opts.duration ?? (opts.action ? 10000 : 1800)
+    if (dur > 0 && !opts.persistent) {
+      timer = setTimeout(() => { visible.value = false }, dur)
     }
   }
   function dismiss() {

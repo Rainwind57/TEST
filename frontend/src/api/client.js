@@ -1,7 +1,7 @@
 import axios from 'axios'
 import { useToast } from '../stores/toast'
 
-const baseURL = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000/api'
+const baseURL = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8899/api'
 export { baseURL }
 
 const api = axios.create({
@@ -18,7 +18,14 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-const { toast } = useToast()
+let _toastFn = null
+function _getToast() {
+  if (_toastFn) return _toastFn
+  try {
+    _toastFn = useToast().toast
+    return _toastFn
+  } catch (_) { return null }
+}
 
 api.interceptors.response.use(
   res => res.data,
@@ -35,12 +42,14 @@ api.interceptors.response.use(
       return Promise.reject(new Error('登录已失效，请重新登录'))
     }
     const msg = err?.response?.data?.detail || err.message || '请求失败'
-    // 网络错误（无 response）或 5xx：toast 带重试按钮，不自动消失（旧版仅 toast 1.8s 消失无重试）
     const isNetwork = !err.response
     const is5xx = status >= 500
     if (isNetwork || is5xx) {
-      const config = err.config
-      toast(msg, { action: { label: '重试', onClick: () => api.request(config) } })
+      const toast = _getToast()
+      if (toast) {
+        const config = err.config
+        toast(msg, { action: { label: '重试', onClick: () => api.request(config) }, duration: 10000 })
+      }
       return Promise.reject(new Error(msg))
     }
     return Promise.reject(new Error(msg))

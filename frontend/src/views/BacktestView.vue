@@ -32,7 +32,7 @@ const strategySource = ref('factor')   // factor=技术因子 | model=ML模型
 const modelId = ref('')
 const groups = ref(5)
 const days = ref(5)
-const hist = ref(180)
+const hist = ref(300)
 const benchmark = ref('hs300')
 const applyCost = ref(true)
 const commissionRate = ref(0.00025)
@@ -46,14 +46,16 @@ const sectorOptions = ref([])
 // P2：资产类别（future 时候选池取期货主力连续合约）
 const assetClass = ref('a-share')
 
-// 起止日联动 hist：选了回测区间后自动推算最小所需历史长度（因子窗口+暖机）
+// 起止日联动 hist：hist 是拉取 K 线的数据窗口天数（非回测天数），给因子计算+暖机用
+// dist_52w_high 等长周期因子需要 240 天窗口，再加回测暖机 60 天 → 底线 300
 watch([startDate, endDate], ([s, e]) => {
   if (s && e) {
     const days = (new Date(e) - new Date(s)) / 86400000
     if (days > 0) {
-      const minHist = Math.max(250, Math.ceil(days) + 200)  // 200 暖机：因子窗口(120)+回测起点(60)+冗余
-      if (Number(hist.value) < minHist) hist.value = minHist
+      hist.value = Math.max(300, Math.ceil(days) + 240)
     }
+  } else if (!s && !e) {
+    hist.value = 300
   }
 })
 

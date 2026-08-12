@@ -666,7 +666,7 @@ watch(() => store.activeCode, (code) => {
 })
 
 onMounted(async () => {
-  try { await store.fetchWatchlist() } catch (e) { toast('自选列表加载失败: ' + e.message) }
+  await store.fetchWatchlist().catch(() => {})
   await refresh().catch(() => {})
   timer = setInterval(() => { if (!document.hidden) store.refreshQuotes().catch(() => {}) }, 6000)
 })
