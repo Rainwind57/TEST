@@ -1,7 +1,0 @@
-INFO:     Started server process [16464]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8899 (Press CTRL+C to quit)
-INFO:     127.0.0.1:8411 - "GET /api/health HTTP/1.1" 200 OK
-{"ts": "2026-08-05T16:51:22.018", "level": "INFO", "logger": "quant.request", "msg": "POST /api/ml/evaluate 200 20039ms", "request_id": "d2bbc9aaeb96"}
-INFO:     127.0.0.1:8425 - "POST /api/ml/evaluate HTTP/1.1" 200 OK

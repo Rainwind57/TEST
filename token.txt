@@ -1,1 +1,0 @@
-{"id":18,"username":"tester","token":"eyJ1aWQiOjE4LCJzdWIiOiJ0ZXN0ZXIiLCJleHAiOjE3ODcwNDUyOTN9.uRVPelX8OjXAhcrCUuRj6qVfx8MTWycq7ECiWmhNPtw"}

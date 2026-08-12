@@ -1,0 +1,52 @@
+# CodeMaker & GitHub
+.codemaker/
+.github/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+*.whl
+instance/
+
+# Reports & artifacts
+backend/reports/
+backend/artifacts/
+backend/ml_models/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Env & secrets
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+token.txt
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
