@@ -355,7 +355,7 @@ th{{background:#16213c;color:#cfe0ff}}
 <div class="card"><h3>多空累计收益与回撤</h3><p class="sub" style="margin:4px 0 8px">蓝线为多空组合累计收益率（%），红色阴影为回撤。长期右上→策略有效。</p><div id="chartLS" class="chart"></div></div>
 <div class="card"><h3>分组平均收益</h3><p class="sub" style="margin:4px 0 8px">柱状图为各分组的平均持仓期收益，分组1→N 单调→因子区分度好。</p><div id="chartGroup" class="chart"></div></div>
 <div class="card"><h3>IC / RankIC 时序列</h3><p class="sub" style="margin:4px 0 8px">IC（皮尔逊）/ RankIC（斯皮尔曼）时序。>0 天数多→因子预测方向稳，|IC|大→区分度强。</p><div id="chartIC" class="chart"></div></div>
-<div class="card" id="chartPos" style="display:none"><h3>持仓与换手变化</h3><p class="sub" style="margin:4px 0 8px">每期多头/空头持仓数量及换手股数。换手高→模型对不同股票区分度强、信号变化活跃。</p><div id="chartPos" class="chart"></div></div>
+<div class="card" id="chartPosCard" style="display:none"><h3>持仓与换手变化</h3><p class="sub" style="margin:4px 0 8px">每期多头/空头持仓数量及换手股数。换手高→模型对不同股票区分度强、信号变化活跃。</p><div id="chartPos" class="chart"></div></div>
 <script>
 const LS={ls_json}, GS={gs_json}, IC={ic_json};
 const dates=LS.map(p=>p.date);
@@ -393,7 +393,7 @@ echarts.init(document.getElementById('chartIC')).setOption({{
 }});
 const PL = {json.dumps(payload.get("positionLedger") or [], ensure_ascii=False)};
 if (PL.length > 0) {{
-  document.getElementById('chartPos').style.display = 'block';
+  document.getElementById('chartPosCard').style.display = 'block';
   const posDates = PL.map(p => p.date);
   const posLongCount = PL.map(p => p.long ? p.long.length : 0);
   const posShortCount = PL.map(p => p.short ? p.short.length : 0);

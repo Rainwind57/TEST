@@ -95,7 +95,7 @@ onMounted(loadAll)
           <tr v-for="s in strategies" :key="s.id">
             <td>{{ s.name }}</td>
             <td>{{ s.kind }}</td>
-            <td class="muted">{{ s.config?.factor || s.config?.factors?.length + '因子' || '-' }}</td>
+            <td class="muted">{{ s.config?.factor || (s.config?.factors?.length ? s.config.factors.length + '因子' : '-') }}</td>
             <td>{{ fmtTime(s.created_at) }}</td>
             <td>
               <button class="btn-ghost sm" :disabled="running === s.id" @click="runStrategy(s.id)">{{ running === s.id ? '运行中…' : '运行' }}</button>

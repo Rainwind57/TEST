@@ -52,6 +52,6 @@ async def backtest(body: IntradayBody, uid: int = Depends(require_user_id)):
     if body.saveArtifact:
         from .. import artifacts
         meta = artifacts.save_artifact("intraday", result,
-                                       name=f"分钟回测-{body.code or '组合'}")
+                                       name=f"分钟回测-{body.code or '组合'}", user_id=uid)
         result["artifact"] = meta
     return result

@@ -59,14 +59,23 @@ def get_signal_config() -> dict:
         "board": db.get_setting("monitor_board", "all"),
         "poolSize": int(db.get_setting("monitor_pool_size", "150")),
         "adjustId": db.get_setting("monitor_adjust_id", ""),
+        "source": db.get_setting("monitor_source", "watchlist"),  # watchlist|board|model_topn
+        "sourceBoard": db.get_setting("monitor_source_board", "all"),
+        "sourceTopN": int(db.get_setting("monitor_source_topn", "20")),
     }
 
 
 def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
                      rule_factor: str = "", board: str = "all",
-                     pool_size: int = 150, adjust_id: str = "") -> dict:
+                     pool_size: int = 150, adjust_id: str = "",
+                     source: str = "watchlist", source_board: str = "all",
+                     source_topn: int = 20) -> dict:
     if mode not in ("rule", "model"):
         raise ValueError("mode 必须为 rule 或 model")
+    if source not in ("watchlist", "board", "model_topn"):
+        raise ValueError("source 必须为 watchlist、board 或 model_topn")
+    if source == "model_topn" and not model_id:
+        raise ValueError("model_topn 来源需要指定 modelId")
     if mode == "model":
         if not model_id:
             raise ValueError("模型模式下必须指定模型 modelId")
@@ -82,6 +91,9 @@ def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
     db.set_setting("monitor_board", board)
     db.set_setting("monitor_pool_size", str(pool_size))
     db.set_setting("monitor_adjust_id", adjust_id)
+    db.set_setting("monitor_source", source)
+    db.set_setting("monitor_source_board", source_board)
+    db.set_setting("monitor_source_topn", str(source_topn))
     return get_signal_config()
 
 
@@ -206,7 +218,33 @@ async def _scan_signals_impl():
     global _last_signals
     try:
         conn = db.get_conn()
-        all_codes = [r["code"] for r in conn.execute("SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
+        cfg = get_signal_config()
+
+        # 标的池来源：watchlist（默认）/ 板块(board) / 模型TopN(model_topn)
+        source = cfg.get("source", "watchlist")
+        if source == "board":
+            board = cfg.get("sourceBoard", "all")
+            pool = await adapters.fetch_market_list_multi([board], cfg.get("poolSize", 300))
+            codes_from_source = [r["code"] for r in pool]
+        elif source == "model_topn" and cfg.get("modelId"):
+            from . import ml as _ml
+            try:
+                ranked = await _ml.score_latest(
+                    cfg["modelId"],
+                    board=cfg.get("sourceBoard", "all"),
+                    pool_size=cfg.get("poolSize", 300),
+                )
+                top_n = cfg.get("sourceTopN", 20)
+                codes_from_source = [r["code"] for r in ranked[:top_n]]
+            except Exception:
+                logger.warning("盯盘模型TopN打分失败，回退为自选股池", exc_info=True)
+                codes_from_source = [r["code"] for r in conn.execute(
+                    "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
+        else:
+            codes_from_source = [r["code"] for r in conn.execute(
+                "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
+
+        all_codes = codes_from_source
         positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost FROM positions").fetchall()}
         # 构建名称查找表（优先 watchlist name，其次 positions name）
         name_map = {}
@@ -223,7 +261,6 @@ async def _scan_signals_impl():
             _last_signals = []
             return
 
-        cfg = get_signal_config()
         signals: list[dict] = []
 
         # 模型模式：用落盘 ML 模型预测分生成三态信号 + 持仓联动
@@ -250,6 +287,16 @@ async def _scan_signals_impl():
                             "featureWeights": adj_payload.get("featureWeights") or {},
                             "threshold": adj_payload.get("threshold"),
                         }
+                # 无显式调参配置时，检查模型自身侧车 JSON 中的 featureWeights（克隆/另存模型）
+                if adjust_cfg is None:
+                    meta = ml.load_model_meta(cfg["modelId"])
+                    if meta and meta.get("featureWeights"):
+                        adjust_cfg = {
+                            "modelId": cfg["modelId"],
+                            "featureNames": meta.get("featureNames", []),
+                            "featureWeights": meta["featureWeights"],
+                            "threshold": meta.get("threshold"),
+                        }
                 if cfg.get("ranking") == "full":
                     # 全池排名口径：先用 score_codes 给自选股精确打分，再用 score_latest 获取
                     # 全市场得分分布计算分位，避免自选股不在 top N 中时丢失信号
@@ -273,7 +320,7 @@ async def _scan_signals_impl():
                     for c in codes:
                         wl_score = watchlist_scored.get(c)
                         if wl_score is None:
-                            r = {r["code"]: r for r in ranked}.get(c)
+                            r = {item["code"]: item for item in ranked}.get(c)
                             if not r:
                                 continue
                             wl_score = r["score"]
@@ -585,7 +632,7 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
         cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
         cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
                    (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "sell", sig["code"],
-                    pos.get("name", sig["code"]), sell_qty, price, amount))
+                    pos["name"] or sig["code"], sell_qty, price, amount))
         conn.commit()
         conn.close()
         _record_auto_equity()

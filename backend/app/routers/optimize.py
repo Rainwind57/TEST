@@ -51,7 +51,7 @@ def optimize_backtest(body: OptimizeBody, uid: int = Depends(require_user_id)):
             "isMetrics": result.get("isMetrics"),
             "oosMetrics": result.get("oosMetrics"),
             "splitDate": result.get("splitDate"),
-        }, name=f"寻优-{body.factor or body.modelId}")
+        }, name=f"寻优-{body.factor or body.modelId}", user_id=uid)
         result["artifact"] = meta
     except Exception as e:
         logger.warning("寻优结果落盘失败: %s", e)

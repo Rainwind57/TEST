@@ -1,8 +1,8 @@
 # 前端镜像（P2-11）：多阶段构建，产物用 nginx 托管
 FROM node:20-slim AS builder
 WORKDIR /app
-COPY package.json package*.json* ./
-RUN npm install --registry https://registry.npmmirror.com
+COPY package.json package-lock.json ./
+RUN npm ci --registry https://registry.npmmirror.com
 COPY . .
 RUN npm run build
 

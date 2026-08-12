@@ -78,6 +78,8 @@ def submit(jid: str, coro):
     _cancel_events[jid] = event
     _tasks[jid] = asyncio.create_task(_runner(jid, coro, event)())
 
+_cleanup_scheduled: dict[str, bool] = {}
+
 
 def cancel(jid: str) -> bool:
     t = _tasks.get(jid)
@@ -92,9 +94,6 @@ def cancel(jid: str) -> bool:
         update_job(jid, status="cancelled", finished_at=datetime.datetime.now().isoformat())
         return True
     return False
-
-
-_cleanup_scheduled: dict[str, bool] = {}
 
 
 def _cleanup_job(jid: str):

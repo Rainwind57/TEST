@@ -664,7 +664,6 @@ watch(() => store.activeCode, (code) => {
     if (klineFreq.value !== '分时') loadKline(); else loadTimeshare()
   }
 })
-watch(() => store.source, () => store.refreshQuotes().catch(() => {}))
 
 onMounted(async () => {
   try { await store.fetchWatchlist() } catch (e) { toast('自选列表加载失败: ' + e.message) }

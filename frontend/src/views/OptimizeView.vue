@@ -15,7 +15,7 @@ const boards = ref(['all'])
 const poolSize = ref(60)
 const factor = ref('momentum')
 const strategySource = ref('factor')   // factor=技术因子 | model=ML模型
-const modelId = ref('')
+const modelType = ref('lightgbm')
 const groups = ref(5)
 const n = ref(5)
 const hist = ref(180)
@@ -26,16 +26,10 @@ const loading = ref(false)
 const jobStatus = ref('')
 const result = ref(null)
 const factorOptions = ref([])
-const modelOptions = ref([])
 
 async function loadFactors() {
   try { factorOptions.value = (await api.get('/select/factors')).filter(f => f.kline) }
   catch (e) { toast(e.message) }
-}
-
-async function loadModels() {
-  try { modelOptions.value = await api.get('/ml/models') }
-  catch (e) { /* 静默 */ }
 }
 
 function baseCfg() {
@@ -46,7 +40,7 @@ function baseCfg() {
     commissionRate: 0.00025, stampDuty: 0.001, slippage: 0.001, applyCost: true,
   }
   if (strategySource.value === 'model') {
-    cfg.modelId = modelId.value
+    cfg.modelType = modelType.value
   } else {
     cfg.factor = factor.value
   }
@@ -70,7 +64,7 @@ async function pollJob(jobId, onProgress) {
 }
 
 async function run() {
-  if (strategySource.value === 'model' && !modelId.value) { toast('请先选择 ML 模型'); return }
+  if (strategySource.value === 'model' && !modelType.value) { toast('请先选择模型类型'); return }
   loading.value = true
   try {
     const cfg = { ...baseCfg(), nTrials: Number(nTrials.value) }
@@ -83,7 +77,7 @@ async function run() {
 
 async function saveStrategy() {
   if (!result.value) return
-  const name = prompt('策略名称', `${strategySource.value === 'model' ? modelId.value : factor.value}_opt_${nTrials.value}trials`)
+  const name = prompt('策略名称', `${strategySource.value === 'model' ? modelType.value : factor.value}_opt_${nTrials.value}trials`)
   if (!name) return
   try {
     await api.post('/optimize/save-strategy', {
@@ -125,12 +119,11 @@ const fmt = v => v == null ? '-' : Number(v).toFixed(3)
 const fmtPct = v => v == null ? '-' : (Number(v) * 100).toFixed(2) + '%'
 
 onMounted(async () => {
-  await Promise.all([loadFactors(), loadModels()])
-  // 消费 ML 页写入的当前模型：有则自动切到模型寻优
+  await loadFactors()
   const cm = research.currentModel
-  if (cm?.id && modelOptions.value.some(m => m.id === cm.id)) {
+  if (cm?.modelType) {
     strategySource.value = 'model'
-    modelId.value = cm.id
+    modelType.value = cm.modelType
   }
 })
 </script>
@@ -152,11 +145,11 @@ onMounted(async () => {
             <option v-for="f in factorOptions" :key="f.key" :value="f.key">{{ f.label }}</option>
           </select>
         </div>
-        <div v-else class="field"><label>模型</label>
-          <select v-model="modelId">
-            <option value="">请选择模型</option>
-            <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ m.id }}</option>
-          </select>
+      <div v-else class="field"><label>模型类型</label>
+        <select v-model="modelType">
+          <option value="gbdt">GBDT (scikit-learn)</option>
+          <option value="lightgbm">LightGBM</option>
+        </select>
         </div>
         <div class="field"><label>历史长度</label><input v-model="hist" type="number" /></div>
         <div class="field"><label>试验数</label><input v-model="nTrials" type="number" /></div>

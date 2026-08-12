@@ -17,16 +17,20 @@ const modelId = ref('')
 const modelOptions = ref([])
 const savingCfg = ref(false)
 const scanning = ref(false)
-const ranking = ref('isolated')
+const ranking = ref('full')
 const autoTrade = ref(false)
 const savingAutoTrade = ref(false)
 const monitorConfig = ref(null)
 
 // 模型模式下的板块/池规模/调参（与选股口径对齐）
-const board = ref('all')
+const board = ref(['all'])
 const poolSize = ref(150)
 const adjustId = ref('')
 const adjustOptions = ref([])
+// 标的来源：watchlist=自选股 / board=板块 / model_topn=模型TopN
+const source = ref('watchlist')
+const sourceBoard = ref(['all'])
+const sourceTopN = ref(20)
 const addWatchlistBusy = ref({})
 const buyBusy = ref({})
 
@@ -39,10 +43,13 @@ async function loadStatus() {
     if (s.config) {
       mode.value = s.config.mode || 'rule'
       modelId.value = s.config.modelId || ''
-      ranking.value = s.config.ranking || 'isolated'
-      board.value = s.config.board || 'all'
+      ranking.value = s.config.ranking || 'full'
+      board.value = [s.config.board || 'all']
       poolSize.value = s.config.poolSize || 150
       adjustId.value = s.config.adjustId || ''
+      source.value = s.config.source || 'watchlist'
+      sourceBoard.value = [s.config.sourceBoard || 'all']
+      sourceTopN.value = s.config.sourceTopN || 20
       monitorConfig.value = s.config
     }
   } catch (e) { toast(e.message) }
@@ -77,9 +84,12 @@ async function saveConfig() {
       mode: mode.value,
       modelId: modelId.value,
       ranking: ranking.value,
-      board: board.value,
+      board: board.value[0],
       poolSize: Number(poolSize.value),
       adjustId: adjustId.value,
+      source: source.value,
+      sourceBoard: sourceBoard.value[0],
+      sourceTopN: Number(sourceTopN.value),
     })
     monitorConfig.value = cfg
     const desc = cfg.mode === 'model'
@@ -143,7 +153,7 @@ async function addToWatchlist(code, name) {
 async function buySignal(code, name) {
   buyBusy.value[code] = true
   try {
-    await api.post('/portfolio/order', { code, name: name || code, side: 'buy', qty: 100 })
+    await api.post('/portfolio/order', { code, side: 'buy', qty: 100 })
     toast(`${code} 已下单买入100股`)
   } catch (e) { toast(e.message) }
   finally { buyBusy.value[code] = false }
@@ -152,8 +162,8 @@ async function buySignal(code, name) {
 async function swapToSignal(s) {
   try {
     // 卖出原持仓100股 + 买入换仓目标100股
-    await api.post('/portfolio/order', { code: s.code, name: s.name || s.code, side: 'sell', qty: 100 })
-    await api.post('/portfolio/order', { code: s.swapTo, name: s.swapToName || s.swapTo, side: 'buy', qty: 100 })
+    await api.post('/portfolio/order', { code: s.code, side: 'sell', qty: 100 })
+    await api.post('/portfolio/order', { code: s.swapTo, side: 'buy', qty: 100 })
     toast(`已换仓：卖出 ${s.code} → 买入 ${s.swapTo}`)
   } catch (e) { toast(e.message) }
 }
@@ -180,7 +190,7 @@ async function batchBuy() {
   let ok = 0
   for (const s of actionable) {
     try {
-      await api.post('/portfolio/order', { code: s.code, name: s.name || s.code, side: 'buy', qty: 100 })
+      await api.post('/portfolio/order', { code: s.code, side: 'buy', qty: 100 })
       ok++
     } catch (e) { /* skip */ }
   }
@@ -257,6 +267,8 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
             · 池规模：<strong>{{ monitorConfig.poolSize || 150 }}</strong>
             <span v-if="monitorConfig.adjustId"> · 调参：<strong>{{ monitorConfig.adjustId }}</strong></span>
           </template>
+          · 标的来源：<strong>{{ monitorConfig.source === 'board' ? '指定板块' : monitorConfig.source === 'model_topn' ? '模型TopN' : '自选股' }}</strong>
+          <span v-if="monitorConfig.sourceBoard && monitorConfig.source !== 'watchlist'"> · {{ monitorConfig.sourceBoard }}</span>
         </span>
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
@@ -289,6 +301,19 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
             <option value="">不使用调参</option>
             <option v-for="a in adjustOptions" :key="a.id" :value="a.id">{{ a.name }}</option>
           </select>
+        </div>
+        <div class="field"><label>标的来源</label>
+          <select v-model="source">
+            <option value="watchlist">自选股</option>
+            <option value="board">指定板块</option>
+            <option value="model_topn">模型TopN</option>
+          </select>
+        </div>
+        <div v-if="source === 'board' || source === 'model_topn'" class="field"><label>来源板块</label>
+          <BoardSelect v-model="sourceBoard" style="min-width:100px" />
+        </div>
+        <div v-if="source === 'model_topn'" class="field"><label>取前N只</label>
+          <input v-model.number="sourceTopN" type="number" min="5" max="100" step="5" class="num-inp" />
         </div>
         <button class="btn-ghost" :disabled="savingCfg" @click="saveConfig">{{ savingCfg ? '保存中…' : '保存配置' }}</button>
         <button class="btn-ghost" :disabled="scanning" @click="scanNow">{{ scanning ? '扫描中…' : '立即扫描' }}</button>

@@ -20,6 +20,9 @@ class SignalConfigBody(BaseModel):
     board: str = "all"            # 模型模式候选板块（与选股口径对齐）
     poolSize: int = 150           # 模型模式候选池规模
     adjustId: str = ""            # 模型模式调参配置 artifact id
+    source: str = "watchlist"     # 标的来源：watchlist=自选股 / board=板块 / model_topn=模型TopN
+    sourceBoard: str = "all"      # source=board/model_topn 时的板块
+    sourceTopN: int = 20          # source=model_topn 时取前N只
 
 
 @router.get("/status")
@@ -44,11 +47,13 @@ def set_signal_config(body: SignalConfigBody, uid: int = Depends(require_user_id
     模型模式：ranking=isolated 对各股孤立打分，ranking=full 对全池排名后取分位（与选股口径一致）。
     board/poolSize/adjustId 为模型模式下的候选板块/池规模/调参配置，与选股口径对齐。
     规则模式：ruleFactor 为空则默认动量+RSI，否则用指定因子。
+    source 控制标的池来源：watchlist=自选股 / board=指定板块全量 / model_topn=模型全市场打分TopN。
     """
     try:
         return scheduler.set_signal_config(
             body.mode, body.modelId, body.ranking, body.ruleFactor,
             board=body.board, pool_size=body.poolSize, adjust_id=body.adjustId,
+            source=body.source, source_board=body.sourceBoard, source_topn=body.sourceTopN,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))

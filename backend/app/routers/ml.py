@@ -235,7 +235,7 @@ def adjust_model(mid: str, body: ModelAdjustBody, uid: int = Depends(require_use
     if body.saveArtifact:
         from .. import artifacts
         meta2 = artifacts.save_artifact("ml_adjust", adjust_cfg,
-                                        name=f"调参-{mid}")
+                                        name=f"调参-{mid}", user_id=uid)
         result["artifact"] = meta2
         result["adjustId"] = meta2["id"]
     if body.saveAsNew:
@@ -248,8 +248,8 @@ def adjust_model(mid: str, body: ModelAdjustBody, uid: int = Depends(require_use
     return result
 
 
-def _load_adjust(adjustId: str | None, adjust: dict | None) -> dict | None:
-    """从 artifact 或直传 dict 解析调参配置。"""
+def _load_adjust(adjustId: str | None, adjust: dict | None, modelId: str | None = None) -> dict | None:
+    """从 artifact 或直传 dict 解析调参配置。若无显式传入，自动读取模型自带 featureWeights（克隆模型）。"""
     if adjust:
         return {"modelId": adjust.get("modelId", ""), "featureNames": adjust.get("featureNames", []),
                 "featureWeights": adjust.get("featureWeights") or {},
@@ -263,6 +263,13 @@ def _load_adjust(adjustId: str | None, adjust: dict | None) -> dict | None:
         return {"modelId": cfg.get("modelId", ""), "featureNames": cfg.get("featureNames", []),
                 "featureWeights": cfg.get("featureWeights") or {},
                 "threshold": cfg.get("threshold")}
+    # 无显式调参：检查模型自带侧车 JSON 中的 featureWeights（克隆/另存模型自动携带）
+    if modelId:
+        meta = ml.load_model_meta(modelId)
+        if meta and meta.get("featureWeights"):
+            return {"modelId": modelId, "featureNames": meta.get("featureNames", []),
+                    "featureWeights": meta["featureWeights"],
+                    "threshold": meta.get("threshold")}
     return None
 
 
@@ -284,7 +291,7 @@ async def score(body: ScoreBody, uid: int = Depends(require_user_id)):
     adjustId/adjust 传调参配置时应用人工权重/阈值。
     """
     try:
-        adjust = _load_adjust(body.adjustId, body.adjust)
+        adjust = _load_adjust(body.adjustId, body.adjust, body.modelId)
         rows = await ml.score_latest(body.modelId, body.board, body.poolSize,
                                      adjust=adjust, asset_class=body.assetClass,
                                      boards=body.boards)
@@ -304,7 +311,7 @@ async def score(body: ScoreBody, uid: int = Depends(require_user_id)):
             "codes": [r["code"] for r in rows],
             "rows": rows,
             "config": body.model_dump(),
-        }, name=f"ML打分-{body.modelId}")
+        }, name=f"ML打分-{body.modelId}", user_id=uid)
         return {"rows": rows, "artifact": meta}
     return rows
 
@@ -337,7 +344,7 @@ async def ml_backtest(body: MLBacktestBody, uid: int = Depends(require_user_id))
     startDate/endDate 限定验证回测的调仓日区间（分时段验证）。
     """
     try:
-        adjust = _load_adjust(body.adjustId, body.adjust)
+        adjust = _load_adjust(body.adjustId, body.adjust, body.modelId)
         config = body.model_dump()
         # 注入模型元数据供报告渲染模型类型/超参/特征重要性
         try:

@@ -1,7 +1,7 @@
 import axios from 'axios'
 import { useToast } from '../stores/toast'
 
-const baseURL = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8899/api'
+const baseURL = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000/api'
 export { baseURL }
 
 const api = axios.create({
@@ -59,7 +59,7 @@ export async function downloadFile(url, payload, filename) {
     timeout: 300000,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
-  saveBlob(res, filename)
+  await saveBlob(res, filename)
 }
 
 // GET 下载（报告历史文件等只读端点），响应处理与 downloadFile 一致
@@ -70,7 +70,7 @@ export async function downloadGet(url, filename) {
     timeout: 120000,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
-  saveBlob(res, filename)
+  await saveBlob(res, filename)
 }
 
 function saveBlob(res, filename) {

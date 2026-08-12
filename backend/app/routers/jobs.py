@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .. import jobs, ml, optimize
 from . import selection as sel
-from .ml import EvalBody
+from .ml import EvalBody, _load_adjust
 from .optimize import OptimizeBody
 from .auth import require_user_id
 
@@ -36,7 +36,7 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
         except Exception as e:
             raise HTTPException(400, f"config 字段不匹配: {e}")
         jid = jobs.create_job("backtest", body.config, user_id=uid)
-        jobs.submit(jid, sel.run_backtest(cfg))
+        jobs.submit(jid, sel.run_backtest(cfg, uid=uid))
         return {"jobId": jid, "status": "pending"}
 
     if body.kind == "select":
@@ -54,7 +54,7 @@ async def submit_job(body: JobSubmitBody, uid: int = Depends(require_user_id)):
         except Exception as e:
             raise HTTPException(400, f"config 字段不匹配: {e}")
         jid = jobs.create_job("factor-regression", body.config, user_id=uid)
-        jobs.submit(jid, sel.run_factor_regression(cfg))
+        jobs.submit(jid, sel.run_factor_regression(cfg, uid=uid))
         return {"jobId": jid, "status": "pending"}
 
     if body.kind in ("ml-evaluate", "ml-train", "ml-backtest", "ml-optimize"):
@@ -134,13 +134,14 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             bt_cfg = MLBacktestBody(**config)
         except Exception as e:
             raise HTTPException(400, f"config 字段不匹配: {e}")
+        adjust = _load_adjust(bt_cfg.adjustId, bt_cfg.adjust, bt_cfg.modelId)
         jobs.submit(jid, ml.backtest_model(
             bt_cfg.modelId, bt_cfg.board, bt_cfg.poolSize, bt_cfg.groups, bt_cfg.n,
             bt_cfg.hist, bt_cfg.commissionRate, bt_cfg.stampDuty, bt_cfg.slippage,
             bt_cfg.benchmark, bt_cfg.applyCost, asset_class=bt_cfg.assetClass,
             start_date=bt_cfg.startDate, end_date=bt_cfg.endDate,
             config=bt_cfg.model_dump(),
-            boards=bt_cfg.boards))
+            boards=bt_cfg.boards, adjust=adjust))
     return {"jobId": jid, "status": "pending"}
 
 

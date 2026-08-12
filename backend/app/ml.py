@@ -175,6 +175,15 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     # 历史长度钳制：内置长周期因子（如 momentum120/dist_52w_high 240 日窗口）需要足够历史，
     # 用户传过小的 hist 时自动抬升，避免默认参数下「开箱即失败」
     hist = max(int(hist), min_hist_for_ml(n))
+    # 时间段窗口适配：指定的 start_date/end_date 需要 hist 覆盖从今天回溯到 start_date 的天数，
+    # 否则 kline 拉取的时间范围与过滤区间无交集 → 必然「有效样本不足」
+    if start_date:
+        import datetime as _dt
+        from_date = _dt.date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+        days_to_cover = (_dt.date.today() - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        if days_to_cover > hist:
+            logger.info("hist=%d 不足以覆盖时间段 %s~%s，自动抬升至 %d", hist, start_date, end_date or "今天", days_to_cover)
+            hist = min(days_to_cover, 1500)
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
     # 因子选择：selected_factors 非空时只保留用户勾选的因子
@@ -258,7 +267,8 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         if not keep:
             raise ValueError(
                 f"指定时间段（{start_date or '不限'} ~ {end_date or '不限'}）内有效样本为 0。"
-                f"请调整时间段范围，或增大候选池/加长历史(hist)后再试。"
+                f"K线历史覆盖 {hist} 日（截至今天），可能未覆盖到目标时间段。"
+                f"请增大 hist（建议 ≥ 时间段跨度 + 260 日），或调整时间段范围，或增大候选池后重试。"
             )
         rows = [rows[k] for k in keep]
         labels = [labels[k] for k in keep]
@@ -1070,6 +1080,14 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     # 上限 1500 日（约 6 年）：超过此值 Sina API 返回 null，Tencent 降级返回格式异常
     user_hist = int(hist)
     hist = max(user_hist, min_hist_for_ml(n))
+    # 时间段窗口适配（同 build_dataset）
+    if start_date:
+        import datetime as _dt
+        from_date = _dt.date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+        days_to_cover = (_dt.date.today() - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        if days_to_cover > hist:
+            logger.info("hist=%d 不足以覆盖回测时间段 %s~%s，自动抬升至 %d", hist, start_date, end_date or "今天", days_to_cover)
+            hist = min(days_to_cover, 1500)
     hist = min(hist, 1500)
     hist_clamped = hist != user_hist
 
@@ -1312,7 +1330,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         raise ValueError(
             f"有效截面样本不足，无法完成 ML 信号分层回测：候选池 {len(pool)} 只、有效 {len(series)} 只，"
             f"但所有调仓日截面均未凑够 {groups * 2} 只（多因停牌/涨跌停/因子缺失被跳过）。"
-            f"请增大候选池规模、缩短持有期(n)或放宽板块范围。"
+            f"请增大候选池规模、缩短持有期(n)、放宽板块范围，"
+            f"或检查 hist({hist}日)是否足够覆盖{'时间段 ' + start_date + '~' + end_date if start_date or end_date else '回测区间'}。"
         )
 
     group_summary = [

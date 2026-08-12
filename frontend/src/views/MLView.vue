@@ -86,7 +86,7 @@ async function openAdjust(m) {
     ;(adjustMeta.value.featureImportance || []).forEach(f => { importanceMap[f.feature] = f.importance })
     const featureNames = adjustMeta.value.featureNames || []
     for (const f of featureNames) {
-      featureWeights[f] = existingWeights[f] ?? importanceMap[f] ?? 0
+      featureWeights[f] = existingWeights[f] ?? 1.0
     }
     // 默认展开有非零权重的分组
     const groupHasNonZero = {}
@@ -436,7 +436,7 @@ onUnmounted(() => { pollActive = false })
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>训练起始日</label><input v-model="trainStart" type="date" /></div>
         <div class="field"><label>训练结束日</label><input v-model="trainEnd" type="date" /></div>
-        <span class="hint">留空=用最近 hist 天全部样本；限定后仅用该区间样本训练/评估</span>
+        <span class="hint">留空=用最近 hist 天全部样本；限定时间段后请确保「历史长度」≥ 时间段跨度+260日（不足时后端自动抬升）</span>
       </div>
       <!-- 任务1：因子选择折叠面板 -->
       <div class="factor-select-box">

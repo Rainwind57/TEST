@@ -58,11 +58,11 @@ async def run_strategy(sid: int, request: Request):
     kind = s["kind"]
     try:
         if kind == "backtest":
-            return await sel.run_backtest(sel.BacktestBody(**cfg))
+            return await sel.run_backtest(sel.BacktestBody(**cfg), uid=_uid(request))
         if kind == "select":
-            return await sel.run_select(sel.SelectBody(**cfg))
+            return await sel.run_select(sel.SelectBody(**cfg), uid=_uid(request))
         if kind == "regression":
-            return await sel.run_factor_regression(sel.FactorRegressionBody(**cfg))
+            return await sel.run_factor_regression(sel.FactorRegressionBody(**cfg), uid=_uid(request))
         if kind == "intraday":
             ib = IntradayBody(**cfg)
             icfg = intraday.IntradayConfig(
@@ -76,7 +76,7 @@ async def run_strategy(sid: int, request: Request):
             return await intraday.run_intraday_backtest(icfg)
         if kind == "ml":
             from .ml import MLBacktestBody
-            return await ml_router.ml_backtest(MLBacktestBody(**cfg))
+            return await ml_router.ml_backtest(MLBacktestBody(**cfg), uid=_uid(request))
     except (TypeError, ValueError) as e:
         raise HTTPException(400, f"策略配置字段不匹配: {e}")
     raise HTTPException(400, f"暂不支持一键运行 kind={kind}")
