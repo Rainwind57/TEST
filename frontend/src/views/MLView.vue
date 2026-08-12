@@ -60,6 +60,15 @@ const featureWeights = reactive({})
 const threshold = ref(null)
 const lastAdjustId = ref('')
 const adjustNote = ref('')
+const cloneSaving = ref(false)
+const monitorModelId = ref('')
+
+async function loadMonitorActive() {
+  try {
+    const cfg = await api.get('/monitor/config')
+    monitorModelId.value = cfg.mode === 'model' ? cfg.modelId : ''
+  } catch (e) { /* 静默，盯盘模块可能未启动 */ }
+}
 
 async function openAdjust(m) {
   if (adjustPanel.value === m.id) { adjustPanel.value = ''; return }
@@ -73,9 +82,11 @@ async function openAdjust(m) {
     for (const k of Object.keys(adjGroupOpen)) delete adjGroupOpen[k]
     threshold.value = adjustMeta.value.threshold ?? null
     const existingWeights = adjustMeta.value.featureWeights || {}
+    const importanceMap = {}
+    ;(adjustMeta.value.featureImportance || []).forEach(f => { importanceMap[f.feature] = f.importance })
     const featureNames = adjustMeta.value.featureNames || []
     for (const f of featureNames) {
-      featureWeights[f] = existingWeights[f] ?? 1
+      featureWeights[f] = existingWeights[f] ?? importanceMap[f] ?? 0
     }
     // 默认展开有非零权重的分组
     const groupHasNonZero = {}
@@ -83,7 +94,7 @@ async function openAdjust(m) {
       const mf = manualFeatures.value.find(m => m.key === f)
       const g = (mf ? mf.group : '其他') || '其他'
       if (!(g in groupHasNonZero)) groupHasNonZero[g] = false
-      if ((featureWeights[f] ?? 1) !== 1) groupHasNonZero[g] = true
+      if ((featureWeights[f] ?? 0) !== 0) groupHasNonZero[g] = true
     }
     for (const [g, open] of Object.entries(groupHasNonZero)) {
       adjGroupOpen[g] = open
@@ -117,6 +128,22 @@ async function saveAdjust(m) {
     adjustNote.value = res.effectNote || ''
     toast(lastAdjustId.value ? `调参配置已保存：${lastAdjustId.value}` : '调参已应用（未保存）')
   } catch (e) { toast(e.message) }
+}
+
+async function saveAsNewModel(m) {
+  cloneSaving.value = true
+  try {
+    const res = await api.post(`/ml/models/${m.id}/adjust`, { ...adjustPayload(), saveAsNew: true })
+    if (res.newModelId) {
+      toast(`新模型已保存：${res.newModelId}`)
+      await loadModels()
+    } else if (res.cloneError) {
+      toast(`另存失败：${res.cloneError}`)
+    } else {
+      toast('另存失败，请重试')
+    }
+  } catch (e) { toast(e.message) }
+  finally { cloneSaving.value = false }
 }
 
 function evalConfig() {
@@ -382,7 +409,7 @@ const lsOption = computed(() => {
   }
 })
 
-onMounted(() => { loadModels(); loadSectors(); loadManualFeatures() })
+onMounted(() => { loadModels(); loadSectors(); loadManualFeatures(); loadMonitorActive() })
 onUnmounted(() => { pollActive = false })
 </script>
 
@@ -514,6 +541,7 @@ onUnmounted(() => { pollActive = false })
             <td>
               {{ m.id }}
               <span v-if="m.computable === false" class="badge-warn" :title="'未知特征: ' + (m.unknownFeatures||[]).join(', ')">因子不可计算</span>
+              <span v-if="monitorModelId === m.id" class="badge-monitor" title="此模型正在盯盘调度中使用">🔍 盯盘中</span>
             </td>
             <td class="muted">{{ m.modelType || '?' }}</td>
             <td class="muted">{{ m.nFeatures ?? '?' }}</td>
@@ -563,6 +591,7 @@ onUnmounted(() => { pollActive = false })
         </div>
         <div class="panel-toolbar">
           <button class="btn-primary sm" @click="saveAdjust({ id: adjustPanel })">保存调参配置</button>
+          <button class="btn-ghost sm" :disabled="cloneSaving" @click="saveAsNewModel({ id: adjustPanel })">{{ cloneSaving ? '另存中…' : '另存为新模型' }}</button>
           <span v-if="lastAdjustId" class="hint">已保存 adjustId：{{ lastAdjustId }}（打分/回测自动生效）</span>
         </div>
         <div v-if="adjustNote" class="adj-note">{{ adjustNote }}</div>
@@ -647,6 +676,7 @@ onUnmounted(() => { pollActive = false })
 /* 模型可回测状态标记 */
 .row-disabled td { opacity: 0.55; }
 .badge-warn { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; background: rgba(255,107,107,.15); color: #ff6b6b; font-size: 10px; font-weight: 600; }
+.badge-monitor { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; background: rgba(79,140,255,.15); color: #4f8cff; font-size: 10px; font-weight: 600; }
 .tag-ok { color: #22c55e; font-weight: 600; font-size: 12px; }
 .tag-fail { color: #ff6b6b; font-weight: 600; font-size: 12px; }
 .factor-checkbox { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }

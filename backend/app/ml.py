@@ -1068,8 +1068,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     n = max(1, n)
     # 历史钳制：内置长周期因子需要足够窗口（momentum120 / dist_52w_high 240 日）；
     # 上限 1500 日（约 6 年）：超过此值 Sina API 返回 null，Tencent 降级返回格式异常
-    hist = max(int(hist), min_hist_for_ml(n))
+    user_hist = int(hist)
+    hist = max(user_hist, min_hist_for_ml(n))
     hist = min(hist, 1500)
+    hist_clamped = hist != user_hist
 
     bench_code = BENCHMARKS.get(benchmark)
     if benchmark != "none" and bench_code is None:
@@ -1171,6 +1173,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     bucket_returns = [[] for _ in range(groups)]
     long_short_points = []
     top_group_returns = []
+    position_ledger = []
     bench_by_date = {}
     cum = 1.0
     cum_top = 1.0
@@ -1267,9 +1270,11 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
 
         sorted_preds = sorted(preds)
         day_buckets = [[] for _ in range(groups)]
-        for fv, fret in zip(preds, cross_rets):
+        day_bucket_codes = [[] for _ in range(groups)]
+        for code, fv, fret in zip(cross_codes, preds, cross_rets):
             b = bucket_index(fv, sorted_preds, groups)
             day_buckets[b].append(fret)
+            day_bucket_codes[b].append(code)
             bucket_returns[b].append(fret)
 
         if day_buckets[0] and day_buckets[-1]:
@@ -1284,6 +1289,13 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             long_short_points.append({
                 "date": date_t, "longShort": net_ls, "cum": cum - 1.0,
                 "topCum": cum_top - 1.0, "gross": ls_ret,
+            })
+            position_ledger.append({
+                "date": date_t,
+                "long": day_bucket_codes[-1][:],
+                "short": day_bucket_codes[0][:],
+                "longReturn": top_ret,
+                "shortReturn": bottom_ret,
             })
             top_group_returns.append(net_top)
             if bench_series and bench_date_idx:
@@ -1357,6 +1369,15 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     ic_stats = information_coefficient_stats([p["ic"] for p in ic_series], ppy)
     mean_rank_ic = mean([p["rankIc"] for p in ic_series])
 
+    effective_start = ic_series[0]["date"] if ic_series else (start_date or ref_dates[60])
+    effective_end = ic_series[-1]["date"] if ic_series else (end_date or ref_dates[-1])
+    hist_warning = None
+    if hist_clamped:
+        hist_warning = (
+            f"历史长度(hist)已从 {user_hist} 自动调整至 {hist} 日，"
+            f"以确保覆盖内置长周期因子所需的最短窗口（≥{min_hist_for_ml(n)}日）。"
+            f"回测实际拉取 {hist} 日 K 线，有效调仓区间 {effective_start} ~ {effective_end}。"
+        )
     result = {
         "factorLabel": f"ML模型({mid})", "groups": groups, "n": n, "modelId": mid,
         "meanIc": ic_stats["meanIc"], "meanRankIc": mean_rank_ic,
@@ -1364,8 +1385,12 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         "icSeries": ic_series, "groupSummary": group_summary, "longShort": long_short_points,
         "metrics": metrics, "benchmark": bench_metrics,
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
+        "actualHistDays": hist, "effectiveStart": effective_start, "effectiveEnd": effective_end,
+        "positionLedger": position_ledger,
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
     }
+    if hist_warning:
+        result["histWarning"] = hist_warning
     if config is not None:
         result["config"] = config
     # 快照因子前视风险警告
@@ -1394,11 +1419,13 @@ def _equity_curve(returns: list[float]) -> list[float]:
     return eq
 
 
-async def score_codes(mid: str, codes: list[str]) -> list[dict]:
+async def score_codes(mid: str, codes: list[str],
+                     adjust: dict | None = None) -> list[dict]:
     """对指定代码列表用落盘模型打分（供盯盘调度复用，不依赖行情列表接口）。
 
     快照特征用腾讯行情字段（turnover/pe/pb/市值）填充，财务类字段缺失则跳过该股。
-    返回 [{code, score}]，按代码顺序（与输入对齐）。
+    adjust 为调参配置 {featureWeights, threshold}，与 score_latest 口径对齐。
+    返回 [{code, score}]。
     """
     bundle = _load_model(mid)
     feature_names = bundle["feature_names"]
@@ -1445,7 +1472,13 @@ async def score_codes(mid: str, codes: list[str]) -> list[dict]:
         return []
     X = np.array([f for _, f in collected], dtype=np.float64)
     Xp = _apply_preprocess(X, params)
-    preds = model.predict(Xp).tolist()
+    if adjust:
+        Xp = _apply_feature_weights(Xp, feature_names, adjust.get("featureWeights") or {})
+    preds = model.predict(Xp)
+    if adjust:
+        preds = _apply_threshold(preds.tolist(), adjust.get("threshold"))
+    else:
+        preds = preds.tolist()
     # 人造模型规则过滤
     model_rule = getattr(model, 'rule', '')
     if model_rule:
@@ -1706,6 +1739,45 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
     except Exception:
         pass
     return meta
+
+
+def clone_model_with_adjust(mid: str, feature_weights: dict | None = None,
+                            threshold: float | None = None) -> dict:
+    """复制原模型并附上调参权重，另存为一个独立新模型。
+
+    新模型与原模型同源（bundle 完整复制，含 model/preprocess/feature_names），
+    仅在侧车 JSON 中写入 featureWeights 和 threshold 供后续推理时 apply。
+    新模型 ID 为 clone_{原mid}_{timestamp}。
+    """
+    src_path = os.path.join(ML_DIR, f"{mid}.joblib")
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"原模型不存在: {mid}")
+    src_meta = load_model_meta(mid) or {}
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_id = f"clone_{mid}_{ts}"
+    new_path = os.path.join(ML_DIR, f"{new_id}.joblib")
+    # 完整复制原模型 bundle
+    bundle = joblib.load(src_path)
+    joblib.dump(bundle, new_path)
+    # 写入新侧车 JSON：包含调参权重
+    fw = {k: float(v) for k, v in (feature_weights or {}).items()
+          if k in (bundle.get("feature_names") or [])}
+    new_meta = {
+        "id": new_id, "path": new_path,
+        "modelType": src_meta.get("modelType", bundle.get("model_type", "gbdt")),
+        "featureNames": bundle.get("feature_names") or src_meta.get("featureNames") or [],
+        "featureImportance": src_meta.get("featureImportance") or [],
+        "featureWeights": fw or None,
+        "threshold": float(threshold) if threshold is not None else None,
+        "clonedFrom": mid,
+        "trainedAt": datetime.datetime.now().isoformat(),
+    }
+    try:
+        with open(os.path.join(ML_DIR, f"{new_id}.json"), "w", encoding="utf-8") as f:
+            json.dump(new_meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return new_meta
 
 
 def model_import_template() -> dict:

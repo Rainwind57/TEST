@@ -376,9 +376,20 @@ onMounted(async () => {
     <div v-if="loading" class="stat-cards"><Skeleton type="cards" :count="8" /></div>
     <div v-else-if="!result" class="empty-hint">设置参数后点击「运行分层回测」</div>
     <template v-else>
+      <div v-if="result.histWarning" class="warn-box" style="margin-bottom:12px">
+        📌 {{ result.histWarning }}
+      </div>
+      <div v-if="result.survivorshipBiasWarning" class="warn-box" style="margin-bottom:12px">
+        ⚠️ {{ result.survivorshipBiasWarning }}
+      </div>
+      <div v-if="result.snapshotWarning" class="warn-box" style="margin-bottom:12px;background:rgba(230,168,23,.12);border-color:#e6a81755;color:#e6a817">
+        ⚠️ {{ result.snapshotWarning }}
+      </div>
       <div class="stat-cards">
         <div class="stat-card"><div class="label">有效股票数</div><div class="value">{{ result.effectiveStocks }}</div></div>
         <div class="stat-card"><div class="label">调仓期数</div><div class="value">{{ result.rebalanceCount }}</div></div>
+        <div class="stat-card"><div class="label">有效区间</div><div class="value hint" style="font-size:13px">{{ result.effectiveStart || '-' }} ~ {{ result.effectiveEnd || '-' }}</div></div>
+        <div class="stat-card"><div class="label">实际K线天数</div><div class="value">{{ result.actualHistDays || '-' }}</div></div>
         <div class="stat-card"><div class="label">平均 IC</div><div class="value" :class="result.meanIc >= 0 ? 'up' : 'down'">{{ num(result.meanIc) }}</div></div>
         <div class="stat-card"><div class="label">IC 胜率</div><div class="value">{{ (result.icWinRate * 100).toFixed(1) }}%</div></div>
         <div class="stat-card"><div class="label">年化收益</div><div class="value up">{{ pct(m.annualizedReturn) }}</div></div>
@@ -410,4 +421,5 @@ onMounted(async () => {
 .btn-ghost.sm { padding: 4px 10px; font-size: 12px; margin-right: 4px; }
 .btn-ghost.sm.danger { color: #ff6b6b; }
 .muted { color: var(--text-mute); font-size: 12px; }
+.warn-box { background: rgba(255,82,82,.06); border: 1px solid #ff525244; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #ff5252; }
 </style>

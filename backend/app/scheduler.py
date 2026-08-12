@@ -9,6 +9,7 @@
 （_last_run / 信号结果）已落 scheduler_runs 表，重启后可审计、可回溯。
 """
 import asyncio
+import bisect
 import datetime
 import logging
 import os
@@ -48,17 +49,22 @@ def get_signal_config() -> dict:
       - "isolated"：对 watchlist 各股孤立打分
       - "full"（默认）：对全池排名后取 watchlist 子集的分位（与选股 score_latest 口径一致）
     monitor_rule_factor 为规则模式的因子名（空=默认动量+RSI）
+    monitor_board / monitor_pool_size / monitor_adjust_id 为模型模式下的板块/池规模/调参传递
     """
     return {
         "mode": db.get_setting("monitor_mode", "rule"),
         "modelId": db.get_setting("monitor_model_id", ""),
         "ranking": db.get_setting("monitor_ranking", "full"),
         "ruleFactor": db.get_setting("monitor_rule_factor", ""),
+        "board": db.get_setting("monitor_board", "all"),
+        "poolSize": int(db.get_setting("monitor_pool_size", "150")),
+        "adjustId": db.get_setting("monitor_adjust_id", ""),
     }
 
 
 def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
-                     rule_factor: str = "") -> dict:
+                     rule_factor: str = "", board: str = "all",
+                     pool_size: int = 150, adjust_id: str = "") -> dict:
     if mode not in ("rule", "model"):
         raise ValueError("mode 必须为 rule 或 model")
     if mode == "model":
@@ -73,6 +79,9 @@ def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
     db.set_setting("monitor_model_id", model_id or "")
     db.set_setting("monitor_ranking", ranking if mode == "model" else "")
     db.set_setting("monitor_rule_factor", rule_factor if mode == "rule" else "")
+    db.set_setting("monitor_board", board)
+    db.set_setting("monitor_pool_size", str(pool_size))
+    db.set_setting("monitor_adjust_id", adjust_id)
     return get_signal_config()
 
 
@@ -184,10 +193,12 @@ async def scan_now(force: bool = False) -> dict:
     """立即手动执行一次盯盘信号扫描（替代只能等交易日 15:10 cron 的被动模式）。
 
     force=True 时跳过交易日判断，方便用户任意时刻验证扫描逻辑能否产出信号。
+    扫描全市场K线较耗时（30-60秒），前端已设置长超时。
     """
     if not force and not await _is_trading_day():
         return {"ok": False, "reason": "当前非交易日，扫描已跳过（可加 force=true 强制扫描）", "signals": []}
     await _scan_signals_impl()
+    _last_run = {"task": "scan_signals", "ts": datetime.datetime.now().isoformat()}
     return {"ok": True, "signals": _last_signals}
 
 
@@ -195,8 +206,15 @@ async def _scan_signals_impl():
     global _last_signals
     try:
         conn = db.get_conn()
-        all_codes = [r["code"] for r in conn.execute("SELECT code FROM watchlist ORDER BY added_at").fetchall()]
+        all_codes = [r["code"] for r in conn.execute("SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
         positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost FROM positions").fetchall()}
+        # 构建名称查找表（优先 watchlist name，其次 positions name）
+        name_map = {}
+        for r in conn.execute("SELECT code, name FROM watchlist WHERE name IS NOT NULL AND name != ''").fetchall():
+            name_map[r["code"]] = r["name"]
+        for r in conn.execute("SELECT code, name FROM positions WHERE name IS NOT NULL AND name != ''").fetchall():
+            if r["code"] not in name_map:
+                name_map[r["code"]] = r["name"]
         conn.close()
 
         # 过滤不可交易标的（指数/ETF），只对可交易个股生成信号与下单
@@ -219,16 +237,55 @@ async def _scan_signals_impl():
                                            f"请重新保存配置（或切回规则模式）")
                 return
             try:
+                # 解析调参配置（与选股口径对齐）
+                adjust_cfg = None
+                if cfg.get("adjustId"):
+                    from . import artifacts
+                    rec = artifacts.load_artifact(cfg["adjustId"])
+                    if rec:
+                        adj_payload = rec.get("payload", {})
+                        adjust_cfg = {
+                            "modelId": adj_payload.get("modelId", cfg["modelId"]),
+                            "featureNames": adj_payload.get("featureNames", []),
+                            "featureWeights": adj_payload.get("featureWeights") or {},
+                            "threshold": adj_payload.get("threshold"),
+                        }
                 if cfg.get("ranking") == "full":
-                    # 全池排名口径（与选股 score_latest 一致）：对全市场排序后取 watchlist 分位
-                    ranked = await ml.score_latest(cfg["modelId"], pool_size=150)
-                    rank_by_code = {r["code"]: r for r in ranked}
-                    total = len(ranked)
+                    # 全池排名口径：先用 score_codes 给自选股精确打分，再用 score_latest 获取
+                    # 全市场得分分布计算分位，避免自选股不在 top N 中时丢失信号
+                    import bisect
+                    watchlist_scored = {}
+                    try:
+                        wl = await ml.score_codes(cfg["modelId"], codes, adjust=adjust_cfg)
+                        watchlist_scored = {s["code"]: s["score"] for s in wl}
+                    except Exception:
+                        logger.warning("盯盘自选股打分失败，回退为仅全池排名", exc_info=True)
+
+                    ranked = await ml.score_latest(
+                        cfg["modelId"],
+                        board=cfg.get("board", "all"),
+                        pool_size=cfg.get("poolSize", 150),
+                        adjust=adjust_cfg,
+                    )
+                    market_scores = sorted([r["score"] for r in ranked])
+                    n_market = len(market_scores)
+
                     for c in codes:
-                        r = rank_by_code.get(c)
-                        if not r:
-                            continue
-                        pct = (total - r["rank"] + 1) / max(1, total)
+                        wl_score = watchlist_scored.get(c)
+                        if wl_score is None:
+                            r = {r["code"]: r for r in ranked}.get(c)
+                            if not r:
+                                continue
+                            wl_score = r["score"]
+                            rank = r["rank"]
+                            idx = bisect.bisect_left(market_scores, wl_score)
+                        else:
+                            idx = bisect.bisect_left(market_scores, wl_score)
+                            rank = n_market - idx if idx < n_market else 1
+
+                        # 分位：idx 为 market_scores 中小于 wl_score 的数量
+                        # idx 大 = 很多股票得分低于此股 = 排名靠前
+                        pct = (idx + 1) / max(1, n_market + 1) if n_market > 0 else 0.5
                         if pct >= 0.75:
                             sig = "看多"
                         elif pct <= 0.25:
@@ -237,15 +294,31 @@ async def _scan_signals_impl():
                             sig = "中性"
                         if c in positions and sig == "看空":
                             sig = "平仓"
-                        signals.append({"code": c, "score": r["score"], "rank": r["rank"],
-                                       "signal": sig, "mode": "model"})
+                        signals.append({"code": c, "score": wl_score, "rank": rank,
+                                       "signal": sig, "mode": "model",
+                                       "board": cfg.get("board", "all"),
+                                       "poolSize": cfg.get("poolSize", 150)})
                 else:
-                    scored = await ml.score_codes(cfg["modelId"], codes)
+                    # isolated 口径：对自选股独立打分，但同样取全市场分布计算分位
+                    # 避免 isolated 用硬编码 0.005 阈值与 full 口径不一致
+                    import bisect as _bisect2
+                    scored = await ml.score_codes(cfg["modelId"], codes, adjust=adjust_cfg)
+                    ranked = await ml.score_latest(
+                        cfg["modelId"],
+                        board=cfg.get("board", "all"),
+                        pool_size=cfg.get("poolSize", 150),
+                        adjust=adjust_cfg,
+                    )
+                    market_scores_iso = sorted([r["score"] for r in ranked])
+                    n_iso = len(market_scores_iso)
+
                     for s in scored:
                         score = s["score"]
-                        if score > 0.005:
+                        idx = _bisect2.bisect_left(market_scores_iso, score) if n_iso > 0 else 0
+                        pct = (idx + 1) / max(1, n_iso + 1) if n_iso > 0 else 0.5
+                        if pct >= 0.75:
                             sig = "看多"
-                        elif score < -0.005:
+                        elif pct <= 0.25:
                             sig = "看空"
                         else:
                             sig = "中性"
@@ -253,6 +326,8 @@ async def _scan_signals_impl():
                             sig = "平仓"
                         signals.append({
                             "code": s["code"], "score": score, "signal": sig, "mode": "model",
+                            "board": cfg.get("board", "all"),
+                            "poolSize": cfg.get("poolSize", 150),
                         })
             except Exception as e:
                 _last_signals = []
@@ -326,6 +401,7 @@ async def _scan_signals_impl():
 
         # 对已持仓但不在 watchlist 中的标的也做退出检查
         watched = set(codes)
+        current_mode = cfg["mode"]
         for pos_code in positions:
             if pos_code in watched:
                 continue
@@ -350,8 +426,38 @@ async def _scan_signals_impl():
                 exit_tag = ("持仓走弱(建议减仓)"
                            if not exit_tag else exit_tag + "+走弱")
             if exit_tag:
-                signals.append({"code": pos_code, "momentum": m, "rsi": r, "signal": exit_tag,
-                                "mode": "rule", "inPosition": True})
+                signals.append({"code": pos_code, "name": name_map.get(pos_code, ""),
+                                "momentum": m, "rsi": r, "signal": exit_tag,
+                                "mode": current_mode, "inPosition": True})
+
+        # 为所有信号补全 name 字段（供前端展示和操作入口使用）
+        for s in signals:
+            if not s.get("name"):
+                s["name"] = name_map.get(s["code"], "")
+
+        # 仓位联动增强：持仓且信号变中性 → 减仓（区别于看空→平仓）
+        # 持仓且存在得分更高的候选 → 换仓建议
+        if cfg["mode"] == "model" and positions:
+            signal_by_code = {s["code"]: s for s in signals}
+            best_code = None
+            best_score = -999
+            for s in signals:
+                if s.get("score") is not None and s["score"] > best_score:
+                    best_score = s["score"]
+                    best_code = s["code"]
+
+            for pos_code, pos in positions.items():
+                sig = signal_by_code.get(pos_code)
+                if not sig:
+                    continue
+                # 减仓：持仓中，信号为中性
+                if sig.get("signal") == "中性":
+                    sig["signal"] = "减仓"
+                # 换仓：持仓中，且存在得分明显更高的其他股票
+                if best_code and best_code != pos_code and best_score > (sig.get("score") or -999) + 0.01:
+                    sig["swapTo"] = best_code
+                    sig["swapToName"] = name_map.get(best_code, best_code)
+                    sig["swapScore"] = best_score
 
         _last_signals = signals
         db.log_scheduler_run("scan_signals", True, {"count": len(signals), "mode": cfg["mode"],

@@ -71,9 +71,14 @@ def payload_from_result(result: dict) -> dict:
         "benchmark": result.get("benchmark"),
         "groupSummary": result.get("groupSummary") or [],
         "longShort": result.get("longShort") or [],
+        "positionLedger": result.get("positionLedger") or [],
         "icSeries": result.get("icSeries") or [],
         "survivorshipBiasWarning": result.get("survivorshipBiasWarning", ""),
         "snapshotWarning": result.get("snapshotWarning", ""),
+        "histWarning": result.get("histWarning", ""),
+        "actualHistDays": result.get("actualHistDays"),
+        "effectiveStart": result.get("effectiveStart"),
+        "effectiveEnd": result.get("effectiveEnd"),
         "longOnly": result.get("longOnly", True),
         "longOnlyNote": result.get("longOnlyNote", ""),
         "longShortNote": result.get("longShortNote", ""),
@@ -105,7 +110,7 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     if strategy_kind == "ML模型":
         strategy_name = cfg.get("modelId") or "-"
 
-    # 警告横幅：前视偏差 / 生存偏差 / 多空不可实盘
+    # 警告横幅：前视偏差 / 生存偏差 / 多空不可实盘 / 历史长度钳制
     warnings = []
     sw = payload.get("snapshotWarning", "")
     if sw:
@@ -113,6 +118,9 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     sb = payload.get("survivorshipBiasWarning", "")
     if sb:
         warnings.append(f'<div class="warn-banner">⚠️ 生存偏差：{_htmlescape(sb)}</div>')
+    hw = payload.get("histWarning", "")
+    if hw:
+        warnings.append(f'<div class="info-banner">📌 历史长度调整：{_htmlescape(hw)}</div>')
     lo = payload.get("longOnly", True)
     if lo:
         note = payload.get("longOnlyNote", "")
@@ -199,6 +207,11 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
 
     warnings_html = "\n".join(warnings) if warnings else ""
 
+    # 有效区间（从回测结果中读取，解决"报告看不出回测区间"的历史问题）
+    eff_start = payload.get("effectiveStart") or cfg.get("effectiveStart") or "-"
+    eff_end = payload.get("effectiveEnd") or cfg.get("effectiveEnd") or "-"
+    actual_hist = payload.get("actualHistDays") or cfg.get("actualHistDays") or hist_val
+
     summary = (
         f'{warnings_html}'
         f'{factor_html}'
@@ -209,6 +222,8 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     f'<td>策略名/模型ID</td><td>{_htmlescape(strategy_name)}</td></tr>'
         f'<tr><td>回测区间</td><td>{start} ~ {end}</td>'
         f'<td>历史长度(hist)</td><td>{hist_val}</td></tr>'
+        f'<tr><td>有效调仓区间</td><td>{eff_start} ~ {eff_end}</td>'
+        f'<td>实际拉取K线天数</td><td>{actual_hist}</td></tr>'
         f'<tr><td>持有期(n)</td><td>{n_val}</td>'
         f'<td>候选池规模</td><td>{pool_size}</td></tr>'
         f'<tr><td>板块</td><td>{board_val}</td>'
@@ -340,6 +355,7 @@ th{{background:#16213c;color:#cfe0ff}}
 <div class="card"><h3>多空累计收益与回撤</h3><p class="sub" style="margin:4px 0 8px">蓝线为多空组合累计收益率（%），红色阴影为回撤。长期右上→策略有效。</p><div id="chartLS" class="chart"></div></div>
 <div class="card"><h3>分组平均收益</h3><p class="sub" style="margin:4px 0 8px">柱状图为各分组的平均持仓期收益，分组1→N 单调→因子区分度好。</p><div id="chartGroup" class="chart"></div></div>
 <div class="card"><h3>IC / RankIC 时序列</h3><p class="sub" style="margin:4px 0 8px">IC（皮尔逊）/ RankIC（斯皮尔曼）时序。>0 天数多→因子预测方向稳，|IC|大→区分度强。</p><div id="chartIC" class="chart"></div></div>
+<div class="card" id="chartPos" style="display:none"><h3>持仓与换手变化</h3><p class="sub" style="margin:4px 0 8px">每期多头/空头持仓数量及换手股数。换手高→模型对不同股票区分度强、信号变化活跃。</p><div id="chartPos" class="chart"></div></div>
 <script>
 const LS={ls_json}, GS={gs_json}, IC={ic_json};
 const dates=LS.map(p=>p.date);
@@ -375,6 +391,31 @@ echarts.init(document.getElementById('chartIC')).setOption({{
     {{name:'RankIC',type:'line',data:IC.map(p=>p.rankIc),showSymbol:false,itemStyle:{{color:'#6c5ce7'}}}}
   ]
 }});
+const PL = {json.dumps(payload.get("positionLedger") or [], ensure_ascii=False)};
+if (PL.length > 0) {{
+  document.getElementById('chartPos').style.display = 'block';
+  const posDates = PL.map(p => p.date);
+  const posLongCount = PL.map(p => p.long ? p.long.length : 0);
+  const posShortCount = PL.map(p => p.short ? p.short.length : 0);
+  const posTurnover = PL.map((p, i) => {{
+    if (i === 0) return posLongCount[0] + posShortCount[0];
+    const prev = new Set([...(PL[i-1].long||[]), ...(PL[i-1].short||[])]);
+    const curr = new Set([...(p.long||[]), ...(p.short||[])]);
+    let same = 0; prev.forEach(c => {{ if (curr.has(c)) same++; }});
+    return (prev.size + curr.size - 2*same);
+  }});
+  echarts.init(document.getElementById('chartPos')).setOption({{
+    tooltip:{{trigger:'axis'}}, legend:{{textStyle:{{color:'#8e9bbd'}},top:0}},
+    grid:{{left:60,right:30,top:40,bottom:60}},
+    xAxis:{{type:'category',data:posDates,axisLabel:{{color:'#8e9bbd',rotate:45}}}},
+    yAxis:[{{type:'value',name:'持仓数',axisLabel:{{color:'#8e9bbd'}}}},{{type:'value',name:'换手数',axisLabel:{{color:'#8e9bbd'}}}}],
+    series:[
+      {{name:'多头持仓',type:'line',data:posLongCount,showSymbol:false,itemStyle:{{color:'#ff4d4f'}}}},
+      {{name:'空头持仓',type:'line',data:posShortCount,showSymbol:false,itemStyle:{{color:'#21c08b'}}}},
+      {{name:'换手股数',type:'bar',yAxisIndex:1,data:posTurnover,itemStyle:{{color:'rgba(79,140,255,.35)'}}}}
+    ]
+  }});
+}}
 </script>
 </body></html>"""
 

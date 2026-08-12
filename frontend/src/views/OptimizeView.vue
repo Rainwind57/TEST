@@ -173,6 +173,9 @@ onMounted(async () => {
         <span v-if="jobStatus" class="hint" style="margin-left:8px">{{ jobStatus }}</span>
         <button class="btn-ghost" v-if="result" @click="saveStrategy">回写为策略</button>
         <button class="btn-ghost" v-if="result" @click="applyToBacktest">应用到回测</button>
+        <span v-if="result?.finalModel?.id" class="hint" style="margin-left:8px;color:#4f8cff">
+          ✅ 已保存模型：{{ result.finalModel.id }}
+        </span>
       </div>
     </div>
 

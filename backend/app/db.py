@@ -40,8 +40,14 @@ def init_db():
     cur = conn.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS watchlist (
         code TEXT PRIMARY KEY,
+        name TEXT DEFAULT '',
         added_at TEXT
     )""")
+    # 兼容旧表缺少 name 列
+    try:
+        cur.execute("ALTER TABLE watchlist ADD COLUMN name TEXT DEFAULT ''")
+    except Exception:
+        pass
     cur.execute("""CREATE TABLE IF NOT EXISTS portfolio_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         cash REAL NOT NULL

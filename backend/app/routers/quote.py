@@ -11,6 +11,7 @@ router = APIRouter(prefix="/api", tags=["quote"])
 
 class WatchAddBody(BaseModel):
     code: str
+    name: str = ""
 
 
 @router.get("/quote")
@@ -87,9 +88,9 @@ async def stock_exists(code: str):
 @router.get("/watchlist")
 def get_watchlist():
     conn = db.get_conn()
-    rows = conn.execute("SELECT code FROM watchlist ORDER BY added_at").fetchall()
+    rows = conn.execute("SELECT code, name FROM watchlist ORDER BY added_at").fetchall()
     conn.close()
-    return [r["code"] for r in rows]
+    return [{"code": r["code"], "name": r["name"] or ""} for r in rows]
 
 
 @router.post("/watchlist")
@@ -102,8 +103,8 @@ def add_watchlist(body: WatchAddBody, uid: int = Depends(require_user_id)):
     if existing:
         conn.close()
         raise HTTPException(409, "已在自选列表中")
-    conn.execute("INSERT INTO watchlist (code, added_at) VALUES (?, ?)",
-                 (code, datetime.datetime.now().isoformat()))
+    conn.execute("INSERT INTO watchlist (code, name, added_at) VALUES (?, ?, ?)",
+                 (code, (body.name or "").strip(), datetime.datetime.now().isoformat()))
     conn.commit()
     conn.close()
     return {"ok": True}

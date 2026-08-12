@@ -17,6 +17,9 @@ class SignalConfigBody(BaseModel):
     modelId: str = ""
     ranking: str = "isolated"      # 模型模式排名口径：isolated=孤立打分 / full=全池排名分位
     ruleFactor: str = ""          # 规则模式因子名（空=默认动量+RSI）
+    board: str = "all"            # 模型模式候选板块（与选股口径对齐）
+    poolSize: int = 150           # 模型模式候选池规模
+    adjustId: str = ""            # 模型模式调参配置 artifact id
 
 
 @router.get("/status")
@@ -39,10 +42,14 @@ def set_signal_config(body: SignalConfigBody, uid: int = Depends(require_user_id
     """设置盯盘信号引擎：rule 规则或指定 ML 模型（modelId 必填）。
     
     模型模式：ranking=isolated 对各股孤立打分，ranking=full 对全池排名后取分位（与选股口径一致）。
+    board/poolSize/adjustId 为模型模式下的候选板块/池规模/调参配置，与选股口径对齐。
     规则模式：ruleFactor 为空则默认动量+RSI，否则用指定因子。
     """
     try:
-        return scheduler.set_signal_config(body.mode, body.modelId, body.ranking, body.ruleFactor)
+        return scheduler.set_signal_config(
+            body.mode, body.modelId, body.ranking, body.ruleFactor,
+            board=body.board, pool_size=body.poolSize, adjust_id=body.adjustId,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 

@@ -4,27 +4,36 @@ import api from '../api/client'
 export const useWatchlistStore = defineStore('watchlist', {
   state: () => ({
     codes: [],
+    nameMap: {},          // { code: name } — 从 /watchlist API 返回
     source: 'tencent',
-    quotes: {},          // { code: quoteObj }
-    noData: [],          // 已拉取但无行情数据的代码（无效代码/退市/停牌无数据），用于区分"加载中"与"无数据"
+    quotes: {},
+    noData: [],
     activeCode: null,
     loading: false,
     lastUpdated: null
   }),
   getters: {
-    sortedCodes: (state) => state.codes
+    sortedCodes: (state) => state.codes,
+    getName: (state) => (code) => state.nameMap[code] || state.quotes[code]?.name || code
   },
   actions: {
     async fetchWatchlist() {
-      this.codes = await api.get('/watchlist')
+      const data = await api.get('/watchlist')
+      // 兼容旧格式（字符串数组）和新格式（{code, name} 数组）
+      if (data.length && typeof data[0] === 'object') {
+        this.codes = data.map(d => d.code)
+        this.nameMap = {}
+        data.forEach(d => { if (d.name) this.nameMap[d.code] = d.name })
+      } else {
+        this.codes = data
+      }
       if (!this.activeCode && this.codes.length) this.activeCode = this.codes[0]
     },
-    async addCode(code) {
-      await api.post('/watchlist', { code })
+    async addCode(code, name = '') {
+      await api.post('/watchlist', { code, name })
       await this.fetchWatchlist()
       this.activeCode = code
-      // 行情拉取失败不影响添加结果（无效代码/弱网时刷新会抛错，股票本身已入自选）
-      try { await this.refreshQuotes() } catch (e) { /* 忽略，noData 仍会标记 */ }
+      try { await this.refreshQuotes() } catch (e) { /* ignore */ }
     },
     async removeCode(code) {
       await api.delete(`/watchlist/${code}`)

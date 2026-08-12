@@ -180,6 +180,7 @@ class ModelAdjustBody(BaseModel):
     featureWeights: dict[str, float] | None = None   # 特征权重覆盖（key=featureName, value=weight）
     threshold: float | None = None                    # 预测阈值偏移
     saveArtifact: bool = False                        # 调整配置落盘，供打分/回测引用
+    saveAsNew: bool = False                           # 另存为新模型（复制原模型+调参权重）
 
 
 @router.get("/models/{mid}/params")
@@ -237,6 +238,13 @@ def adjust_model(mid: str, body: ModelAdjustBody, uid: int = Depends(require_use
                                         name=f"调参-{mid}")
         result["artifact"] = meta2
         result["adjustId"] = meta2["id"]
+    if body.saveAsNew:
+        try:
+            new_meta = ml.clone_model_with_adjust(mid, body.featureWeights, body.threshold)
+            result["newModel"] = new_meta
+            result["newModelId"] = new_meta.get("id")
+        except Exception as e:
+            result["cloneError"] = str(e)
     return result
 
 
