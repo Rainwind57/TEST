@@ -62,6 +62,14 @@ def get_signal_config() -> dict:
         "source": db.get_setting("monitor_source", "watchlist"),  # watchlist|board|model_topn
         "sourceBoard": db.get_setting("monitor_source_board", "all"),
         "sourceTopN": int(db.get_setting("monitor_source_topn", "20")),
+        "bullPct": float(db.get_setting("monitor_bull_pct", "0.75")),
+        "bearPct": float(db.get_setting("monitor_bear_pct", "0.25")),
+        # 一键买入分配策略（P0 透明化持仓分配）
+        "allocMode": db.get_setting("monitor_alloc_mode", "equal"),      # equal|fixed|risk
+        "perPositionPct": float(db.get_setting("monitor_alloc_per_pos_pct", "0.2")),
+        "maxPositions": int(db.get_setting("monitor_alloc_max_positions", "5")),
+        # 交易方向：long=只做多 / short=只做空 / both=两者（P1 多空分离）
+        "tradeDirections": db.get_setting("monitor_trade_directions", "both"),
     }
 
 
@@ -69,11 +77,20 @@ def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
                      rule_factor: str = "", board: str = "all",
                      pool_size: int = 150, adjust_id: str = "",
                      source: str = "watchlist", source_board: str = "all",
-                     source_topn: int = 20) -> dict:
+                     source_topn: int = 20, bull_pct: float = 0.75,
+                     bear_pct: float = 0.25, alloc_mode: str = "equal",
+                     per_position_pct: float = 0.2, max_positions: int = 5,
+                     trade_directions: str = "both") -> dict:
     if mode not in ("rule", "model"):
         raise ValueError("mode 必须为 rule 或 model")
     if source not in ("watchlist", "board", "model_topn"):
         raise ValueError("source 必须为 watchlist、board 或 model_topn")
+    if alloc_mode not in ("equal", "fixed", "risk"):
+        raise ValueError("allocMode 必须为 equal、fixed 或 risk")
+    if trade_directions not in ("long", "short", "both"):
+        raise ValueError("tradeDirections 必须为 long、short 或 both")
+    if not 0 < per_position_pct <= 1:
+        raise ValueError("单标仓位上限须在 (0, 1] 之间")
     if source == "model_topn" and not model_id:
         raise ValueError("model_topn 来源需要指定 modelId")
     if mode == "model":
@@ -84,6 +101,8 @@ def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
             raise ValueError(f"模型不存在: {model_id}，请重新选择或删除该配置")
         if ranking not in ("isolated", "full"):
             raise ValueError("ranking 必须为 isolated 或 full")
+        if not 0.0 < bear_pct < bull_pct < 1.0:
+            raise ValueError("分位阈值须满足 0 < bearPct < bullPct < 1")
     db.set_setting("monitor_mode", mode)
     db.set_setting("monitor_model_id", model_id or "")
     db.set_setting("monitor_ranking", ranking if mode == "model" else "")
@@ -94,6 +113,12 @@ def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
     db.set_setting("monitor_source", source)
     db.set_setting("monitor_source_board", source_board)
     db.set_setting("monitor_source_topn", str(source_topn))
+    db.set_setting("monitor_bull_pct", str(bull_pct))
+    db.set_setting("monitor_bear_pct", str(bear_pct))
+    db.set_setting("monitor_alloc_mode", alloc_mode)
+    db.set_setting("monitor_alloc_per_pos_pct", str(per_position_pct))
+    db.set_setting("monitor_alloc_max_positions", str(max_positions))
+    db.set_setting("monitor_trade_directions", trade_directions)
     return get_signal_config()
 
 
@@ -103,6 +128,125 @@ def last_run():
 
 def last_signals():
     return _last_signals
+
+
+def _enrich_signal(s: dict, position_codes: set, allow_short: bool = True) -> dict:
+    """为信号附加结构化字段 direction/action/reason，替代前端中文串匹配。
+
+    allow_short=False 时（模型声明 long_only 或 allowShort=False），
+    非持仓股的看空信号不产出空单动作（action=none）。
+    """
+    tag = s.get("signal") or ""
+    code = s["code"]
+
+    direction = "neutral"
+    if any(k in tag for k in ("看多", "超卖", "突破")):
+        direction = "long"
+    elif any(k in tag for k in ("看空", "超买", "走弱")):
+        direction = "short"
+
+    if s.get("swapTo"):
+        action = "swap"
+    elif code in position_codes:
+        if "平仓" in tag:
+            action = "sell"
+        elif "减仓" in tag:
+            action = "sell"
+            s["reduce"] = True
+        else:
+            action = "hold"
+    else:
+        if direction == "long":
+            action = "buy"
+        elif direction == "short":
+            action = "short" if allow_short else "none"
+        else:
+            action = "none"
+
+    parts = []
+    if s.get("momentum") is not None:
+        parts.append(f"动量{s['momentum']:+.2f}")
+    if s.get("rsi") is not None:
+        parts.append(f"RSI{s['rsi']:.0f}")
+    if s.get("score") is not None:
+        parts.append(f"得分{s['score']:.3f}")
+    if s.get("zScore") is not None:
+        parts.append(f"z{s['zScore']:+.2f}")
+    s["direction"] = direction
+    s["action"] = action
+    s["reason"] = "、".join(parts) if parts else tag
+    return s
+
+
+def enrich_signals(signals: list[dict], positions: dict, allow_short: bool = True) -> list[dict]:
+    pos_codes = set(positions.keys())
+    for s in signals:
+        _enrich_signal(s, pos_codes, allow_short)
+    return signals
+
+
+def _rule_or_pct_signal(rules: dict, features: list | None, pct: float, cfg: dict) -> str:
+    """离散买卖规则命中时返回 看多/看空/中性；规则未启用或特征缺失时回退分位阈值。"""
+    if rules.get("active") and features is not None:
+        if rules.get("bullFn") and rules["bullFn"](features, pct):
+            return "看多"
+        if rules.get("bearFn") and rules["bearFn"](features, pct):
+            return "看空"
+        return "中性"
+    bull_pct = float(cfg.get("bullPct", 0.75))
+    bear_pct = float(cfg.get("bearPct", 0.25))
+    if pct >= bull_pct:
+        return "看多"
+    if pct <= bear_pct:
+        return "看空"
+    return "中性"
+
+
+async def plan_allocations(buy_codes: list[str], cash: float, policy: dict) -> dict:
+    """统一分配引擎：等权/固定金额/风险预算，整手取整，下单前可预览。
+
+    policy: {mode:'equal'|'fixed'|'risk', perPositionPct:0.2, maxPositions:5}
+    """
+    mode = policy.get("mode", "equal")
+    per_pct = float(policy.get("perPositionPct", 0.2))
+    max_pos = int(policy.get("maxPositions", 5))
+    codes = list(buy_codes)[:max_pos]
+    if not codes:
+        return {"count": 0, "allocations": [], "perPct": per_pct, "usedPct": 0.0}
+    try:
+        quotes = await adapters.fetch_tencent_quotes(codes)
+    except Exception:
+        quotes = {}
+    budget = cash * per_pct
+    out = []
+    cash_left = cash
+    remaining = len(codes)
+    for code in codes:
+        q = quotes.get(code)
+        price = q.get("price", 0) if q else 0
+        name = q.get("name", "") if q else ""
+        if not price or price <= 0:
+            remaining -= 1
+            out.append({"code": code, "name": name, "price": 0.0, "plannedQty": 0,
+                        "plannedAmount": 0.0, "plannedPct": 0.0, "error": "无行情"})
+            continue
+        if mode == "fixed":
+            per = min(budget, cash_left)
+        else:  # equal / risk（风险预算暂按等权近似）：按剩余现金与剩余标的迭代重算
+            per = min(budget, cash_left / remaining) if remaining > 0 else 0.0
+        qty = int(per / price) // 100 * 100
+        amt = qty * price
+        out.append({"code": code, "name": name, "price": price, "plannedQty": qty,
+                    "plannedAmount": amt, "plannedPct": amt / cash if cash else 0.0})
+        cash_left -= amt
+        remaining -= 1
+    total_amt = sum(a["plannedAmount"] for a in out)
+    return {
+        "count": sum(1 for a in out if a["plannedQty"] > 0),
+        "allocations": out,
+        "perPct": per_pct,
+        "usedPct": total_amt / cash if cash else 0.0,
+    }
 
 
 def start():
@@ -169,7 +313,7 @@ async def _refresh_equity():
     try:
         conn = db.get_conn()
         state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
-        positions = conn.execute("SELECT code, name, qty, avg_cost FROM positions").fetchall()
+        positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
         conn.close()
         if not state:
             return
@@ -180,7 +324,8 @@ async def _refresh_equity():
         for p in positions:
             q = quotes.get(p["code"])
             price = q.get("price", 0) if q else 0
-            market_value += price * p["qty"]
+            sign = -1.0 if p["side"] == "short" else 1.0
+            market_value += sign * price * p["qty"]
         total = cash + market_value
         conn = db.get_conn()
         conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
@@ -245,7 +390,7 @@ async def _scan_signals_impl():
                 "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
 
         all_codes = codes_from_source
-        positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost FROM positions").fetchall()}
+        positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()}
         # 构建名称查找表（优先 watchlist name，其次 positions name）
         name_map = {}
         for r in conn.execute("SELECT code, name FROM watchlist WHERE name IS NOT NULL AND name != ''").fetchall():
@@ -297,13 +442,22 @@ async def _scan_signals_impl():
                             "featureWeights": meta["featureWeights"],
                             "threshold": meta.get("threshold"),
                         }
+                # M6B 离散买卖规则：模型自带 bullRule/bearRule 时，规则判定优先于分位阈值
+                rules = {"active": False, "bullFn": None, "bearFn": None}
+                try:
+                    rules = ml.get_signal_rules(cfg["modelId"])
+                except Exception:
+                    logger.warning("盯盘模型买卖规则加载失败，回退分位阈值", exc_info=True)
                 if cfg.get("ranking") == "full":
                     # 全池排名口径：先用 score_codes 给自选股精确打分，再用 score_latest 获取
                     # 全市场得分分布计算分位，避免自选股不在 top N 中时丢失信号
                     import bisect
                     watchlist_scored = {}
+                    wl_by_code = {}
                     try:
-                        wl = await ml.score_codes(cfg["modelId"], codes, adjust=adjust_cfg)
+                        wl = await ml.score_codes(cfg["modelId"], codes, adjust=adjust_cfg,
+                                                  return_features=rules["active"])
+                        wl_by_code = {s["code"]: s for s in wl}
                         watchlist_scored = {s["code"]: s["score"] for s in wl}
                     except Exception:
                         logger.warning("盯盘自选股打分失败，回退为仅全池排名", exc_info=True)
@@ -319,6 +473,7 @@ async def _scan_signals_impl():
 
                     for c in codes:
                         wl_score = watchlist_scored.get(c)
+                        features = None
                         if wl_score is None:
                             r = {item["code"]: item for item in ranked}.get(c)
                             if not r:
@@ -329,17 +484,13 @@ async def _scan_signals_impl():
                         else:
                             idx = bisect.bisect_left(market_scores, wl_score)
                             rank = n_market - idx if idx < n_market else 1
+                            features = wl_by_code.get(c, {}).get("features")
 
                         # 分位：idx 为 market_scores 中小于 wl_score 的数量
                         # idx 大 = 很多股票得分低于此股 = 排名靠前
                         pct = (idx + 1) / max(1, n_market + 1) if n_market > 0 else 0.5
-                        if pct >= 0.75:
-                            sig = "看多"
-                        elif pct <= 0.25:
-                            sig = "看空"
-                        else:
-                            sig = "中性"
-                        if c in positions and sig == "看空":
+                        sig = _rule_or_pct_signal(rules, features, pct, cfg)
+                        if c in positions and positions[c].get("side", "long") == "long" and sig == "看空":
                             sig = "平仓"
                         signals.append({"code": c, "score": wl_score, "rank": rank,
                                        "signal": sig, "mode": "model",
@@ -349,7 +500,8 @@ async def _scan_signals_impl():
                     # isolated 口径：对自选股独立打分，但同样取全市场分布计算分位
                     # 避免 isolated 用硬编码 0.005 阈值与 full 口径不一致
                     import bisect as _bisect2
-                    scored = await ml.score_codes(cfg["modelId"], codes, adjust=adjust_cfg)
+                    scored = await ml.score_codes(cfg["modelId"], codes, adjust=adjust_cfg,
+                                                  return_features=rules["active"])
                     ranked = await ml.score_latest(
                         cfg["modelId"],
                         board=cfg.get("board", "all"),
@@ -363,13 +515,8 @@ async def _scan_signals_impl():
                         score = s["score"]
                         idx = _bisect2.bisect_left(market_scores_iso, score) if n_iso > 0 else 0
                         pct = (idx + 1) / max(1, n_iso + 1) if n_iso > 0 else 0.5
-                        if pct >= 0.75:
-                            sig = "看多"
-                        elif pct <= 0.25:
-                            sig = "看空"
-                        else:
-                            sig = "中性"
-                        if s["code"] in positions and sig == "看空":
+                        sig = _rule_or_pct_signal(rules, s.get("features"), pct, cfg)
+                        if s["code"] in positions and positions[s["code"]].get("side", "long") == "long" and sig == "看空":
                             sig = "平仓"
                         signals.append({
                             "code": s["code"], "score": score, "signal": sig, "mode": "model",
@@ -417,7 +564,7 @@ async def _scan_signals_impl():
                             tag = f"{rule_factor}弱势(看空)"
                         else:
                             tag = "中性"
-                        if code in positions and "看空" in tag:
+                        if code in positions and positions[code].get("side", "long") == "long" and "看空" in tag:
                             tag = "减仓"
                         signals.append({"code": code, "factorValue": float(v), "zScore": z,
                                        "signal": tag, "mode": "rule"})
@@ -440,7 +587,7 @@ async def _scan_signals_impl():
                                 tag = (tag + "+走弱" if tag else "走弱(看空)")
                         if tag is None:
                             tag = "中性"
-                        if code in positions and ("看空" in tag or "走弱" in tag):
+                        if code in positions and positions[code].get("side", "long") == "long" and ("看空" in tag or "走弱" in tag):
                             tag = "减仓"
                         signals.append({"code": code, "momentum": m, "rsi": r, "signal": tag, "mode": "rule"})
 
@@ -506,6 +653,19 @@ async def _scan_signals_impl():
                     sig["swapToName"] = name_map.get(best_code, best_code)
                     sig["swapScore"] = best_score
 
+        # 模型方向/做空开关：模型声明 long_only 或 allowShort=False 时，看空信号不产出空单
+        allow_short = True
+        if cfg["mode"] == "model" and cfg.get("modelId"):
+            try:
+                from . import ml as _ml_mod
+                _md = _ml_mod.model_direction(cfg["modelId"])
+                allow_short = _md["allowShort"] and _md["direction"] != "long_only"
+            except Exception:
+                allow_short = True
+
+        # 结构化信号：统一附加 direction/action/reason，供前后端消费（P0）
+        enrich_signals(signals, positions, allow_short=allow_short)
+
         _last_signals = signals
         db.log_scheduler_run("scan_signals", True, {"count": len(signals), "mode": cfg["mode"],
                                                      "tradableCount": len(codes)})
@@ -522,56 +682,64 @@ async def _scan_signals_impl():
 
 
 async def _execute_auto_trade(signals: list[dict], positions: dict):
-    """根据信号自动生成买卖单（需 auto_trade 配置开启）。
+    """按结构化信号（direction/action）自动生成买卖/做空/回补单。
 
     风险控制：
-    - 买单：仅对「看多」信号且未持仓的标的建仓，等权分配，单笔≤总现金 20%
-    - 卖单：对「平仓」信号的已持仓标的全平；「减仓」卖出 50% 仓位保留剩余
-    - 单次买卖各不超过 5 笔
+    - 买入：action=buy 且未持多头的标的，分配引擎等权分配，逐单按剩余现金迭代重算
+    - 做空：action=short 且未持空头的标的（融券模拟，方案A）
+    - 卖出：多头持仓中 action=sell（平仓全平 / 减仓半平）
+    - 回补：空头持仓中 direction=long（看多/超卖/突破）→ 全平空单
+    - 各方向单次不超过 maxPositions 笔；tradeDirections 控制只做多/只做空/两者
     """
     import datetime as dt
 
-    buy_signals = [s for s in signals if (
-        ("看多" in (s.get("signal") or "") or "超卖" in (s.get("signal") or ""))
-        and s["code"] not in positions
-    )]
-    sell_signals = [s for s in signals if (
-        s["code"] in positions
-        and ("平仓" in (s.get("signal") or "")
-             or "减仓" in (s.get("signal") or "")
-             or "持仓走弱" in (s.get("signal") or "")
-             or "持仓超买" in (s.get("signal") or ""))
-    )]
-
-    if not buy_signals and not sell_signals:
-        return
+    cfg = get_signal_config()
+    dirs = cfg.get("tradeDirections", "both")
+    max_n = int(cfg.get("maxPositions", 5))
+    per_pct = float(cfg.get("perPositionPct", 0.2))
 
     conn = db.get_conn()
     state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
+    pos_rows = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
+    conn.close()
     if not state:
-        conn.close()
         return
     cash = state["cash"]
-    conn.close()
+    pos_by_code = {r["code"]: r for r in pos_rows}
+    long_codes = {c for c, p in pos_by_code.items() if (p["side"] or "long") == "long"}
+    short_codes = {c for c, p in pos_by_code.items() if p["side"] == "short"}
 
-    # 买单：等权分配，最多 5 笔
-    max_buy = min(len(buy_signals), 5)
     COMM = 0.00025   # 佣金
     STAMP = 0.001    # 印花税
-    if max_buy > 0:
-        per_buy_cash = min(cash * 0.2, cash / max_buy)
-        for sig in buy_signals[:max_buy]:
-            try:
-                quotes = await adapters.fetch_tencent_quotes([sig["code"]])
-            except Exception:
+
+    buy_candidates = [s for s in signals if s.get("action") == "buy" and s["code"] not in long_codes]
+    short_candidates = [s for s in signals if s.get("action") == "short" and s["code"] not in short_codes]
+    sell_candidates = [s for s in signals if s.get("action") == "sell" and s["code"] in long_codes]
+    cover_candidates = [s for s in signals if s.get("direction") == "long" and s["code"] in short_codes]
+
+    if dirs == "long":
+        short_candidates = []
+        cover_candidates = []
+    elif dirs == "short":
+        buy_candidates = []
+        sell_candidates = []
+        cover_candidates = []
+
+    executed = {"buy": 0, "short": 0, "sell": 0, "cover": 0}
+
+    # 买入：复用统一分配引擎（尊重 allocMode 等权/固定金额/风险预算），逐单按剩余现金落单
+    if buy_candidates and dirs in ("long", "both"):
+        plan = await plan_allocations(
+            [s["code"] for s in buy_candidates], cash,
+            {"mode": cfg.get("allocMode", "equal"),
+             "perPositionPct": per_pct, "maxPositions": max_n})
+        for alloc in plan.get("allocations", []):
+            code = alloc["code"]
+            price = alloc["price"]
+            qty = alloc["plannedQty"]
+            amount = alloc["plannedAmount"]
+            if qty < 100 or price <= 0:
                 continue
-            q = quotes.get(sig["code"])
-            if not q or not q.get("price") or q["price"] <= 0:
-                continue
-            qty = int(per_buy_cash / q["price"]) // 100 * 100
-            if qty < 100:
-                continue
-            amount = q["price"] * qty
             cost = amount * COMM
             conn = db.get_conn()
             cur = conn.cursor()
@@ -581,63 +749,143 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
                 conn.close()
                 continue
             new_cash = cur_cash - amount - cost
-            existing = cur.execute("SELECT * FROM positions WHERE code = ?", (sig["code"],)).fetchone()
+            existing = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
             if existing:
                 new_qty = existing["qty"] + qty
                 new_avg = (existing["avg_cost"] * existing["qty"] + amount + cost) / new_qty
                 cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=? WHERE code=?",
-                           (new_qty, new_avg, q["name"], sig["code"]))
+                           (new_qty, new_avg, alloc.get("name", ""), code))
             else:
-                cur.execute("INSERT INTO positions (code, name, qty, avg_cost) VALUES (?, ?, ?, ?)",
-                           (sig["code"], q["name"], qty, q["price"] + cost / qty))
+                cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'long')",
+                           (code, alloc.get("name", ""), qty, price + cost / qty))
             cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
             cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "buy", sig["code"],
-                        q["name"], qty, q["price"], amount))
+                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "buy", code,
+                        alloc.get("name", ""), qty, price, amount))
             conn.commit()
             conn.close()
-            # 记录净值快照，保持 equity_history 连续
+            executed["buy"] += 1
             _record_auto_equity()
 
-    # 卖单：平仓全平，减仓卖 50%，最多 5 笔
-    max_sell = min(len(sell_signals), 5)
-    for sig in sell_signals[:max_sell]:
-        pos = positions[sig["code"]]
-        signal_type = sig.get("signal") or ""
-        is_reduce = "减仓" in signal_type and "平仓" not in signal_type
-        sell_qty = max(100, int(pos["qty"] * 0.5)) if is_reduce else pos["qty"]
-        sell_qty = min(sell_qty, pos["qty"])
-        try:
-            quotes = await adapters.fetch_tencent_quotes([sig["code"]])
-        except Exception:
-            continue
-        q = quotes.get(sig["code"])
-        price = q["price"] if q and q.get("price") and q["price"] > 0 else pos["avg_cost"]
-        amount = price * sell_qty
-        conn = db.get_conn()
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
-        if not cur_pos or cur_pos["qty"] < sell_qty:
+    # 做空：融券开空，复用分配引擎按单标预算折算空单股数（尊重 allocMode）
+    if short_candidates and dirs in ("short", "both"):
+        plan = await plan_allocations(
+            [s["code"] for s in short_candidates], cash,
+            {"mode": cfg.get("allocMode", "equal"),
+             "perPositionPct": per_pct, "maxPositions": max_n})
+        for alloc in plan.get("allocations", []):
+            code = alloc["code"]
+            price = alloc["price"]
+            qty = alloc["plannedQty"]
+            amount = alloc["plannedAmount"]
+            if qty < 100 or price <= 0:
+                continue
+            cost = amount * COMM
+            conn = db.get_conn()
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            existing = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
+            if existing and (existing["side"] or "long") == "long":
+                conn.close()
+                continue
+            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+            new_cash = cur_cash + amount - cost
+            if existing:
+                new_qty = existing["qty"] + qty
+                new_avg = (existing["avg_cost"] * existing["qty"] + amount) / new_qty
+                cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=?, side='short' WHERE code=?",
+                           (new_qty, new_avg, alloc.get("name", ""), code))
+            else:
+                cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'short')",
+                           (code, alloc.get("name", ""), qty, price))
+            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "short", code,
+                        alloc.get("name", ""), qty, price, amount))
+            conn.commit()
             conn.close()
-            continue
-        cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
-        sell_cost = amount * (COMM + STAMP)
-        new_cash = cur_cash + amount - sell_cost
-        remain = cur_pos["qty"] - sell_qty
-        if remain <= 0:
-            cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
-        else:
-            cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
-        cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
-        cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
-                   (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "sell", sig["code"],
-                    pos["name"] or sig["code"], sell_qty, price, amount))
-        conn.commit()
-        conn.close()
-        _record_auto_equity()
+            executed["short"] += 1
+            _record_auto_equity()
 
-    db.log_scheduler_run("auto_trade", True, {"buyCount": max_buy, "sellCount": max_sell})
+    # 卖出：多头平仓全平 / 减仓半平
+    if sell_candidates and dirs in ("long", "both"):
+        for sig in sell_candidates[:max_n]:
+            pos = pos_by_code.get(sig["code"])
+            if not pos:
+                continue
+            is_reduce = bool(sig.get("reduce"))
+            sell_qty = max(100, int(pos["qty"] * 0.5)) if is_reduce else pos["qty"]
+            sell_qty = min(sell_qty, pos["qty"])
+            try:
+                quotes = await adapters.fetch_tencent_quotes([sig["code"]])
+            except Exception:
+                continue
+            q = quotes.get(sig["code"])
+            price = q["price"] if q and q.get("price") and q["price"] > 0 else pos["avg_cost"]
+            amount = price * sell_qty
+            conn = db.get_conn()
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
+            if not cur_pos or (cur_pos["side"] or "long") != "long" or cur_pos["qty"] < sell_qty:
+                conn.close()
+                continue
+            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
+            sell_cost = amount * (COMM + STAMP)
+            new_cash = cur_cash + amount - sell_cost
+            remain = cur_pos["qty"] - sell_qty
+            if remain <= 0:
+                cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
+            else:
+                cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
+            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
+                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "sell", sig["code"],
+                        pos["name"] or sig["code"], sell_qty, price, amount))
+            conn.commit()
+            conn.close()
+            executed["sell"] += 1
+            _record_auto_equity()
+
+    # 回补：空头持仓出现看多信号 → 全平空单
+    if cover_candidates:
+        for sig in cover_candidates[:max_n]:
+            pos = pos_by_code.get(sig["code"])
+            if not pos:
+                continue
+            cover_qty = pos["qty"]
+            try:
+                quotes = await adapters.fetch_tencent_quotes([sig["code"]])
+            except Exception:
+                continue
+            q = quotes.get(sig["code"])
+            price = q["price"] if q and q.get("price") and q["price"] > 0 else pos["avg_cost"]
+            amount = price * cover_qty
+            cost = amount * COMM
+            conn = db.get_conn()
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
+            if not cur_pos or cur_pos["side"] != "short" or cur_pos["qty"] < cover_qty:
+                conn.close()
+                continue
+            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
+            new_cash = cur_cash - amount - cost
+            remain = cur_pos["qty"] - cover_qty
+            if remain <= 0:
+                cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
+            else:
+                cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
+            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
+                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "cover", sig["code"],
+                        pos["name"] or sig["code"], cover_qty, price, amount))
+            conn.commit()
+            conn.close()
+            executed["cover"] += 1
+            _record_auto_equity()
+
+    db.log_scheduler_run("auto_trade", True, executed)
 
 
 def _record_auto_equity():
@@ -649,9 +897,10 @@ def _record_auto_equity():
             conn.close()
             return
         cash = state["cash"]
-        positions = conn.execute("SELECT code, qty, avg_cost FROM positions").fetchall()
-        # 自动调仓时用最近交易价估算市值（无需额外网络请求）
-        mkt_val = sum(p["avg_cost"] * p["qty"] for p in positions)
+        positions = conn.execute("SELECT code, qty, avg_cost, side FROM positions").fetchall()
+        # 自动调仓时用最近交易价（avg_cost）估算市值（无需额外网络请求）
+        mkt_val = sum((-p["avg_cost"] if p["side"] == "short" else p["avg_cost"]) * p["qty"]
+                      for p in positions)
         total = cash + mkt_val
         conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
                      (datetime.datetime.now().isoformat(), total))

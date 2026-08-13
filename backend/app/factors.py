@@ -794,13 +794,23 @@ def win_rate(period_returns: list[float]) -> float:
 
 def information_coefficient_stats(ic_series: list[float], periods_per_year: float = TRADING_DAYS) -> dict:
     """IC 统计。ICIR = meanIC/stdIC × √(年化采样数)；
-    periods_per_year 应传 252/n（n=调仓间隔），旧版误用 √len(总期数) 导致口径错误。"""
+    periods_per_year 应传 252/n（n=调仓间隔），旧版误用 √len(总期数) 导致口径错误。
+    附加 t 统计量（mean / (std/√n)）与双侧 p 值（正态近似）。"""
     if not ic_series:
-        return {"meanIc": 0.0, "icIr": 0.0, "icWinRate": 0.0}
+        return {"meanIc": 0.0, "icIr": 0.0, "icWinRate": 0.0, "tStat": 0.0, "pValue": 1.0}
+    n = len(ic_series)
     m = mean(ic_series)
     s = std(ic_series)
     ir = 0.0 if s == 0 else m / s * math.sqrt(periods_per_year)
-    return {"meanIc": m, "icIr": ir, "icWinRate": sum(1 for v in ic_series if v > 0) / len(ic_series)}
+    if n < 2 or s == 0:
+        t = 0.0
+        p = 1.0 if s == 0 else 0.0
+    else:
+        t = m / (s / math.sqrt(n))
+        # 正态近似双尾 p 值（自由度较大时与 t 分布几乎一致）
+        p = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0))))
+    return {"meanIc": m, "icIr": ir, "icWinRate": sum(1 for v in ic_series if v > 0) / n,
+            "tStat": t, "pValue": p}
 
 
 # ---------------- 交易成本模型 ----------------

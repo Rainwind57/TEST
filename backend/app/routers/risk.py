@@ -109,7 +109,7 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
 async def attribution():
     """对当前模拟盘持仓做收益归因 + 风险分解。"""
     conn = db.get_conn()
-    positions = conn.execute("SELECT code, name, qty, avg_cost FROM positions").fetchall()
+    positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
     conn.close()
     if not positions:
         raise HTTPException(422, "当前无持仓，无法做风险归因")
@@ -118,7 +118,8 @@ async def attribution():
         quotes = await adapters.fetch_tencent_quotes(codes)
     except Exception:
         quotes = {}
-    mv = {r["code"]: (quotes.get(r["code"], {}).get("price", 0) or r["avg_cost"]) * r["qty"]
+    mv = {r["code"]: ((quotes.get(r["code"], {}).get("price", 0) or r["avg_cost"]) * r["qty"]
+                      * (-1.0 if r["side"] == "short" else 1.0))
           for r in positions}
     weights = [float(mv[c]) for c in codes]
     return await _run_attribution(codes, weights)

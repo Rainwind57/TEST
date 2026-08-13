@@ -141,7 +141,7 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             bt_cfg.benchmark, bt_cfg.applyCost, asset_class=bt_cfg.assetClass,
             start_date=bt_cfg.startDate, end_date=bt_cfg.endDate,
             config=bt_cfg.model_dump(),
-            boards=bt_cfg.boards, adjust=adjust))
+            boards=bt_cfg.boards, adjust=adjust, direction=bt_cfg.direction))
     return {"jobId": jid, "status": "pending"}
 
 

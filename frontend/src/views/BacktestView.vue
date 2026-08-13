@@ -46,15 +46,19 @@ const sectorOptions = ref([])
 // P2：资产类别（future 时候选池取期货主力连续合约）
 const assetClass = ref('a-share')
 
-// 起止日联动 hist：hist 是拉取 K 线的数据窗口天数（非回测天数），给因子计算+暖机用
-// dist_52w_high 等长周期因子需要 240 天窗口，再加回测暖机 60 天 → 底线 300
+// 起止日联动 hist：hist 是拉取 K 线的数据窗口天数（从今天往前回溯），给因子计算+暖机用。
+// 覆盖条件：窗口须回溯到 startDate 之前（暖机 60 + 长周期因子 240）；
+// 仅 endDate 时窗口结束于 endDate，需额外覆盖 (today - endDate) 区间。
 watch([startDate, endDate], ([s, e]) => {
-  if (s && e) {
-    const days = (new Date(e) - new Date(s)) / 86400000
-    if (days > 0) {
-      hist.value = Math.max(300, Math.ceil(days) + 240)
-    }
-  } else if (!s && !e) {
+  if (s || e) {
+    const today = new Date(); today.setHours(0, 0, 0, 0)
+    const from = s ? new Date(s + 'T00:00:00') : today
+    const to = e ? new Date(e + 'T00:00:00') : today
+    const backToFrom = Math.max(0, Math.floor((today - from) / 86400000))
+    const extraEnd = to < today ? Math.floor((today - to) / 86400000) : 0
+    const need = backToFrom + 60 + 240 + extraEnd
+    hist.value = Math.max(300, Math.ceil(need))
+  } else {
     hist.value = 300
   }
 })
@@ -179,7 +183,22 @@ async function exportReport(fmt) {
       format: fmt, factorLabel: result.value.factorLabel, config: result.value.config,
       metrics: result.value.metrics, benchmark: result.value.benchmark,
       groupSummary: result.value.groupSummary, longShort: result.value.longShort,
-      icSeries: result.value.icSeries
+      icSeries: result.value.icSeries,
+      positionLedger: result.value.positionLedger || [],
+      featureImportance: result.value.featureImportance || [],
+      actualHistDays: result.value.actualHistDays,
+      effectiveStart: result.value.effectiveStart,
+      effectiveEnd: result.value.effectiveEnd,
+      direction: result.value.direction || 'long_short',
+      survivorshipBiasWarning: result.value.survivorshipBiasWarning || '',
+      snapshotWarning: result.value.snapshotWarning || '',
+      histWarning: result.value.histWarning || '',
+      icIr: result.value.icIr ?? null,
+      icTStat: result.value.icTStat ?? null,
+      icPValue: result.value.icPValue ?? null,
+      yearlyReturns: result.value.yearlyReturns || [],
+      stockContribution: result.value.stockContribution || [],
+      bucketDates: result.value.bucketDates || [],
     }
     const ext = fmt === 'html' ? 'html' : fmt === 'pdf' ? 'pdf' : 'xlsx'
     await downloadFile('/reports/backtest', payload, `backtest.${ext}`)
@@ -325,7 +344,7 @@ onMounted(async () => {
       </div>
       <div class="field"><label>分组数</label><input v-model="groups" type="number" min="2" max="10" /></div>
       <div class="field"><label>持有天数 N</label><input v-model="days" type="number" min="1" max="30" /></div>
-      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="2500" /></div>
+      <div class="field"><label>历史长度(日)</label><input v-model="hist" type="number" min="60" max="5000" /></div>
       <div class="field"><label>回测起始日</label><input v-model="startDate" type="date" /></div>
       <div class="field"><label>回测结束日</label><input v-model="endDate" type="date" /></div>
       <div class="field"><label>基准</label>

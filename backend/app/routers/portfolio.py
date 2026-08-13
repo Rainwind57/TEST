@@ -15,14 +15,14 @@ STAMP_DUTY = 0.001     # 千 1 印花税（卖出单边）
 
 class OrderBody(BaseModel):
     code: str
-    side: str  # "buy" | "sell"
+    side: str  # "buy" | "sell" | "short" | "cover"
     qty: int
 
 
 async def _build_portfolio_view():
     conn = db.get_conn()
     cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-    positions = conn.execute("SELECT code, name, qty, avg_cost FROM positions").fetchall()
+    positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
     trades = conn.execute(
         "SELECT time, side, code, name, qty, price, amount FROM trades ORDER BY id DESC LIMIT 30"
     ).fetchall()
@@ -44,12 +44,15 @@ async def _build_portfolio_view():
     for p in positions:
         q = quotes.get(p["code"])
         price = q["price"] if q else p["avg_cost"]
-        value = price * p["qty"]
+        side = p["side"] or "long"
+        # 空头为负债：市值取负，盈亏 =（开仓价 - 现价）* 数量
+        sign = -1.0 if side == "short" else 1.0
+        value = sign * price * p["qty"]
         market_value += value
-        pnl = (price - p["avg_cost"]) * p["qty"]
-        pnl_pct = (price / p["avg_cost"] - 1) * 100 if p["avg_cost"] else 0.0
+        pnl = (p["avg_cost"] - price) * p["qty"] if side == "short" else (price - p["avg_cost"]) * p["qty"]
+        pnl_pct = ((p["avg_cost"] / price - 1) * 100 if side == "short" else (price / p["avg_cost"] - 1) * 100) if p["avg_cost"] else 0.0
         pos_list.append({
-            "code": p["code"], "name": p["name"], "qty": p["qty"],
+            "code": p["code"], "name": p["name"], "qty": p["qty"], "side": side,
             "avgCost": p["avg_cost"], "price": price, "marketValue": value,
             "pnl": pnl, "pnlPct": pnl_pct,
         })
@@ -77,8 +80,8 @@ async def get_portfolio():
 
 @router.post("/order")
 async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
-    if body.side not in ("buy", "sell"):
-        raise HTTPException(400, "side 必须为 buy 或 sell")
+    if body.side not in ("buy", "sell", "short", "cover"):
+        raise HTTPException(400, "side 必须为 buy/sell/short/cover")
     if body.qty <= 0 or body.qty % 100 != 0:
         raise HTTPException(400, "数量需为 100 的整数倍")
 
@@ -100,8 +103,12 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
     cur.execute("BEGIN IMMEDIATE")  # 获取写锁，防并发下单双花（旧版读改写非原子）
     cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
     pos = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
+    pos_side = pos["side"] if pos else "long"
 
     if body.side == "buy":
+        if pos and pos_side == "short":
+            conn.close()
+            raise HTTPException(422, "该代码持有空单，请先回补（side=cover）")
         cost = amount * COMMISSION
         if amount + cost > cash:
             conn.close()
@@ -113,14 +120,40 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
             cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ? WHERE code = ?",
                         (new_qty, new_avg_cost, q["name"], code))
         else:
-            cur.execute("INSERT INTO positions (code, name, qty, avg_cost) VALUES (?, ?, ?, ?)",
+            cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'long')",
                         (code, q["name"], body.qty, price + cost / body.qty))
-    else:
-        if not pos or pos["qty"] < body.qty:
+    elif body.side == "sell":
+        if not pos or pos_side != "long" or pos["qty"] < body.qty:
             conn.close()
-            raise HTTPException(422, "持仓不足")
+            raise HTTPException(422, "多头持仓不足")
         cost = amount * (COMMISSION + STAMP_DUTY)
         new_cash = cash + amount - cost
+        remain = pos["qty"] - body.qty
+        if remain <= 0:
+            cur.execute("DELETE FROM positions WHERE code = ?", (code,))
+        else:
+            cur.execute("UPDATE positions SET qty = ? WHERE code = ?", (remain, code))
+    elif body.side == "short":
+        # 融券开空：按现价"卖出借入股份"，现金增加，负债以负市值体现
+        if pos and pos_side == "long":
+            conn.close()
+            raise HTTPException(422, "该代码持有多头，请先卖出（side=sell）后再做空")
+        cost = amount * COMMISSION
+        new_cash = cash + amount - cost
+        if pos:
+            new_qty = pos["qty"] + body.qty
+            new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount) / new_qty
+            cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ?, side = 'short' WHERE code = ?",
+                        (new_qty, new_avg_cost, q["name"], code))
+        else:
+            cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'short')",
+                        (code, q["name"], body.qty, price))
+    else:  # cover：买入回补空单
+        if not pos or pos_side != "short" or pos["qty"] < body.qty:
+            conn.close()
+            raise HTTPException(422, "空头持仓不足")
+        cost = amount * COMMISSION
+        new_cash = cash - amount - cost
         remain = pos["qty"] - body.qty
         if remain <= 0:
             cur.execute("DELETE FROM positions WHERE code = ?", (code,))

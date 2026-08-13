@@ -58,6 +58,8 @@ def init_db():
         qty INTEGER NOT NULL,
         avg_cost REAL NOT NULL
     )""")
+    # 做空支持：side=long|short（旧库兼容，默认 long）
+    _ensure_column(cur, "positions", "side", "TEXT DEFAULT 'long'")
     cur.execute("""CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         time TEXT,

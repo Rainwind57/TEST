@@ -19,6 +19,26 @@ class ExportBody(BaseModel):
     groupSummary: list[dict] = []
     longShort: list[dict] = []
     icSeries: list[dict] = []
+    positionLedger: list[dict] = []
+    featureImportance: list[dict] = []
+    actualHistDays: int | None = None
+    effectiveStart: str | None = None
+    effectiveEnd: str | None = None
+    signalMode: str = "group"
+    bullRule: str = ""
+    bearRule: str = ""
+    topAttribution: dict | None = None
+    # 分层回测优化：方向 + 报告补全字段
+    direction: str = "long_short"
+    survivorshipBiasWarning: str = ""
+    snapshotWarning: str = ""
+    histWarning: str = ""
+    icIr: float | None = None
+    icTStat: float | None = None
+    icPValue: float | None = None
+    yearlyReturns: list[dict] = []
+    stockContribution: list[dict] = []
+    bucketDates: list[str] = []
 
 
 def _payload_from_body(body: ExportBody) -> dict:
@@ -30,6 +50,25 @@ def _payload_from_body(body: ExportBody) -> dict:
         "groupSummary": body.groupSummary,
         "longShort": body.longShort,
         "icSeries": body.icSeries,
+        "positionLedger": body.positionLedger,
+        "featureImportance": body.featureImportance,
+        "actualHistDays": body.actualHistDays,
+        "effectiveStart": body.effectiveStart,
+        "effectiveEnd": body.effectiveEnd,
+        "signalMode": body.signalMode,
+        "bullRule": body.bullRule,
+        "bearRule": body.bearRule,
+        "topAttribution": body.topAttribution,
+        "direction": body.direction,
+        "survivorshipBiasWarning": body.survivorshipBiasWarning,
+        "snapshotWarning": body.snapshotWarning,
+        "histWarning": body.histWarning,
+        "icIr": body.icIr,
+        "icTStat": body.icTStat,
+        "icPValue": body.icPValue,
+        "yearlyReturns": body.yearlyReturns,
+        "stockContribution": body.stockContribution,
+        "bucketDates": body.bucketDates,
     }
 
 

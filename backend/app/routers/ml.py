@@ -150,14 +150,22 @@ class ManualModelBody(BaseModel):
     featureWeights: dict[str, float] = {}
     threshold: float | None = None
     rule: str = ""
+    bullRule: str = ""   # 看多信号规则（scorePct + 因子名表达式，回测离散买卖）
+    bearRule: str = ""   # 看空信号规则
+    direction: str = "long_short"  # long_short | long_only | short_only
+    allowShort: bool = True         # 是否允许做空（产出空头候选/空单）
 
 
 @router.post("/models/manual")
 def create_manual_model(body: ManualModelBody, uid: int = Depends(require_user_id)):
     """创建"人造/手动模型"：手工指定因子权重 + 阈值（可选规则说明），
-    落盘为与自动训练产物同构的 bundle，可立即用于打分/回测/盯盘调度。"""
+    落盘为与自动训练产物同构的 bundle，可立即用于打分/回测/盯盘调度。
+    bullRule/bearRule 为离散买卖信号规则，回测时替代分位分组驱动物理持仓。
+    direction/allowShort 声明模型交易方向与是否允许做空。"""
     try:
-        meta = ml.create_manual_model(body.name, body.featureWeights, body.threshold, body.rule)
+        meta = ml.create_manual_model(body.name, body.featureWeights, body.threshold,
+                                      body.rule, body.bullRule, body.bearRule,
+                                      body.direction, body.allowShort)
     except ValueError as e:
         raise HTTPException(422, str(e))
     return meta
@@ -282,6 +290,7 @@ class ScoreBody(BaseModel):
     adjustId: str | None = None  # 调参配置 artifact id（/models/{mid}/adjust 产出）
     adjust: dict | None = None   # 或直接传 {featureWeights, threshold}
     assetClass: str = "a-share"  # a-share | future
+    direction: str | None = None  # 覆盖模型默认方向（long_short/long_only/short_only）
 
 
 @router.post("/score")
@@ -289,12 +298,17 @@ async def score(body: ScoreBody, uid: int = Depends(require_user_id)):
     """用落盘模型对候选池最新截面打分（打通 ML→选股：结果可加入自选/买入模拟盘）。
 
     adjustId/adjust 传调参配置时应用人工权重/阈值。
+    返回 {scores, longList, shortList, direction, allowShort}：longList 为做多候选、
+    shortList 为做空候选（仅模型 allowShort 且非 long_only 时非空）。
     """
     try:
         adjust = _load_adjust(body.adjustId, body.adjust, body.modelId)
         rows = await ml.score_latest(body.modelId, body.board, body.poolSize,
                                      adjust=adjust, asset_class=body.assetClass,
                                      boards=body.boards)
+        md = ml.model_direction(body.modelId)
+        direction = body.direction or md["direction"]
+        payload = ml.split_directional_scores(rows, direction, md["allowShort"])
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -312,8 +326,8 @@ async def score(body: ScoreBody, uid: int = Depends(require_user_id)):
             "rows": rows,
             "config": body.model_dump(),
         }, name=f"ML打分-{body.modelId}", user_id=uid)
-        return {"rows": rows, "artifact": meta}
-    return rows
+        return {**payload, "artifact": meta}
+    return payload
 
 
 class MLBacktestBody(BaseModel):
@@ -334,6 +348,7 @@ class MLBacktestBody(BaseModel):
     assetClass: str = "a-share"  # a-share | future
     startDate: str | None = None  # 验证区间起始日（YYYY-MM-DD，含），分时段验证
     endDate: str | None = None    # 验证区间结束日（YYYY-MM-DD，含）
+    direction: str | None = None  # long_short | long_only | short_only；不传回退模型声明方向
 
 
 @router.post("/backtest")
@@ -365,7 +380,10 @@ async def ml_backtest(body: MLBacktestBody, uid: int = Depends(require_user_id))
             start_date=body.startDate, end_date=body.endDate,
             config=config,
             boards=body.boards,
+            direction=body.direction or ml.model_direction(body.modelId)["direction"],
         )
+        if result.get("ok") is False:
+            return result
         # 回测存档带 user_id
         try:
             from .. import reporting

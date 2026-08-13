@@ -90,6 +90,24 @@ async def _kline_retry(kline_fn, code: str, days: int, attempts: int = 3,
         logger.warning("K线拉取失败 code=%s days=%s error=%s", code, days, last_error)
     return []
 
+
+async def _kline_window_retry(code: str, end_date: str, days: int,
+                              attempts: int = 3, delay: float = 0.5) -> list[dict]:
+    """K线窗口拉取（终止于 end_date）带指数退避重试。空结果也重试。"""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            kl = await adapters.fetch_kline_window(code, end_date, days)
+            if kl:
+                return kl
+        except Exception as e:
+            last_error = e
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay * (2 ** attempt))
+    if last_error:
+        logger.warning("K线窗口拉取失败 code=%s end=%s days=%s error=%s", code, end_date, days, last_error)
+    return []
+
 # 需要额外拉取的快照因子（行情快照 row 不自带，须调财务/资金流接口）
 _FINANCE_KEYS = {"roe", "net_margin", "revenue_yoy", "profit_yoy",
                  "gross_margin", "debt_ratio", "eps", "bps", "roa"}
@@ -175,15 +193,24 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     # 历史长度钳制：内置长周期因子（如 momentum120/dist_52w_high 240 日窗口）需要足够历史，
     # 用户传过小的 hist 时自动抬升，避免默认参数下「开箱即失败」
     hist = max(int(hist), min_hist_for_ml(n))
-    # 时间段窗口适配：指定的 start_date/end_date 需要 hist 覆盖从今天回溯到 start_date 的天数，
+    # 时间段窗口适配：指定的 start_date/end_date 需要 hist 覆盖回测区间，
     # 否则 kline 拉取的时间范围与过滤区间无交集 → 必然「有效样本不足」
-    if start_date:
+    if start_date or end_date:
         import datetime as _dt
-        from_date = _dt.date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
-        days_to_cover = (_dt.date.today() - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        today = _dt.date.today()
+        from_date = _dt.date.fromisoformat(start_date) if (isinstance(start_date, str) and start_date) else None
+        to_date = _dt.date.fromisoformat(end_date) if (isinstance(end_date, str) and end_date) else None
+        if from_date:
+            # 覆盖 start_date 即覆盖整个 [start_date, end_date]（end_date ≤ today）
+            days_to_cover = (today - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        elif to_date and to_date < today:
+            # 仅 end_date：hist 窗口结束于 end_date，需额外覆盖 (today - end_date) + base hist
+            days_to_cover = (today - to_date).days + hist + 60 + n
+        else:
+            days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         if days_to_cover > hist:
-            logger.info("hist=%d 不足以覆盖时间段 %s~%s，自动抬升至 %d", hist, start_date, end_date or "今天", days_to_cover)
-            hist = min(days_to_cover, 1500)
+            logger.info("hist=%d 不足以覆盖时间段 %s~%s，自动抬升至 %d", hist, start_date or "最早", end_date or "今天", days_to_cover)
+            hist = days_to_cover
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
     # 因子选择：selected_factors 非空时只保留用户勾选的因子
@@ -205,7 +232,10 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         if progress_cb:
             progress_cb(idx + 1, total)
         try:
-            kline = await kline_fn(code, hist)
+            if end_date and asset_class != "future":
+                kline = await _kline_window_retry(code, end_date, hist)
+            else:
+                kline = await kline_fn(code, hist)
         except Exception as e:
             stat["kline_fail"] += 1
             logger.warning("ML数据集拉取K线失败 code=%s: %s", code, e)
@@ -536,6 +566,7 @@ def train_final_model(dataset: dict, model_type: str = "gbdt", params: dict | No
         "id": mid, "path": path, "modelType": model_type,
         "featureNames": feature_names, "nSamples": len(y),
         "trainedAt": datetime.datetime.now().isoformat(),
+        "direction": "long_short", "allowShort": True,
     }
     # 特征重要性随训练写入侧车 JSON：调参接口读 meta 无需再反序列化整包模型
     if hasattr(model, "feature_importances_"):
@@ -714,6 +745,8 @@ def list_models() -> list[dict]:
                 meta = load_model_meta(mid)
                 if meta:
                     entry["modelType"] = meta.get("modelType", "gbdt")
+                    entry["direction"] = meta.get("direction", "long_short")
+                    entry["allowShort"] = bool(meta.get("allowShort", True))
                     fns = meta.get("featureNames", [])
                     entry["featureNames"] = fns
                     entry["nFeatures"] = len(fns)
@@ -764,7 +797,8 @@ def load_model_meta(mid: str) -> dict | None:
             "featureImportance": meta["featureImportance"],
         }
         for k in ("trainedAt", "nSamples", "name", "manual", "rule",
-                  "threshold", "imported", "sourceFile", "featureWeights"):
+                  "threshold", "imported", "sourceFile", "featureWeights",
+                  "direction", "allowShort"):
             if k in meta:
                 result[k] = meta[k]
         return result
@@ -790,7 +824,8 @@ def load_model_meta(mid: str) -> dict | None:
     }
     if meta:
         for k in ("trainedAt", "nSamples", "name", "manual", "rule",
-                  "threshold", "imported", "sourceFile", "featureWeights"):
+                  "threshold", "imported", "sourceFile", "featureWeights",
+                  "direction", "allowShort"):
             if k in meta:
                 result[k] = meta[k]
     return result
@@ -928,6 +963,30 @@ def _load_model(mid: str) -> dict:
     return bundle
 
 
+def _auto_adjust(mid: str, adjust: dict | None) -> dict | None:
+    """显式 adjust 优先；否则读取模型 sidecar JSON 中的调参权重自动应用。
+
+    克隆模型（clone_xxx）的 featureWeights/threshold 存于 sidecar JSON，
+    推理时若调用方未显式传 adjust，则自动套用，实现「另存新模型即带调参权重」。
+    """
+    if adjust:
+        return adjust
+    meta_path = os.path.join(ML_DIR, f"{mid}.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return None
+    # 手动模型 predict 内部已自行应用权重/阈值，跳过避免双重应用
+    if meta.get("manual"):
+        return None
+    fw = meta.get("featureWeights")
+    th = meta.get("threshold")
+    if not fw and th is None:
+        return None
+    return {"featureWeights": fw or {}, "threshold": th}
+
+
 def _apply_feature_weights(Xp: np.ndarray, feature_names: list[str],
                            feature_weights: dict) -> np.ndarray:
     """人工调参：按特征名对输入做权重缩放（GBDT 黑盒下最直观的干预手段）。
@@ -951,12 +1010,50 @@ def _apply_threshold(preds: list[float], threshold: float | None) -> list[float]
     return [p + float(threshold) for p in preds]
 
 
+def split_directional_scores(rows: list[dict], direction: str = "long_short",
+                             allow_short: bool = True, top_ratio: float = 0.34) -> dict:
+    """把降序打分列表切分为 做多候选(头部) / 做空候选(尾部)。
+
+    longList = 最高分 top_ratio 部分；shortList = 最低分 top_ratio 部分
+    （仅在 allowShort 且非 long_only 时产出）。scores 保留完整降序列表兼容旧调用。
+    """
+    rows = list(rows or [])
+    n = len(rows)
+    k = max(1, int(n * top_ratio)) if n else 0
+    if direction == "short_only":
+        long_list = []
+        short_list = rows[-k:] if allow_short else []
+    elif direction == "long_only":
+        long_list = rows[:k]
+        short_list = []
+    else:
+        long_list = rows[:k]
+        short_list = rows[-k:] if allow_short else []
+    return {
+        "longList": long_list,
+        "shortList": short_list,
+        "scores": rows,
+        "direction": direction,
+        "allowShort": bool(allow_short),
+    }
+
+
+def model_direction(mid: str) -> dict:
+    """读取模型的 direction / allowShort（无 sidecar 时回退默认 long_short / True）。"""
+    meta = load_model_meta(mid) or {}
+    direction = (meta.get("direction") or "long_short").lower()
+    if direction not in ("long_short", "long_only", "short_only"):
+        direction = "long_short"
+    return {"direction": direction, "allowShort": bool(meta.get("allowShort", True))}
+
+
 async def score_latest(mid: str, board: str = "all", pool_size: int = 100,
                        progress_cb=None, adjust: dict | None = None,
                        asset_class: str = "a-share",
                        boards: list[str] | None = None) -> list[dict]:
     """加载落盘模型对候选池最新截面打分，返回按预测分降序的打分列表。"""
     bundle = _load_model(mid)
+    adjust = _auto_adjust(mid, adjust)
     feature_names = bundle["feature_names"]
     model = bundle["model"]
     params = bundle["preprocess"]
@@ -1050,10 +1147,21 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
                          start_date: str | None = None,
                          end_date: str | None = None,
                          config: dict | None = None,
-                         boards: list[str] | None = None) -> dict:
+                         boards: list[str] | None = None,
+                         direction: str | None = None) -> dict:
     """用落盘模型预测分作为截面信号做分层回测，响应结构与 /api/select/backtest 一致，
-    前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。"""
+    前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。
+
+    direction: long_short（多空对冲）/ long_only（仅多头）/ short_only（仅空头）。
+    不传时回退为模型 sidecar 声明的 direction（无则 long_short）。
+    """
     bundle = _load_model(mid)
+    if direction is None:
+        direction = model_direction(mid)["direction"]
+    direction = direction.lower()
+    if direction not in ("long_short", "long_only", "short_only"):
+        raise ValueError(f"未知交易方向: {direction}（应为 long_short / long_only / short_only）")
+    adjust = _auto_adjust(mid, adjust)
     feature_names = bundle["feature_names"]
     model = bundle["model"]
     params = bundle["preprocess"]
@@ -1077,18 +1185,26 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     groups = max(2, min(10, groups))
     n = max(1, n)
     # 历史钳制：内置长周期因子需要足够窗口（momentum120 / dist_52w_high 240 日）；
-    # 上限 1500 日（约 6 年）：超过此值 Sina API 返回 null，Tencent 降级返回格式异常
+    # 超大窗口由 adapters.fetch_kline 内部东财分页自动处理
     user_hist = int(hist)
     hist = max(user_hist, min_hist_for_ml(n))
-    # 时间段窗口适配（同 build_dataset）
-    if start_date:
+    # 时间段窗口适配：同时考虑 start_date 与 end_date，确保抓取窗口覆盖回测区间
+    if start_date or end_date:
         import datetime as _dt
-        from_date = _dt.date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
-        days_to_cover = (_dt.date.today() - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        today = _dt.date.today()
+        from_date = _dt.date.fromisoformat(start_date) if (isinstance(start_date, str) and start_date) else None
+        to_date = _dt.date.fromisoformat(end_date) if (isinstance(end_date, str) and end_date) else None
+        if from_date:
+            # 覆盖 start_date 即覆盖整个 [start_date, end_date]（end_date ≤ today）
+            days_to_cover = (today - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        elif to_date and to_date < today:
+            # 仅 end_date：hist 窗口结束于 end_date，需额外覆盖 (today - end_date) + base hist
+            days_to_cover = (today - to_date).days + hist + 60 + n
+        else:
+            days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         if days_to_cover > hist:
-            logger.info("hist=%d 不足以覆盖回测时间段 %s~%s，自动抬升至 %d", hist, start_date, end_date or "今天", days_to_cover)
-            hist = min(days_to_cover, 1500)
-    hist = min(hist, 1500)
+            logger.info("hist=%d 不足以覆盖回测时间段 %s~%s，自动抬升至 %d", hist, start_date or "最早", end_date or "今天", days_to_cover)
+            hist = days_to_cover
     hist_clamped = hist != user_hist
 
     bench_code = BENCHMARKS.get(benchmark)
@@ -1122,7 +1238,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     async def fetch_one(code):
         nonlocal fetch_fail
         async with sem:
-            kline = await _kline_retry(kline_fn, code, hist + n + 25)
+            if end_date and asset_class != "future":
+                kline = await _kline_window_retry(code, end_date, hist + n + 25)
+            else:
+                kline = await _kline_retry(kline_fn, code, hist + n + 25)
             if not kline:
                 fetch_fail += 1
                 logger.warning("ML回测拉取K线失败 code=%s", code)
@@ -1140,7 +1259,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     bench_series = None
     if bench_code:
         try:
-            bench_series = await adapters.fetch_kline(bench_code, hist + n + 25)
+            if end_date:
+                bench_series = await adapters.fetch_kline_window(bench_code, end_date, hist + n + 25)
+            else:
+                bench_series = await adapters.fetch_kline(bench_code, hist + n + 25)
         except Exception:
             bench_series = None
 
@@ -1187,14 +1309,33 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
 
     cost_rate = round_trip_cost_rate(commission_rate, stamp_duty, slippage) if apply_cost else 0.0
 
+    # M6 离散买卖规则：模型自带 bullRule/bearRule 时，回测以规则判定多空信号替代分位分组
+    bull_rule = getattr(model, 'bull_rule', '') or ''
+    bear_rule = getattr(model, 'bear_rule', '') or ''
+    bull_fn, bull_err = compile_signal_rule(bull_rule, feature_names) if bull_rule else (None, '')
+    bear_fn, bear_err = compile_signal_rule(bear_rule, feature_names) if bear_rule else (None, '')
+    if bull_rule and bull_err:
+        raise ValueError(f"看多规则不合法: {bull_err}")
+    if bear_rule and bear_err:
+        raise ValueError(f"看空规则不合法: {bear_err}")
+    use_signal_rules = bool(bull_fn or bear_fn)
+
     ic_series = []
     bucket_returns = [[] for _ in range(groups)]
+    bucket_ret_series = [[] for _ in range(groups)]  # B3：每组逐期净值收益
+    bucket_equity = [[1.0] for _ in range(groups)]   # B3：每组净值曲线
+    bucket_dates: list[str] = []
+    stock_contribution: dict[str, float] = defaultdict(float)  # B5：个股累计贡献
     long_short_points = []
     top_group_returns = []
     position_ledger = []
+    prev_long: set[str] = set()
+    prev_short: set[str] = set()
     bench_by_date = {}
     cum = 1.0
     cum_top = 1.0
+    cum_bottom = 1.0
+    last_cross = None  # M8 归因：最后一个调仓日截面快照
 
     bench_date_idx = {row["date"]: idx for idx, row in enumerate(bench_series)} if bench_series else {}
 
@@ -1286,36 +1427,126 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         rank_ic = _spearman(preds, ic_rets)
         ic_series.append({"date": date_t, "ic": ic, "rankIc": rank_ic, "sample": len(cross_codes)})
 
-        sorted_preds = sorted(preds)
-        day_buckets = [[] for _ in range(groups)]
-        day_bucket_codes = [[] for _ in range(groups)]
-        for code, fv, fret in zip(cross_codes, preds, cross_rets):
-            b = bucket_index(fv, sorted_preds, groups)
-            day_buckets[b].append(fret)
-            day_bucket_codes[b].append(code)
-            bucket_returns[b].append(fret)
+        # M8 归因：保存最后一个调仓日截面（特征原始值 + 预测分），循环结束后构建特征分位归因
+        last_cross = {"date": date_t, "codes": list(cross_codes),
+                      "feats": [list(f) for f in cross_feats], "preds": list(preds)}
 
-        if day_buckets[0] and day_buckets[-1]:
-            top_ret = mean(day_buckets[-1])
-            bottom_ret = mean(day_buckets[0])
-            ls_ret = top_ret - bottom_ret
-            # 多空双腿各一份往返成本（旧版仅扣一份）
-            net_ls = ls_ret - 2.0 * cost_rate
-            net_top = top_ret - cost_rate
-            cum *= (1.0 + net_ls)
-            cum_top *= (1.0 + net_top)
-            long_short_points.append({
-                "date": date_t, "longShort": net_ls, "cum": cum - 1.0,
-                "topCum": cum_top - 1.0, "gross": ls_ret,
-            })
+        if use_signal_rules:
+            # 规则模式：bullRule→多头，bearRule→空头，其余中性。scorePct 为当日截面分位。
+            n_cross = len(cross_codes)
+            order_idx = sorted(range(n_cross), key=lambda k: preds[k])
+            pct_of = [0.0] * n_cross
+            for rank, k in enumerate(order_idx):
+                pct_of[k] = (rank + 1) / (n_cross + 1)
+            cur_long: set[str] = set()
+            cur_short: set[str] = set()
+            long_rets: list[float] = []
+            short_rets: list[float] = []
+            for k in range(n_cross):
+                f = cross_feats[k]
+                p = pct_of[k]
+                if bull_fn and bull_fn(f, p):
+                    cur_long.add(cross_codes[k])
+                    long_rets.append(cross_rets[k])
+                    bucket_returns[-1].append(cross_rets[k])
+                elif bear_fn and bear_fn(f, p):  # 互斥：已判多头不再判空
+                    cur_short.add(cross_codes[k])
+                    short_rets.append(cross_rets[k])
+                    bucket_returns[0].append(cross_rets[k])
+            top_ret = mean(long_rets) if long_rets else 0.0
+            bottom_ret = mean(short_rets) if short_rets else 0.0
+        else:
+            sorted_preds = sorted(preds)
+            day_buckets = [[] for _ in range(groups)]
+            day_bucket_codes = [[] for _ in range(groups)]
+            for code, fv, fret in zip(cross_codes, preds, cross_rets):
+                b = bucket_index(fv, sorted_preds, groups)
+                day_buckets[b].append(fret)
+                day_bucket_codes[b].append(code)
+                bucket_returns[b].append(fret)
+            top_ret = mean(day_buckets[-1]) if day_buckets[-1] else 0.0
+            bottom_ret = mean(day_buckets[0]) if day_buckets[0] else 0.0
+            cur_long = set(day_bucket_codes[-1]) if day_buckets[-1] else set()
+            cur_short = set(day_bucket_codes[0]) if day_buckets[0] else set()
+
+        # B3 分组净值：逐期记录每组平均收益 → 净值曲线
+        day_bucket_ret = [0.0] * groups
+        if use_signal_rules:
+            day_bucket_ret[0] = bottom_ret
+            day_bucket_ret[-1] = top_ret
+        else:
+            for b in range(groups):
+                day_bucket_ret[b] = mean(day_buckets[b]) if day_buckets[b] else 0.0
+        for g in range(groups):
+            bucket_ret_series[g].append(day_bucket_ret[g])
+            bucket_equity[g].append(bucket_equity[g][-1] * (1.0 + day_bucket_ret[g]))
+        bucket_dates.append(date_t)
+
+        # A1 方向裁剪：long_only 仅保留多头、short_only 仅保留空头
+        if direction == "long_only":
+            cur_short = set()
+        elif direction == "short_only":
+            cur_long = set()
+
+        # 边缘保底：至少一侧有持仓仍记录（避免仓位图断裂）
+        if cur_long or cur_short:
+            long_added = sorted(cur_long - prev_long)
+            long_removed = sorted(prev_long - cur_long)
+            short_added = sorted(cur_short - prev_short)
+            short_removed = sorted(prev_short - cur_short)
+            turnover = len(long_added) + len(long_removed) + len(short_added) + len(short_removed)
             position_ledger.append({
                 "date": date_t,
-                "long": day_bucket_codes[-1][:],
-                "short": day_bucket_codes[0][:],
+                "long": sorted(cur_long),
+                "short": sorted(cur_short),
                 "longReturn": top_ret,
                 "shortReturn": bottom_ret,
+                # 后端直算的持仓数/换手（报告图直接使用，避免前端每次重算）
+                "longCount": len(cur_long),
+                "shortCount": len(cur_short),
+                "turnover": turnover,
+                # 调仓明细：本期相对上期的买入/卖出（供报告「调仓信号」渲染）
+                "longAdded": long_added,
+                "longRemoved": long_removed,
+                "shortAdded": short_added,
+                "shortRemoved": short_removed,
             })
-            top_group_returns.append(net_top)
+            prev_long = cur_long
+            prev_short = cur_short
+
+        # B5 个股累计贡献：多头 +收益，空头 -收益（按方向裁剪后的持仓）
+        code_ret = dict(zip(cross_codes, cross_rets))
+        for c in cur_long:
+            stock_contribution[c] += code_ret.get(c, 0.0)
+        for c in cur_short:
+            stock_contribution[c] -= code_ret.get(c, 0.0)
+
+        # 方向收益：long_short 双份成本；单腿只扣一份
+        net_top = top_ret - cost_rate
+        net_bottom = -(bottom_ret) - cost_rate  # 空头腿收益正向化
+        if direction == "long_only":
+            ls_ret = top_ret
+            net_ls = net_top
+            leg_ok = bool(cur_long)
+        elif direction == "short_only":
+            ls_ret = -(bottom_ret)
+            net_ls = net_bottom
+            leg_ok = bool(cur_short)
+        else:  # long_short
+            ls_ret = top_ret - bottom_ret
+            net_ls = ls_ret - 2.0 * cost_rate
+            leg_ok = bool(cur_long) and bool(cur_short)
+        if leg_ok:
+            cum *= (1.0 + net_ls)
+            if direction != "short_only":
+                cum_top *= (1.0 + net_top)
+                top_group_returns.append(net_top)
+            if direction != "long_only":
+                cum_bottom *= (1.0 + net_bottom)
+            long_short_points.append({
+                "date": date_t, "longShort": net_ls, "cum": cum - 1.0,
+                "topCum": cum_top - 1.0, "bottomCum": cum_bottom - 1.0, "gross": ls_ret,
+            })
             if bench_series and bench_date_idx:
                 bi = bench_date_idx.get(date_t)
                 if bi is not None and bi + n < len(bench_series):
@@ -1327,25 +1558,49 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             progress_cb(rebalance_idx, (total_dates // step) + 1)
 
     if not ic_series:
-        raise ValueError(
-            f"有效截面样本不足，无法完成 ML 信号分层回测：候选池 {len(pool)} 只、有效 {len(series)} 只，"
-            f"但所有调仓日截面均未凑够 {groups * 2} 只（多因停牌/涨跌停/因子缺失被跳过）。"
-            f"请增大候选池规模、缩短持有期(n)、放宽板块范围，"
-            f"或检查 hist({hist}日)是否足够覆盖{'时间段 ' + start_date + '~' + end_date if start_date or end_date else '回测区间'}。"
-        )
+        actual_start = ref_dates[0] if ref_dates else None
+        actual_end = ref_dates[-1] if ref_dates else None
+        return {
+            "ok": False,
+            "reason": "NO_VALID_REBALANCE",
+            "error": (
+                f"回测区间无有效调仓日：候选池 {len(pool)} 只、有效 {len(series)} 只，"
+                f"但所有调仓日截面均未凑够 {groups * 2} 只（多因停牌/涨跌停/因子缺失被跳过）。"
+            ),
+            "hint": (
+                f"历史长度 {hist} 日仅覆盖 {actual_start or '?'} ~ {actual_end or '?'}，"
+                f"请增大历史长度(hist)、后移终止日(end_date)，或增大候选池/缩短持有期(n)/放宽板块范围。"
+            ),
+            "requested": {"start": start_date, "end": end_date, "hist": hist},
+            "actualWindow": {"start": actual_start, "end": actual_end},
+        }
 
-    group_summary = [
-        {"group": idx + 1, "avgReturn": mean(rets) if rets else 0.0, "sample": len(rets)}
-        for idx, rets in enumerate(bucket_returns)
-    ]
+    # 调仓间隔 n 日 → 年化采样数 = 252/n（旧版误用 252，年化收益高估 n 倍、Sharpe 高估 √n 倍）
+    ppy = 252.0 / max(1, n)
+
+    group_summary = []
+    for idx in range(groups):
+        rets = bucket_ret_series[idx]
+        eq = bucket_equity[idx]
+        group_summary.append({
+            "group": idx + 1,
+            "avgReturn": mean(rets) if rets else 0.0,
+            "sample": len(bucket_returns[idx]),
+            "cumReturn": eq[-1] - 1.0 if eq else 0.0,
+            "annualizedReturn": annualized_return(rets, ppy) if rets else 0.0,
+            "sharpe": sharpe_ratio(rets, periods_per_year=ppy) if rets else 0.0,
+            "maxDrawdown": max_drawdown(eq) if eq else 0.0,
+            "equity": [round(v - 1.0, 6) for v in eq],
+        })
 
     ls_returns = [p["longShort"] for p in long_short_points]
     ls_equity = [1.0]
     for r in ls_returns:
         ls_equity.append(ls_equity[-1] * (1.0 + r))
+    gross_returns = [p["gross"] for p in long_short_points]
 
-    # 调仓间隔 n 日 → 年化采样数 = 252/n（旧版误用 252，年化收益高估 n 倍、Sharpe 高估 √n 倍）
-    ppy = 252.0 / max(1, n)
+    avg_turnover = mean([p["turnover"] for p in position_ledger]) if position_ledger else 0.0
+    gross_sharpe = sharpe_ratio(gross_returns, periods_per_year=ppy)
 
     metrics = {
         "cumulativeReturn": cum - 1.0,
@@ -1361,6 +1616,11 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         "rebalanceCount": len(ic_series),
         "costRate": cost_rate,
         "applyCost": apply_cost,
+        # B4：换手率 / 成本侵蚀（毛收益 vs 净收益 Sharpe）
+        "turnover": avg_turnover,
+        "annualizedTurnover": avg_turnover * ppy,
+        "grossSharpe": gross_sharpe,
+        "costErosion": sharpe_ratio(ls_returns, periods_per_year=ppy) - gross_sharpe,
     }
 
     bench_metrics = None
@@ -1382,6 +1642,9 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             "annualizedVolatility": annualized_volatility(aligned_bench, ppy),
             "sharpe": sharpe_ratio(aligned_bench, periods_per_year=ppy),
             "maxDrawdown": max_drawdown(_equity_curve(aligned_bench)),
+            # ab 即策略相对基准的 alpha/beta（_alpha_beta(bench, strat) 签名）
+            "strategyAlpha": ab["alpha"],
+            "strategyBeta": ab["beta"],
             **ab,
         }
 
@@ -1397,17 +1660,67 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             f"以确保覆盖内置长周期因子所需的最短窗口（≥{min_hist_for_ml(n)}日）。"
             f"回测实际拉取 {hist} 日 K 线，有效调仓区间 {effective_start} ~ {effective_end}。"
         )
+    # M8：模型特征贡献（Top-N 重要性，进入报告「特征贡献」卡片）
+    feature_importance = []
+    try:
+        if hasattr(model, "feature_importances_"):
+            imp = model.feature_importances_
+            labels = [(FACTORS.get(k) or SNAPSHOT_FACTORS.get(k) or {}).get("label", k)
+                      for k in feature_names]
+            feature_importance = sorted(
+                [{"feature": feature_names[i],
+                  "label": labels[i] if i < len(labels) else feature_names[i],
+                  "importance": float(imp[i])}
+                 for i in range(min(len(feature_names), len(imp)))],
+                key=lambda x: x["importance"], reverse=True,
+            )
+    except Exception:
+        feature_importance = []
+
+    # B7 分年度绩效：按自然年聚合 long_short 收益
+    yearly: dict[str, list[float]] = {}
+    for p in long_short_points:
+        yearly.setdefault(p["date"][:4], []).append(p["longShort"])
+    yearly_returns = []
+    for yr in sorted(yearly):
+        rets = yearly[yr]
+        cum_yr = 1.0
+        for r in rets:
+            cum_yr *= (1.0 + r)
+        yearly_returns.append({"year": yr, "return": cum_yr - 1.0, "periods": len(rets)})
+
+    # B5 个股累计贡献 Top 30（按绝对贡献排序）
+    name_by_code = {r["code"]: r.get("name", "") for r in pool}
+    stock_contrib = sorted(
+        [{"code": c, "name": name_by_code.get(c, ""), "contribution": v}
+         for c, v in stock_contribution.items()],
+        key=lambda x: abs(x["contribution"]), reverse=True,
+    )[:30]
+
     result = {
         "factorLabel": f"ML模型({mid})", "groups": groups, "n": n, "modelId": mid,
+        "direction": direction,
         "meanIc": ic_stats["meanIc"], "meanRankIc": mean_rank_ic,
         "icWinRate": ic_stats["icWinRate"], "icIr": ic_stats["icIr"],
+        "icTStat": ic_stats["tStat"], "icPValue": ic_stats["pValue"],
         "icSeries": ic_series, "groupSummary": group_summary, "longShort": long_short_points,
         "metrics": metrics, "benchmark": bench_metrics,
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
         "actualHistDays": hist, "effectiveStart": effective_start, "effectiveEnd": effective_end,
         "positionLedger": position_ledger,
+        "featureImportance": feature_importance,
+        "yearlyReturns": yearly_returns,
+        "stockContribution": stock_contrib,
+        "bucketDates": bucket_dates,
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
     }
+    # M6 离散规则信号模式标记 + 规则回显（报告展示）
+    if use_signal_rules:
+        result["signalMode"] = "rule"
+        result["bullRule"] = bull_rule
+        result["bearRule"] = bear_rule
+    # M8 预测归因：最后一个调仓日的 Top 看多/看空个股特征分位
+    result["topAttribution"] = _build_attribution(last_cross, feature_names, top_n=5)
     if hist_warning:
         result["histWarning"] = hist_warning
     if config is not None:
@@ -1439,14 +1752,18 @@ def _equity_curve(returns: list[float]) -> list[float]:
 
 
 async def score_codes(mid: str, codes: list[str],
-                     adjust: dict | None = None) -> list[dict]:
+                     adjust: dict | None = None,
+                     return_features: bool = False) -> list[dict]:
     """对指定代码列表用落盘模型打分（供盯盘调度复用，不依赖行情列表接口）。
 
     快照特征用腾讯行情字段（turnover/pe/pb/市值）填充，财务类字段缺失则跳过该股。
     adjust 为调参配置 {featureWeights, threshold}，与 score_latest 口径对齐。
-    返回 [{code, score}]。
+    return_features=True 时每条结果附带 features（与 feature_names 对齐的原始因子值），
+    供离散买卖规则（bullRule/bearRule）在盯盘侧求值。
+    返回 [{code, score}]（return_features=True 时附加 features）。
     """
     bundle = _load_model(mid)
+    adjust = _auto_adjust(mid, adjust)
     feature_names = bundle["feature_names"]
     model = bundle["model"]
     params = bundle["preprocess"]
@@ -1506,7 +1823,42 @@ async def score_codes(mid: str, codes: list[str],
         if len(keep_idx) < len(collected):
             collected = [collected[i] for i in keep_idx]
             preds = [preds[i] for i in keep_idx]
+    if return_features:
+        return [{"code": c, "score": float(p),
+                 "features": [float(v) if v is not None else 0.0 for v in f]}
+                for (c, f), p in zip(collected, preds)]
     return [{"code": c, "score": float(p)} for c, p in zip([c for c, _ in collected], preds)]
+
+
+def get_signal_rules(mid: str) -> dict:
+    """加载模型离散买卖规则（bull_rule/bear_rule），编译为可求值函数。
+
+    返回 {featureNames, bullRule, bearRule, bullFn, bearFn, active}。
+    无规则时 active=False、bullFn/bearFn 为 None；规则非法时抛 ValueError。
+    用于盯盘模型模式的离散信号判定（规则命中优先于分位阈值）。
+    """
+    bundle = _load_model(mid)
+    model = bundle["model"]
+    feature_names = list(bundle.get("feature_names") or [])
+    bull_rule = (getattr(model, "bull_rule", "") or "").strip()
+    bear_rule = (getattr(model, "bear_rule", "") or "").strip()
+    bull_fn = bear_fn = None
+    if bull_rule:
+        bull_fn, err = compile_signal_rule(bull_rule, feature_names)
+        if err:
+            raise ValueError(f"看多规则不合法: {err}")
+    if bear_rule:
+        bear_fn, err = compile_signal_rule(bear_rule, feature_names)
+        if err:
+            raise ValueError(f"看空规则不合法: {err}")
+    return {
+        "featureNames": feature_names,
+        "bullRule": bull_rule,
+        "bearRule": bear_rule,
+        "bullFn": bull_fn,
+        "bearFn": bear_fn,
+        "active": bool(bull_fn or bear_fn),
+    }
 
 
 def import_model_file(filename: str, data: bytes) -> dict:
@@ -1551,6 +1903,7 @@ def import_model_file(filename: str, data: bytes) -> dict:
         "featureNames": list(feature_names),
         "imported": True, "sourceFile": filename or "",
         "trainedAt": datetime.datetime.now().isoformat(),
+        "direction": "long_short", "allowShort": True,
     }
     # 导入时提取重要性写入侧车 JSON，调参接口无需反序列化整包模型
     if model is not None and hasattr(model, "feature_importances_"):
@@ -1671,6 +2024,152 @@ def _apply_rule_filter(rows: list[dict], fvals_matrix: np.ndarray,
     return keep
 
 
+def _parse_signal_rule(rule: str, feature_names: list[str]) -> str:
+    """将买卖信号规则字符串转为可安全求值的表达式。
+
+    支持变量：scorePct（当日截面分位 0~1）+ 任意 feature_names 因子（原始值，
+    别名 vol=volatility）。支持运算：算术 + - * /、比较 > < >= <= == !=、
+    布尔 and/or/not、括号、常量。因子名精确匹配后映射为 f[i]，scorePct 映射为 p。
+    """
+    if not rule or not rule.strip():
+        return ""
+    expr = rule.strip()
+    expr = expr.replace("且", " and ").replace("或", " or ").replace("并且", " and ").replace("或者", " or ")
+    expr = expr.replace("大于等于", ">=").replace("小于等于", "<=").replace("大于", ">").replace("小于", "<")
+    expr = expr.replace("等于", "==").replace("不等于", "!=").replace("不低于", ">=").replace("不超过", "<=")
+    # scorePct → 特殊变量 p
+    expr = re.sub(r'\bscorePct\b', 'p', expr)
+    # 别名 vol → volatility（文档示例用 vol，因子 key 为 volatility）
+    if 'volatility' in feature_names:
+        expr = re.sub(r'\bvol\b', 'volatility', expr)
+    # 因子名 → f[i]（按 key 长度降序，避免短 key 先匹配长 key 前缀）
+    sorted_fns = sorted(enumerate(feature_names), key=lambda x: -len(x[1]))
+    for i, fn in sorted_fns:
+        if re.search(r'\b' + re.escape(fn) + r'\b', expr):
+            expr = re.sub(r'\b' + re.escape(fn) + r'\b', f"f[{i}]", expr)
+    if re.search(r'[\u4e00-\u9fff]{2,}', expr):
+        raise ValueError(f"规则中包含未识别的变量名: {rule}")
+    return expr
+
+
+def _eval_signal_ast(node, f, p):
+    """安全求值信号规则 AST：算术 + 比较 + 布尔 + f[i] 因子 + p(scorePct)。"""
+    import operator as _op
+    _BIN = {ast.Add: _op.add, ast.Sub: _op.sub, ast.Mult: _op.mul, ast.Div: _op.truediv}
+    _CMP = {ast.Eq: _op.eq, ast.NotEq: _op.ne, ast.Gt: _op.gt, ast.GtE: _op.ge,
+            ast.Lt: _op.lt, ast.LtE: _op.le}
+    if isinstance(node, ast.Expression):
+        return _eval_signal_ast(node.body, f, p)
+    if isinstance(node, ast.BoolOp):
+        vals = [_eval_signal_ast(v, f, p) for v in node.values]
+        return all(vals) if isinstance(node.op, ast.And) else any(vals)
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.Not):
+            return not _eval_signal_ast(node.operand, f, p)
+        if isinstance(node.op, ast.USub):
+            return -_eval_signal_ast(node.operand, f, p)
+        if isinstance(node.op, ast.UAdd):
+            return _eval_signal_ast(node.operand, f, p)
+        raise ValueError(f"不支持的一元运算符: {type(node.op)}")
+    if isinstance(node, ast.BinOp):
+        return _BIN[type(node.op)](_eval_signal_ast(node.left, f, p), _eval_signal_ast(node.right, f, p))
+    if isinstance(node, ast.Compare):
+        left = _eval_signal_ast(node.left, f, p)
+        result = True
+        for op, comp in zip(node.ops, node.comparators):
+            right = _eval_signal_ast(comp, f, p)
+            result = result and _CMP[type(op)](left, right)
+            left = right
+        return result
+    if isinstance(node, ast.Subscript):
+        idx = node.slice.value if isinstance(node.slice, ast.Constant) else node.slice
+        if isinstance(node.value, ast.Name) and node.value.id == "f":
+            v = f[int(idx)]
+            return 0.0 if v is None else float(v)
+        raise ValueError(f"不支持的数组名: {getattr(node.value, 'id', '?')}")
+    if isinstance(node, ast.Name):
+        if node.id == "p":
+            return float(p)
+        raise ValueError(f"未知变量: {node.id}")
+    if isinstance(node, ast.Constant):
+        return node.value
+    raise ValueError(f"不支持的 AST 节点: {ast.dump(node)}")
+
+
+def compile_signal_rule(rule: str, feature_names: list[str]):
+    """编译买卖信号规则。返回 (fn, err)，fn(feature_values, score_pct) -> bool。
+
+    feature_values 为与 feature_names 对齐的因子值列表；score_pct 为该股预测分
+    在当日截面的分位（0~1）。规则非法时返回 (None, 错误信息)。
+    """
+    try:
+        expr = _parse_signal_rule(rule, feature_names)
+    except ValueError as e:
+        return None, str(e)
+    if not expr:
+        return None, "规则为空"
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        return None, f"语法错误: {e}"
+    _ALLOWED = (ast.Expression, ast.BoolOp, ast.BinOp, ast.UnaryOp, ast.Compare,
+                ast.Name, ast.Constant, ast.Subscript, ast.Load,
+                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.UAdd, ast.USub, ast.Not,
+                ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.And, ast.Or)
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED):
+            return None, f"不允许的语法: {type(node).__name__}"
+
+    def fn(f, p):
+        try:
+            return bool(_eval_signal_ast(tree, f, p))
+        except Exception:
+            return False
+    return fn, ""
+
+
+def _build_attribution(last: dict | None, feature_names: list[str], top_n: int = 5) -> dict | None:
+    """M8 预测归因：最后一个调仓日截面的 Top 看多/看空个股各特征截面分位。"""
+    if not last:
+        return None
+    codes = last["codes"]
+    feats = last["feats"]
+    preds = last["preds"]
+    n = len(codes)
+    m = len(feature_names)
+    if not n or not m:
+        return None
+
+    def pct_rank(vals):
+        idxs = [i for i, v in enumerate(vals) if v is not None]
+        order = sorted(idxs, key=lambda i: vals[i])
+        out = [None] * len(vals)
+        for rank, i in enumerate(order):
+            out[i] = (rank + 1) / (len(order) + 1)
+        return out
+
+    fpcts = [pct_rank([feats[i][j] for i in range(n)]) for j in range(m)]
+    labels = [(FACTORS.get(k) or SNAPSHOT_FACTORS.get(k) or {}).get("label", k)
+              for k in feature_names]
+    order = sorted(range(n), key=lambda i: -preds[i])
+
+    def build(idx):
+        return {
+            "code": codes[idx],
+            "score": float(preds[idx]),
+            "featurePcts": {feature_names[j]: fpcts[j][idx]
+                            for j in range(m) if fpcts[j][idx] is not None},
+        }
+
+    return {
+        "date": last["date"],
+        "featureNames": feature_names,
+        "featureLabels": labels,
+        "longs": [build(i) for i in order[:top_n]],
+        "shorts": [build(i) for i in order[-top_n:][::-1]],
+    }
+
+
 # ---------------- 人造/手动模型（P4） ----------------
 
 MANUAL_FEATURES = sorted(list(FACTORS.keys()) + [k for k in SNAPSHOT_FACTORS if SNAPSHOT_FACTORS[k].get("format") != "categorical"])
@@ -1693,11 +2192,13 @@ class _ManualModel:
     """
 
     def __init__(self, feature_names: list[str], weights: dict, threshold: float = 0.0,
-                 rule: str = ""):
+                 rule: str = "", bull_rule: str = "", bear_rule: str = ""):
         self.feature_names = list(feature_names)
         self.weights = [float(weights.get(n, 0.0)) for n in self.feature_names]
         self.threshold = float(threshold or 0.0)
         self.rule = rule or ""
+        self.bull_rule = bull_rule or ""
+        self.bear_rule = bear_rule or ""
 
     def predict(self, X):
         X = np.asarray(X, dtype=np.float64)
@@ -1718,17 +2219,31 @@ class _ManualModel:
 
 
 def create_manual_model(name: str, weights: dict, threshold: float | None = None,
-                        rule: str = "") -> dict:
+                        rule: str = "", bull_rule: str = "", bear_rule: str = "",
+                        direction: str = "long_short", allow_short: bool = True) -> dict:
     """创建并落盘一个人造/手动模型（不依赖任何自动训练）。
 
     feature_names 为全部候选因子（技术 + 快照），落盘结构与自动训练产物完全同构，
     之后即可用于打分、回测、盯盘调度。未指定权重的因子默认权重为 0。返回模型元数据。
+    bull_rule/bear_rule 为离散买卖信号规则（scorePct + 因子名表达式），回测时替代分位分组。
+    direction ∈ {long_short, long_only, short_only}，allowShort 控制是否产出空头候选。
     """
+    direction = (direction or "long_short").lower()
+    if direction not in ("long_short", "long_only", "short_only"):
+        raise ValueError(f"未知交易方向: {direction}")
     feature_names = MANUAL_FEATURES
     valid = {k: v for k, v in (weights or {}).items() if k in feature_names}
     if not valid:
         raise ValueError("请至少为一个有效因子设置权重")
-    model = _ManualModel(feature_names, valid, threshold, rule)
+    if bull_rule:
+        _, err = compile_signal_rule(bull_rule, feature_names)
+        if err:
+            raise ValueError(f"看多规则不合法: {err}")
+    if bear_rule:
+        _, err = compile_signal_rule(bear_rule, feature_names)
+        if err:
+            raise ValueError(f"看空规则不合法: {err}")
+    model = _ManualModel(feature_names, valid, threshold, rule, bull_rule, bear_rule)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     mid = f"manual_{ts}"
     path = os.path.join(ML_DIR, f"{mid}.joblib")
@@ -1746,7 +2261,9 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
         "id": mid, "path": path, "modelType": "manual",
         "name": (name or mid).strip(), "featureNames": feature_names,
         "featureWeights": valid, "threshold": float(threshold or 0.0),
-        "rule": rule or "", "manual": True,
+        "rule": rule or "", "bullRule": bull_rule or "", "bearRule": bear_rule or "",
+        "manual": True,
+        "direction": direction, "allowShort": bool(allow_short),
         "featureImportance": sorted(
             [{"feature": k, "importance": abs(float(v))} for k, v in valid.items()],
             key=lambda x: x["importance"], reverse=True),
@@ -1781,6 +2298,9 @@ def clone_model_with_adjust(mid: str, feature_weights: dict | None = None,
     # 写入新侧车 JSON：包含调参权重
     fw = {k: float(v) for k, v in (feature_weights or {}).items()
           if k in (bundle.get("feature_names") or [])}
+    _cloned_model = bundle.get("model")
+    _bull_rule = getattr(_cloned_model, 'bull_rule', '') or src_meta.get("bullRule", "")
+    _bear_rule = getattr(_cloned_model, 'bear_rule', '') or src_meta.get("bearRule", "")
     new_meta = {
         "id": new_id, "path": new_path,
         "modelType": src_meta.get("modelType", bundle.get("model_type", "gbdt")),
@@ -1788,6 +2308,8 @@ def clone_model_with_adjust(mid: str, feature_weights: dict | None = None,
         "featureImportance": src_meta.get("featureImportance") or [],
         "featureWeights": fw or None,
         "threshold": float(threshold) if threshold is not None else None,
+        "bullRule": _bull_rule or None,
+        "bearRule": _bear_rule or None,
         "clonedFrom": mid,
         "trainedAt": datetime.datetime.now().isoformat(),
     }

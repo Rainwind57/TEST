@@ -4,7 +4,8 @@ import { usePortfolioStore } from '../stores/portfolio'
 import { useWatchlistStore } from '../stores/watchlist'
 import { useToast } from '../stores/toast'
 import EChart from '../components/EChart.vue'
-import { fmtNum, fmtMoney, fmtPct, stripPrefix } from '../utils/format'
+import api from '../api/client'
+import { fmtNum, fmtMoney, fmtPct, stripPrefix, normalizeCode } from '../utils/format'
 
 const portfolio = usePortfolioStore()
 const watchlist = useWatchlistStore()
@@ -13,17 +14,83 @@ const { toast } = useToast()
 const orderCode = ref('')
 const orderSide = ref('buy')
 const orderQty = ref(100)
+const orderQuote = ref(null)      // 下单标的独立行情（解耦自选股）
+const orderValidate = ref(null)   // { code, name, tradable }
+const boardOptions = ref([])      // 板块列表（P1 板块选股入口）
+const boardStocks = ref([])       // 所选板块的股票列表（供联想下拉）
 let timer = null
 let polling = false   // 在途锁：弱网下上次轮询未完成则跳过，避免请求堆积
 
-const orderPrice = computed(() => watchlist.quotes[orderCode.value]?.price || 0)
+const orderPrice = computed(() => orderQuote.value?.price || 0)
 const orderEstimate = computed(() => orderPrice.value ? orderPrice.value * orderQty.value : null)
 
+// 代码输入：归一化 + 防抖拉取单票行情（非自选股也能看到现价）
+let debounceTimer = null
+async function onCodeInput() {
+  clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(async () => {
+    const code = normalizeCode(orderCode.value)
+    if (!code) { orderQuote.value = null; orderValidate.value = null; return }
+    try {
+      const [quoteData, validateData] = await Promise.all([
+        api.get('/quote', { params: { codes: code } }),
+        api.get('/quote/validate', { params: { code } }),
+      ])
+      orderQuote.value = quoteData[code] || null
+      orderValidate.value = validateData
+    } catch (e) {
+      orderQuote.value = null
+      orderValidate.value = null
+    }
+  }, 300)
+}
+
+function onCodeBlur() {
+  // 失焦时归一化输入（支持纯数字 → sh/sz/bj 前缀）
+  const code = normalizeCode(orderCode.value)
+  if (code) orderCode.value = code
+}
+
+// P1：板块选股入口（下拉选板块 → 加载该板块股票到联想列表）
+const selectedBoard = ref('all')
+async function loadBoards() {
+  try {
+    const boards = await api.get('/select/boards')
+    boardOptions.value = [{ value: 'all', label: '全部A股' }, ...(boards || [])]
+  } catch (e) { /* 静默 */ }
+}
+async function onBoardChange() {
+  boardStocks.value = []
+  try {
+    const rows = await api.get('/select/market', { params: { board: selectedBoard.value, limit: 200 } })
+    boardStocks.value = (rows || []).map(r => ({ code: r.code, name: r.name || '' }))
+  } catch (e) { toast(e.message) }
+}
+function pickBoardStock(code) {
+  orderCode.value = code
+  onCodeInput()
+}
+
+// P1：下单成功后提示加入自选（便捷而非门槛）
+function addCurrentToWatchlist() {
+  const code = normalizeCode(orderCode.value)
+  if (!code) { toast('请先输入有效股票代码'); return }
+  if (watchlist.codes.includes(code)) { toast('已在自选中'); return }
+  watchlist.addCode(code, orderQuote.value?.name || orderValidate.value?.name || '')
+    .then(() => toast('已加入自选'))
+    .catch(e => toast(e.message))
+}
+
 async function placeOrder() {
-  if (!orderCode.value) { toast('请先添加自选股'); return }
+  const code = normalizeCode(orderCode.value)
+  if (!code) { toast('请输入股票代码（如 sh600519 / bj830799）'); return }
+  if (orderValidate.value && !orderValidate.value.tradable) {
+    toast('该代码为指数/ETF，不可交易'); return
+  }
+  if (!orderQuote.value?.price) { toast('暂无行情，请确认代码后重试'); return }
   if (!orderQty.value || orderQty.value % 100 !== 0) { toast('数量需为100的整数倍'); return }
   try {
-    await portfolio.order(orderCode.value, orderSide.value, Number(orderQty.value))
+    await portfolio.order(code, orderSide.value, Number(orderQty.value))
     toast(orderSide.value === 'buy' ? '买入成功' : '卖出成功')
   } catch (e) {
     toast(e.message)
@@ -57,13 +124,23 @@ onMounted(async () => {
   if (!watchlist.codes.length) await watchlist.fetchWatchlist()
   await watchlist.refreshQuotes()
   await portfolio.fetch()
-  if (watchlist.codes.length) orderCode.value = watchlist.codes[0]
+  loadBoards()
+  if (watchlist.codes.length) {
+    orderCode.value = watchlist.codes[0]
+    await onCodeInput()
+  }
   timer = setInterval(async () => {
     if (document.hidden || polling) return   // 在途锁
     polling = true
     try {
       await watchlist.refreshQuotes()
       await portfolio.fetch()
+      // 下单标的非自选股时，也按需刷新其报价
+      const oc = normalizeCode(orderCode.value)
+      if (oc && !watchlist.codes.includes(oc)) {
+        const q = await api.get('/quote', { params: { codes: oc } })
+        orderQuote.value = q[oc] || orderQuote.value
+      }
     } finally { polling = false }
   }, 6000)
 })
@@ -89,19 +166,39 @@ onUnmounted(() => clearInterval(timer))
     </div>
 
     <div class="order-panel">
-      <select v-model="orderCode">
-        <option v-if="!watchlist.codes.length" value="">请先添加自选股</option>
-        <option v-for="code in watchlist.codes" :key="code" :value="code">
-          {{ watchlist.quotes[code]?.name || code }}（{{ stripPrefix(code) }}）
-        </option>
+      <div class="code-input-wrap">
+        <input
+          v-model="orderCode"
+          @input="onCodeInput"
+          @blur="onCodeBlur"
+          list="watchlist-suggestions"
+          placeholder="输入代码，如 sh600519 / bj830799"
+          class="code-input"
+        />
+        <datalist id="watchlist-suggestions">
+          <option v-for="code in watchlist.codes" :key="code" :value="code">
+            {{ watchlist.quotes[code]?.name || code }}（{{ stripPrefix(code) }}）
+          </option>
+          <option v-for="s in boardStocks" :key="s.code" :value="s.code">{{ s.name }}（{{ stripPrefix(s.code) }}）</option>
+        </datalist>
+        <span v-if="orderQuote?.name" class="quote-name">{{ orderQuote.name }}</span>
+        <span v-if="orderValidate && !orderValidate.tradable" class="quote-warn">指数/ETF 不可交易</span>
+      </div>
+      <select v-model="selectedBoard" @change="onBoardChange" class="board-select" title="从板块挑股直接下单，无需加入自选">
+        <option v-for="b in boardOptions" :key="b.value" :value="b.value">{{ b.label }}</option>
+      </select>
+      <select v-if="boardStocks.length" @change="pickBoardStock($event.target.value)" class="stock-select" title="该板块股票列表">
+        <option value="">选股…</option>
+        <option v-for="s in boardStocks" :key="s.code" :value="s.code">{{ s.name }}（{{ stripPrefix(s.code) }}）</option>
       </select>
       <div class="side-toggle">
         <button class="side-btn" :class="{ active: orderSide === 'buy', buy: true }" @click="orderSide = 'buy'">买入</button>
         <button class="side-btn" :class="{ active: orderSide === 'sell', sell: true }" @click="orderSide = 'sell'">卖出</button>
       </div>
       <input v-model="orderQty" type="number" step="100" min="100" />
-      <span class="order-estimate">预计金额：{{ orderEstimate ? fmtMoney(orderEstimate) : '--' }}</span>
+      <span class="order-estimate">现价 {{ orderPrice ? fmtNum(orderPrice) : '--' }} ｜ 预计金额：{{ orderEstimate ? fmtMoney(orderEstimate) : '--' }}</span>
       <button class="btn-primary" @click="placeOrder">下单</button>
+      <button class="btn-ghost" @click="addCurrentToWatchlist" title="下单标的不必在自选中，可选加入以持续监控">加入自选</button>
       <button class="btn-ghost" @click="resetPortfolio">重置模拟盘</button>
     </div>
 

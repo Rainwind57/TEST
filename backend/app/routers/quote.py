@@ -26,6 +26,23 @@ async def get_quote(codes: str, source: str = "tencent"):
     return data
 
 
+@router.get("/quote/validate")
+async def validate_quote_code(code: str):
+    """校验下单代码：返回名称与可交易性（供模拟盘下单面板预校验）。
+
+    非自选股也可直接下单，此处仅做名称回填与指数/ETF 拦截提示。
+    行情源异常时 name 为空，但仍返回可交易性（is_tradable 仅看代码规则）。
+    """
+    c = code.strip().lower()
+    name = ""
+    try:
+        data = await adapters.fetch_tencent_quotes([c])
+        name = (data.get(c) or {}).get("name", "")
+    except Exception:
+        pass
+    return {"code": c, "name": name, "tradable": db.is_tradable(c)}
+
+
 @router.get("/kline")
 async def get_kline(code: str, days: int = 500, forceRefresh: bool = False, freq: str = "D"):
     days = max(30, min(days, 2000))  # 防止 days=99999 导致的请求爆炸

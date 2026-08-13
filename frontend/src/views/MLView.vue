@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import api, { longTask, downloadFile } from '../api/client'
 import { useToast } from '../stores/toast'
@@ -24,6 +24,8 @@ const trainStart = ref('')          // 训练集起始日（分时段训练，�
 const trainEnd = ref('')            // 训练集结束日
 const btStart = ref('')             // ML 回测验证区间起始日
 const btEnd = ref('')               // ML 回测验证区间结束日
+const btDirection = ref('long_short')  // long_short | long_only | short_only
+const btBenchmark = ref('none')     // none | hs300 | zz500 | sse
 const sectorOptions = ref([])
 
 // 任务1：训练因子多选
@@ -52,6 +54,28 @@ const scoring = ref('')
 const scoreResult = ref(null)
 const btLoading = ref('')
 const btResult = ref(null)
+
+// U1 前端联动：设定训练/回测时间段后，按后端同款口径估算所需历史长度，用于提示与校验
+const suggestedHist = computed(() => {
+  const today = new Date(); today.setHours(0, 0, 0, 0)
+  let need = 0
+  for (const [s, e] of [[btStart.value, btEnd.value], [trainStart.value, trainEnd.value]]) {
+    if (!s && !e) continue
+    const from = s ? new Date(s + 'T00:00:00') : today
+    const to = e ? new Date(e + 'T00:00:00') : today
+    const backToFrom = Math.max(0, Math.floor((today - from) / 86400000))
+    const extraEnd = to < today ? Math.floor((today - to) / 86400000) : 0
+    // 60 缓冲 + 因子最长回看 240 + extraEnd（与后端 build_dataset/backtest_model 口径一致）
+    need = Math.max(need, backToFrom + 60 + 240 + extraEnd)
+  }
+  return Math.max(0, Math.ceil(need))
+})
+const histInsufficient = computed(() => suggestedHist.value > Number(hist.value || 0))
+
+// U1.3 自动回填：设定时间段后，若历史长度不足建议值，自动抬升；用户手动下调仍不足时禁用提交
+watch(suggestedHist, v => {
+  if (v > 0 && Number(hist.value || 0) < v) hist.value = v
+})
 
 // ---- 人工调参（特征权重 / 阈值） ----
 const adjustPanel = ref('')
@@ -217,16 +241,25 @@ function gotoBacktest(m) {
 }
 
 // 用模型对候选池最新截面打分（ML→选股闭环，支持人工调参权重/阈值）
+const scoreLongList = ref([])     // 做多候选（最高分）
+const scoreShortList = ref([])    // 做空候选（最低分，allowShort 时）
+const scoreDirection = ref('long_short')
 async function runScore(m) {
   scoring.value = m.id
   scoreResult.value = null
+  scoreLongList.value = []
+  scoreShortList.value = []
   try {
     const payload = { modelId: m.id, board: 'all', boards: boards.value, poolSize: Number(poolSize.value), assetClass: assetClass.value }
     if (adjustPanel.value === m.id) {
       const adj = adjustPayload()
       if (Object.keys(adj.featureWeights).length || adj.threshold !== null) payload.adjust = adj
     }
-    scoreResult.value = await longTask('/ml/score', payload)
+    const res = await longTask('/ml/score', payload)
+    scoreResult.value = res?.scores ?? res
+    scoreLongList.value = res?.longList || []
+    scoreShortList.value = res?.shortList || []
+    scoreDirection.value = res?.direction || 'long_short'
     toast(`打分完成，共 ${scoreResult.value.length} 只`)
   } catch (e) { toast(e.message) }
   finally { scoring.value = '' }
@@ -236,13 +269,21 @@ async function runScore(m) {
 async function runMLBacktest(m) {
   btLoading.value = m.id
   btResult.value = null
+  // 模型声明方向作为默认值（UI 可在回测卡片下拉中覆盖）
+  if (m.direction) btDirection.value = m.direction
   try {
     const { jobId } = await api.post('/jobs', { kind: 'ml-backtest', config: {
       modelId: m.id, board: 'all', boards: boards.value, poolSize: Number(poolSize.value),
       n: Number(n.value), hist: Number(hist.value), assetClass: assetClass.value,
       startDate: btStart.value || null, endDate: btEnd.value || null,
+      direction: btDirection.value, benchmark: btBenchmark.value,
     }})
     btResult.value = await pollJob(jobId)
+    if (btResult.value?.ok === false) {
+      toast(btResult.value.hint || btResult.value.error || '回测区间无有效调仓日')
+      btResult.value = null
+      return
+    }
     toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
   } catch (e) { toast(e.message) }
   finally { btLoading.value = '' }
@@ -271,7 +312,11 @@ const manualFeatures = ref([])
 const manualName = ref('')
 const manualThreshold = ref(0)
 const manualRule = ref('')
+const manualBullRule = ref('')
+const manualBearRule = ref('')
 const manualWeights = reactive({})
+const manualDirection = ref('long_short')
+const manualAllowShort = ref(true)
 const creatingManual = ref(false)
 async function loadManualFeatures() {
   try {
@@ -295,6 +340,10 @@ async function saveManualModel() {
       featureWeights: fw,
       threshold: manualThreshold.value === '' || manualThreshold.value === null ? 0 : Number(manualThreshold.value),
       rule: manualRule.value.trim(),
+      bullRule: manualBullRule.value.trim(),
+      bearRule: manualBearRule.value.trim(),
+      direction: manualDirection.value,
+      allowShort: manualAllowShort.value,
     })
     toast(`人造模型已创建：${meta.id}`)
     await loadModels()
@@ -322,6 +371,25 @@ async function exportMLBacktest(fmt) {
       config: btResult.value.config || {}, metrics: btResult.value.metrics,
       benchmark: btResult.value.benchmark, groupSummary: btResult.value.groupSummary,
       longShort: btResult.value.longShort, icSeries: btResult.value.icSeries,
+      positionLedger: btResult.value.positionLedger || [],
+      featureImportance: btResult.value.featureImportance || [],
+      actualHistDays: btResult.value.actualHistDays,
+      effectiveStart: btResult.value.effectiveStart,
+      effectiveEnd: btResult.value.effectiveEnd,
+      signalMode: btResult.value.signalMode || 'group',
+      bullRule: btResult.value.bullRule || '',
+      bearRule: btResult.value.bearRule || '',
+      topAttribution: btResult.value.topAttribution || null,
+      direction: btResult.value.direction || 'long_short',
+      survivorshipBiasWarning: btResult.value.survivorshipBiasWarning || '',
+      snapshotWarning: btResult.value.snapshotWarning || '',
+      histWarning: btResult.value.histWarning || '',
+      icIr: btResult.value.icIr ?? null,
+      icTStat: btResult.value.icTStat ?? null,
+      icPValue: btResult.value.icPValue ?? null,
+      yearlyReturns: btResult.value.yearlyReturns || [],
+      stockContribution: btResult.value.stockContribution || [],
+      bucketDates: btResult.value.bucketDates || [],
     }
     const ext = fmt === 'html' ? 'html' : fmt === 'pdf' ? 'pdf' : 'xlsx'
     await downloadFile('/reports/backtest', payload, `ml_backtest.${ext}`)
@@ -396,16 +464,53 @@ function toggleAdjGroup(group) {
 const lsOption = computed(() => {
   if (!btResult.value?.longShort?.length) return {}
   const pts = btResult.value.longShort
+  const dir = btResult.value.direction || 'long_short'
+  const series = [{
+    name: dir === 'long_only' ? '多头累计' : dir === 'short_only' ? '空头累计' : '多空累计',
+    type: 'line', smooth: true,
+    data: pts.map(p => Number((p.cum * 100).toFixed(3))),
+    itemStyle: { color: '#4f8cff' }, areaStyle: { color: 'rgba(79,140,255,.12)' },
+  }]
+  if (dir === 'long_short') {
+    series.push({
+      name: '多头腿', type: 'line', smooth: true,
+      data: pts.map(p => Number(((p.topCum ?? p.cum) * 100).toFixed(3))),
+      itemStyle: { color: '#21c08b' },
+    })
+    series.push({
+      name: '空头腿', type: 'line', smooth: true,
+      data: pts.map(p => Number(((p.bottomCum ?? 0) * 100).toFixed(3))),
+      itemStyle: { color: '#6c5ce7' },
+    })
+  }
   return {
     grid: { left: 50, right: 20, top: 20, bottom: 30 },
     tooltip: { trigger: 'axis' },
+    legend: { top: 0 },
     xAxis: { type: 'category', data: pts.map(p => p.date) },
     yAxis: { type: 'value', axisLabel: { formatter: v => (v * 100).toFixed(1) + '%' } },
-    series: [{
-      name: '多空累计', type: 'line', smooth: true,
-      data: pts.map(p => Number((p.cum * 100).toFixed(3))),
-      itemStyle: { color: '#4f8cff' }, areaStyle: { color: 'rgba(79,140,255,.12)' },
-    }],
+    series,
+  }
+})
+
+// U3/U4 持仓与换手变化图（positionLedger 后端直算 longCount/shortCount/turnover）
+const posOption = computed(() => {
+  const pl = btResult.value?.positionLedger || []
+  if (!pl.length) return {}
+  return {
+    grid: { left: 50, right: 50, top: 30, bottom: 30 },
+    tooltip: { trigger: 'axis' },
+    legend: { top: 0 },
+    xAxis: { type: 'category', data: pl.map(p => p.date) },
+    yAxis: [
+      { type: 'value', name: '持仓数' },
+      { type: 'value', name: '换手' },
+    ],
+    series: [
+      { name: '多头持仓数', type: 'line', data: pl.map(p => p.longCount ?? 0), itemStyle: { color: '#21c08b' } },
+      { name: '空头持仓数', type: 'line', data: pl.map(p => p.shortCount ?? 0), itemStyle: { color: '#6c5ce7' } },
+      { name: '换手股数', type: 'bar', yAxisIndex: 1, data: pl.map(p => p.turnover ?? 0), itemStyle: { color: 'rgba(79,140,255,.4)' } },
+    ],
   }
 })
 
@@ -436,7 +541,7 @@ onUnmounted(() => { pollActive = false })
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>训练起始日</label><input v-model="trainStart" type="date" /></div>
         <div class="field"><label>训练结束日</label><input v-model="trainEnd" type="date" /></div>
-        <span class="hint">留空=用最近 hist 天全部样本；限定时间段后请确保「历史长度」≥ 时间段跨度+260日（不足时后端自动抬升）</span>
+        <span class="hint">留空=用最近 hist 天全部样本；限定时间段后请确保「历史长度」≥ 时间段跨度+260日（不足时已自动回填）<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
       </div>
       <!-- 任务1：因子选择折叠面板 -->
       <div class="factor-select-box">
@@ -463,8 +568,8 @@ onUnmounted(() => { pollActive = false })
         </div>
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
-        <button class="btn-ghost" :disabled="loading" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
-        <button class="btn-primary" :disabled="training" @click="runTrain">{{ training ? '训练中…' : '训练并落盘' }}</button>
+        <button class="btn-ghost" :disabled="loading || histInsufficient" :title="histInsufficient ? '历史长度不足，请增大历史长度或缩短时间段' : ''" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
+        <button class="btn-primary" :disabled="training || histInsufficient" :title="histInsufficient ? '历史长度不足，请增大历史长度或缩短时间段' : ''" @click="runTrain">{{ training ? '训练中…' : '训练并落盘' }}</button>
         <label style="margin-left:12px;font-size:13px;color:var(--text-mute)"><input type="checkbox" v-model="useSnapshot" /> 含全部快照因子（PE/PB/ROE/北向等，前视，探索用）</label>
         <span v-if="trainMsg" class="hint" style="margin-left:8px">{{ trainMsg }}</span>
       </div>
@@ -500,9 +605,26 @@ onUnmounted(() => { pollActive = false })
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>模型名称</label><input v-model="manualName" placeholder="如：动量+低波 组合" /></div>
         <div class="field"><label>阈值偏移</label><input v-model="manualThreshold" type="number" step="0.01" placeholder="0" /></div>
+        <div class="field">
+          <label>交易方向</label>
+          <select v-model="manualDirection">
+            <option value="long_short">多空对冲</option>
+            <option value="long_only">仅做多</option>
+            <option value="short_only">仅做空</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>允许做空</label>
+          <input v-model="manualAllowShort" type="checkbox" />
+        </div>
         <div class="field grow"><label>规则说明（可选）</label><input v-model="manualRule" placeholder="如：动量>0.1 且 RSI<30 买入" /></div>
         <button class="btn-primary" :disabled="creatingManual" @click="saveManualModel">{{ creatingManual ? '创建中…' : '创建人造模型' }}</button>
       </div>
+      <div class="panel-toolbar" style="margin-top:10px">
+        <div class="field grow"><label>看多规则（可选，回测离散买卖）</label><input v-model="manualBullRule" placeholder="如：scorePct>=0.8 and rsi<70" /></div>
+        <div class="field grow"><label>看空规则（可选，回测离散买卖）</label><input v-model="manualBearRule" placeholder="如：scorePct<=0.2 or momentum<-0.05" /></div>
+      </div>
+      <p class="hint" style="margin-top:8px">规则支持变量：scorePct（预测分截面分位 0~1）+ 因子名（如 rsi/momentum/volatility），运算 + - * / &gt; &lt; &gt;= &lt;= == and or not 与括号。留空则回测退回分位分组。</p>
       <div class="manual-features">
         <div class="mf-row" v-for="f in manualFeatures" :key="f.key">
           <span class="mf-name" :title="f.key">{{ f.label }}</span>
@@ -531,7 +653,24 @@ onUnmounted(() => { pollActive = false })
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>回测起始日</label><input v-model="btStart" type="date" /></div>
         <div class="field"><label>回测结束日</label><input v-model="btEnd" type="date" /></div>
-        <span class="hint">「ML回测」的验证区间（分时段验证），留空=整个历史</span>
+        <div class="field">
+          <label>交易方向</label>
+          <select v-model="btDirection">
+            <option value="long_short">多空对冲</option>
+            <option value="long_only">仅做多</option>
+            <option value="short_only">仅做空</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>基准</label>
+          <select v-model="btBenchmark">
+            <option value="none">无</option>
+            <option value="hs300">沪深300</option>
+            <option value="zz500">中证500</option>
+            <option value="sse">上证指数</option>
+          </select>
+        </div>
+        <span class="hint">「ML回测」的验证区间（分时段验证），留空=整个历史<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
       </div>
       <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」「创建人造模型」或导入模型文件</div>
       <table v-else class="data-table">
@@ -548,7 +687,7 @@ onUnmounted(() => { pollActive = false })
             <td><span :class="m.computable === false ? 'tag-fail' : 'tag-ok'">{{ m.computable === false ? '否' : '是' }}</span></td>
             <td>
               <button class="btn-ghost sm" :disabled="scoring===m.id || !m.computable" :title="!m.computable ? '模型因子不可从K线计算，无法回测' : ''" @click="runScore(m)">{{ scoring===m.id ? '打分中…' : '打分选股' }}</button>
-              <button class="btn-ghost sm" :disabled="btLoading===m.id || !m.computable" :title="!m.computable ? '模型因子不可从K线计算，无法回测' : ''" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
+              <button class="btn-ghost sm" :disabled="btLoading===m.id || !m.computable || histInsufficient" :title="histInsufficient ? '历史长度不足，请增大历史长度或缩短时间段' : (!m.computable ? '模型因子不可从K线计算，无法回测' : '')" @click="runMLBacktest(m)">{{ btLoading===m.id ? '回测中…' : 'ML回测' }}</button>
               <button class="btn-ghost sm" @click="openAdjust(m)">{{ adjustPanel===m.id ? '收起调参' : '调参' }}</button>
               <button class="btn-ghost sm" :disabled="!m.computable" :title="!m.computable ? '模型因子不可从K线计算，无法回测' : ''" @click="gotoBacktest(m)">去主回测</button>
               <button class="btn-ghost sm danger" @click="deleteModel(m.id)">删除</button>
@@ -599,16 +738,35 @@ onUnmounted(() => { pollActive = false })
     </div>
 
     <div v-if="scoreResult" class="card">
-      <div class="card-head"><h3>模型截面打分</h3><span class="hint">最新截面预测分排序（Top 30）</span></div>
-      <table class="data-table">
-        <thead><tr><th>排名</th><th>代码</th><th>名称</th><th>预测分</th></tr></thead>
-        <tbody>
-          <tr v-for="(r,i) in scoreResult.slice(0,30)" :key="r.code">
-            <td>{{ i + 1 }}</td><td>{{ r.code }}</td><td>{{ r.name }}</td>
-            <td class="up">{{ fmt(r.score) }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="card-head"><h3>模型截面打分</h3><span class="hint">
+        最新截面预测分排序（Top 30）· 方向 {{ scoreDirection }}
+      </span></div>
+      <div class="score-grid">
+        <div class="score-col">
+          <h4 class="score-title long">做多候选（最高分）</h4>
+          <table class="data-table">
+            <thead><tr><th>排名</th><th>代码</th><th>名称</th><th>预测分</th></tr></thead>
+            <tbody>
+              <tr v-for="(r,i) in scoreLongList.slice(0,30)" :key="r.code">
+                <td>{{ i + 1 }}</td><td>{{ r.code }}</td><td>{{ r.name }}</td>
+                <td class="up">{{ fmt(r.score) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="score-col" v-if="scoreShortList.length">
+          <h4 class="score-title short">做空候选（最低分）</h4>
+          <table class="data-table">
+            <thead><tr><th>排名</th><th>代码</th><th>名称</th><th>预测分</th></tr></thead>
+            <tbody>
+              <tr v-for="(r,i) in scoreShortList.slice(0,30)" :key="r.code">
+                <td>{{ i + 1 }}</td><td>{{ r.code }}</td><td>{{ r.name }}</td>
+                <td class="down">{{ fmt(r.score) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <div v-if="btResult" class="card">
@@ -627,6 +785,26 @@ onUnmounted(() => { pollActive = false })
       </div>
       <EChart :option="lsOption" style="height:340px" />
     </div>
+
+    <div v-if="btResult?.positionLedger?.length" class="card">
+      <div class="card-head"><h3>持仓与调仓变动</h3><span class="hint">每期多头/空头持仓数量及换手股数；明细为最近 10 期相对上期的进出标的</span></div>
+      <EChart :option="posOption" style="height:300px" />
+      <table class="data-table" style="margin-top:12px">
+        <thead><tr><th>调仓日</th><th>多头持仓</th><th>空头持仓</th><th>换手</th><th>新进多头</th><th>退出多头</th><th>新进空头</th><th>退出空头</th></tr></thead>
+        <tbody>
+          <tr v-for="p in btResult.positionLedger.slice(-10)" :key="p.date">
+            <td>{{ p.date }}</td>
+            <td>{{ p.longCount ?? '-' }}</td>
+            <td>{{ p.shortCount ?? '-' }}</td>
+            <td>{{ p.turnover ?? '-' }}</td>
+            <td>{{ (p.longAdded || []).join(', ') || '-' }}</td>
+            <td>{{ (p.longRemoved || []).join(', ') || '-' }}</td>
+            <td>{{ (p.shortAdded || []).join(', ') || '-' }}</td>
+            <td>{{ (p.shortRemoved || []).join(', ') || '-' }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>
 
@@ -644,6 +822,14 @@ onUnmounted(() => { pollActive = false })
 .btn-ghost.sm.danger { color: #ff6b6b; }
 .adj-note { margin-top: 10px; padding: 8px 12px; background: rgba(79,140,255,.08); border: 1px solid rgba(79,140,255,.2); border-radius: 8px; font-size: 12px; color: var(--text-dim); }
 .btn-ghost.sm { padding: 4px 10px; font-size: 12px; }
+.score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 8px; }
+.score-grid > .score-col:only-child { grid-column: 1 / -1; }
+.score-title { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+.score-title.long { color: #00c853; }
+.score-title.short { color: #ff5252; }
+.up { color: #ff5252; }
+.down { color: #00c853; }
+@media (max-width: 720px) { .score-grid { grid-template-columns: 1fr; } }
 .adjust-box { border-top: 1px solid var(--border); padding: 16px 22px; }
 .adj-threshold { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
 .adj-threshold input { width: 120px; }

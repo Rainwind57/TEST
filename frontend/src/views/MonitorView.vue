@@ -33,6 +33,18 @@ const sourceBoard = ref(['all'])
 const sourceTopN = ref(20)
 const addWatchlistBusy = ref({})
 const buyBusy = ref({})
+const shortBusy = ref({})
+// 模型模式分位阈值（可配，M6 设计A）
+const bullPct = ref(0.75)
+const bearPct = ref(0.25)
+// 一键买入分配策略（P0）+ 交易方向（P1）
+const allocMode = ref('equal')
+const perPositionPct = ref(0.2)
+const maxPositions = ref(5)
+const tradeDirections = ref('both')
+// 信号分组 Tab + 分配预览
+const tab = ref('long')
+const allocPlan = ref(null)
 
 async function loadStatus() {
   try {
@@ -50,6 +62,12 @@ async function loadStatus() {
       source.value = s.config.source || 'watchlist'
       sourceBoard.value = [s.config.sourceBoard || 'all']
       sourceTopN.value = s.config.sourceTopN || 20
+      bullPct.value = s.config.bullPct ?? 0.75
+      bearPct.value = s.config.bearPct ?? 0.25
+      allocMode.value = s.config.allocMode || 'equal'
+      perPositionPct.value = s.config.perPositionPct ?? 0.2
+      maxPositions.value = s.config.maxPositions || 5
+      tradeDirections.value = s.config.tradeDirections || 'both'
       monitorConfig.value = s.config
     }
   } catch (e) { toast(e.message) }
@@ -90,6 +108,12 @@ async function saveConfig() {
       source: source.value,
       sourceBoard: sourceBoard.value[0],
       sourceTopN: Number(sourceTopN.value),
+      bullPct: Number(bullPct.value),
+      bearPct: Number(bearPct.value),
+      allocMode: allocMode.value,
+      perPositionPct: Number(perPositionPct.value),
+      maxPositions: Number(maxPositions.value),
+      tradeDirections: tradeDirections.value,
     })
     monitorConfig.value = cfg
     const desc = cfg.mode === 'model'
@@ -150,21 +174,51 @@ async function addToWatchlist(code, name) {
   finally { addWatchlistBusy.value[code] = false }
 }
 
+// 分配引擎预览：下单前先取价算股数，替代硬编码 100 股
+async function allocFor(codes) {
+  const plan = await api.post('/monitor/alloc-preview', { codes })
+  allocPlan.value = plan
+  return plan
+}
+
 async function buySignal(code, name) {
   buyBusy.value[code] = true
   try {
-    await api.post('/portfolio/order', { code, side: 'buy', qty: 100 })
-    toast(`${code} 已下单买入100股`)
+    const plan = await allocFor([code])
+    const a = plan.allocations?.[0]
+    if (!a || a.plannedQty <= 0) { toast(a?.error || '无行情或资金不足，无法买入'); return }
+    await api.post('/portfolio/order', { code, side: 'buy', qty: a.plannedQty })
+    toast(`${code} 已下单买入${a.plannedQty}股`)
   } catch (e) { toast(e.message) }
   finally { buyBusy.value[code] = false }
 }
 
+async function shortSignal(code, name) {
+  shortBusy.value[code] = true
+  try {
+    const plan = await allocFor([code])
+    const a = plan.allocations?.[0]
+    if (!a || a.plannedQty <= 0) { toast(a?.error || '无行情或资金不足，无法做空'); return }
+    await api.post('/portfolio/order', { code, side: 'short', qty: a.plannedQty })
+    toast(`${code} 已融券做空${a.plannedQty}股`)
+  } catch (e) { toast(e.message) }
+  finally { shortBusy.value[code] = false }
+}
+
 async function swapToSignal(s) {
   try {
-    // 卖出原持仓100股 + 买入换仓目标100股
-    await api.post('/portfolio/order', { code: s.code, side: 'sell', qty: 100 })
-    await api.post('/portfolio/order', { code: s.swapTo, side: 'buy', qty: 100 })
-    toast(`已换仓：卖出 ${s.code} → 买入 ${s.swapTo}`)
+    const pf = await api.get('/portfolio')
+    const pos = (pf.positions || []).find(p => p.code === s.code)
+    if (!pos || !pos.qty) { toast('未找到该持仓，无法换仓'); return }
+    const sellQty = Math.floor(pos.qty / 100) * 100
+    if (sellQty <= 0) { toast('持仓不足一手，无法换仓'); return }
+    const sellSide = pos.side === 'short' ? 'cover' : 'sell'
+    await api.post('/portfolio/order', { code: s.code, side: sellSide, qty: sellQty })
+    const plan = await allocFor([s.swapTo])
+    const a = plan.allocations?.[0]
+    if (!a || a.plannedQty <= 0) { toast(a?.error || '无行情或资金不足，换仓买入失败'); return }
+    await api.post('/portfolio/order', { code: s.swapTo, side: 'buy', qty: a.plannedQty })
+    toast(`已换仓：${sellSide === 'cover' ? '回补' : '卖出'} ${s.code} → 买入 ${s.swapTo} ${a.plannedQty}股`)
   } catch (e) { toast(e.message) }
 }
 
@@ -182,19 +236,21 @@ async function batchAddWatchlist() {
   toast(`已批量加入自选：${ok}/${codes.length}`)
 }
 
-async function batchBuy() {
-  const actionable = signals.value.filter(s =>
-    s.signal && (s.signal.includes('看多') || s.signal.includes('突破'))
-  )
-  if (!actionable.length) { toast('无看多信号可买入'); return }
+// 按方向批量下单：做多 buy / 做空 short，统一走分配引擎
+async function batchBuy(dir) {
+  const list = dir === 'long' ? longList.value : shortList.value
+  if (!list.length) { toast(dir === 'long' ? '无做多候选可买入' : '无做空候选可下单'); return }
+  const plan = await allocFor(list.map(s => s.code))
+  const side = dir === 'long' ? 'buy' : 'short'
   let ok = 0
-  for (const s of actionable) {
+  for (const a of plan.allocations) {
+    if (!a.plannedQty) continue
     try {
-      await api.post('/portfolio/order', { code: s.code, side: 'buy', qty: 100 })
+      await api.post('/portfolio/order', { code: a.code, side, qty: a.plannedQty })
       ok++
     } catch (e) { /* skip */ }
   }
-  toast(`已批量下单买入：${ok}/${actionable.length}`)
+  toast(`已批量下单：${ok}/${list.length}`)
 }
 
 const equityOption = computed(() => {
@@ -209,18 +265,31 @@ const equityOption = computed(() => {
   }
 })
 
-const signalClass = sig => {
-  if (!sig) return 'muted'
-  if (sig.includes('看多') || sig.includes('突破')) return 'up'
-  if (sig.includes('看空') || sig.includes('减仓') || sig.includes('平仓') || sig.includes('走弱')) return 'down'
+// 结构化信号分组（替代中文串匹配）
+const longList = computed(() => signals.value.filter(s => s.direction === 'long' && s.action === 'buy'))
+const shortList = computed(() => signals.value.filter(s => s.direction === 'short' && s.action === 'short'))
+const adjList = computed(() => signals.value.filter(s =>
+  s.action === 'sell' || s.action === 'swap' || s.action === 'hold' || s.inPosition))
+const otherList = computed(() => signals.value.filter(s =>
+  s.direction === 'neutral' && !s.inPosition && s.action !== 'sell' && s.action !== 'swap'))
+const visibleSignals = computed(() => {
+  if (tab.value === 'short') return shortList.value
+  if (tab.value === 'adj') return adjList.value
+  if (tab.value === 'other') return otherList.value
+  return longList.value
+})
+
+const signalClass = s => {
+  if (!s) return 'muted'
+  if (s.direction === 'long') return 'up'
+  if (s.direction === 'short') return 'down'
   return 'muted'
 }
-const signalStyle = sig => {
-  if (!sig) return {}
-  if (sig.includes('持仓')) return { background: '#e6a81722', borderColor: '#e6a817', color: '#e6a817' }
-  if (sig.includes('看多') || sig.includes('突破')) return { background: '#00c85322', borderColor: '#00c853', color: '#00c853' }
-  if (sig.includes('看空')) return { background: '#ff525222', borderColor: '#ff5252', color: '#ff5252' }
-  if (sig.includes('平仓') || sig.includes('减仓')) return { background: '#ff525222', borderColor: '#ff5252', color: '#ff5252' }
+const signalStyle = s => {
+  if (!s) return {}
+  if (s.action === 'sell' || s.action === 'swap') return { background: '#e6a81722', borderColor: '#e6a817', color: '#e6a817' }
+  if (s.direction === 'long') return { background: '#00c85322', borderColor: '#00c853', color: '#00c853' }
+  if (s.direction === 'short') return { background: '#ff525222', borderColor: '#ff5252', color: '#ff5252' }
   return { background: '#e6a81722', borderColor: '#e6a817', color: '#e6a817' }
 }
 
@@ -232,12 +301,17 @@ const signalStats = computed(() => {
   let bullish = 0, bearish = 0, neutral = 0, position = 0
   signals.value.forEach(s => {
     if (s.inPosition) position++
-    if (!s.signal) neutral++
-    else if (s.signal.includes('看多') || s.signal.includes('突破')) bullish++
-    else if (s.signal.includes('看空') || s.signal.includes('平仓') || s.signal.includes('减仓') || s.signal.includes('走弱') || s.signal.includes('超买')) bearish++
+    if (s.direction === 'long') bullish++
+    else if (s.direction === 'short') bearish++
     else neutral++
   })
   return { bullish, bearish, neutral, position, total: signals.value.length }
+})
+
+const allocSummary = computed(() => {
+  if (!allocPlan.value) return null
+  const p = allocPlan.value
+  return `将买入/做空 ${p.count} 只 · 每只约 ${(p.perPct * 100).toFixed(0)}% 仓位 · 预计占用现金 ${(p.usedPct * 100).toFixed(1)}%`
 })
 
 const lastScanTime = computed(() => {
@@ -302,6 +376,12 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
             <option v-for="a in adjustOptions" :key="a.id" :value="a.id">{{ a.name }}</option>
           </select>
         </div>
+        <div v-if="mode === 'model'" class="field"><label>看多分位</label>
+          <input v-model.number="bullPct" type="number" min="0.5" max="0.99" step="0.01" class="num-inp" title="分位≥该值判看多" />
+        </div>
+        <div v-if="mode === 'model'" class="field"><label>看空分位</label>
+          <input v-model.number="bearPct" type="number" min="0.01" max="0.5" step="0.01" class="num-inp" title="分位≤该值判看空" />
+        </div>
         <div class="field"><label>标的来源</label>
           <select v-model="source">
             <option value="watchlist">自选股</option>
@@ -314,6 +394,26 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
         </div>
         <div v-if="source === 'model_topn'" class="field"><label>取前N只</label>
           <input v-model.number="sourceTopN" type="number" min="5" max="100" step="5" class="num-inp" />
+        </div>
+        <div class="field"><label>分配策略</label>
+          <select v-model="allocMode">
+            <option value="equal">等权</option>
+            <option value="fixed">固定金额</option>
+            <option value="risk">风险预算</option>
+          </select>
+        </div>
+        <div class="field"><label>单标仓位上限</label>
+          <input v-model.number="perPositionPct" type="number" min="0.05" max="1" step="0.05" class="num-inp" title="占总资金比例，0.2=20%" />
+        </div>
+        <div class="field"><label>最大持仓数</label>
+          <input v-model.number="maxPositions" type="number" min="1" max="20" step="1" class="num-inp" />
+        </div>
+        <div class="field"><label>交易方向</label>
+          <select v-model="tradeDirections">
+            <option value="long">只做多</option>
+            <option value="short">只做空</option>
+            <option value="both">多空两者</option>
+          </select>
         </div>
         <button class="btn-ghost" :disabled="savingCfg" @click="saveConfig">{{ savingCfg ? '保存中…' : '保存配置' }}</button>
         <button class="btn-ghost" :disabled="scanning" @click="scanNow">{{ scanning ? '扫描中…' : '立即扫描' }}</button>
@@ -342,25 +442,42 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
         <h3>盯盘信号（全量扫描）</h3>
         <div class="signal-summary" v-if="signals.length">
           <span class="stat-badge up">🟢 {{ signalStats.bullish }} 看多</span>
-          <span class="stat-badge down">🔴 {{ signalStats.bearish }} 看空/减仓</span>
+          <span class="stat-badge down">🔴 {{ signalStats.bearish }} 看空</span>
           <span class="stat-badge muted">🟡 {{ signalStats.neutral }} 中性</span>
           <span v-if="signalStats.position" class="stat-badge pos">📌 {{ signalStats.position }} 持仓</span>
           <span class="hint" style="margin-left:4px">{{ lastScanTime ? '扫描于 ' + lastScanTime : '' }}</span>
         </div>
-        <div v-if="signals.length" class="batch-actions">
-          <button class="btn-ghost sm" @click="batchAddWatchlist">📋 全部加入自选</button>
-          <button class="btn-ghost sm" @click="batchBuy">💰 看多信号批量买入</button>
-        </div>
       </div>
+
+      <!-- 信号分组 Tab（做多/做空/持仓调整/其他） -->
+      <div class="signal-tabs" v-if="signals.length">
+        <button :class="{ active: tab === 'long' }" @click="tab = 'long'">做多候选 ({{ longList.length }})</button>
+        <button :class="{ active: tab === 'short' }" @click="tab = 'short'">做空候选 ({{ shortList.length }})</button>
+        <button :class="{ active: tab === 'adj' }" @click="tab = 'adj'">持仓调整 ({{ adjList.length }})</button>
+        <button :class="{ active: tab === 'other' }" @click="tab = 'other'">中性/其他 ({{ otherList.length }})</button>
+      </div>
+
+      <!-- 分配预览（扫描/预览后展示） -->
+      <div class="alloc-preview" v-if="allocPlan">{{ allocSummary }}</div>
+
+      <div v-if="signals.length" class="batch-actions">
+        <button class="btn-ghost sm" @click="batchAddWatchlist">📋 全部加入自选</button>
+        <button class="btn-ghost sm" @click="batchBuy('long')">💰 做多信号批量买入</button>
+        <button class="btn-ghost sm" @click="batchBuy('short')">📉 做空信号批量下单</button>
+      </div>
+
       <div v-if="!signals.length" class="empty-hint">
         暂无信号。请先确保自选股列表不为空（在选股页面添加），然后切换信号引擎并点击"立即扫描"。
+      </div>
+      <div v-else-if="!visibleSignals.length" class="empty-hint">
+        当前分组无候选信号，可切换上方 Tab 查看其他分组。
       </div>
       <table v-else class="data-table">
         <thead><tr>
           <th>代码</th><th>名称</th><th>引擎</th><th>动量</th><th>RSI</th><th>模型得分</th><th>信号</th><th>操作</th>
         </tr></thead>
         <tbody>
-          <tr v-for="s in signals" :key="s.code" :class="{ 'row-in-position': s.inPosition }">
+          <tr v-for="s in visibleSignals" :key="s.code" :class="{ 'row-in-position': s.inPosition }">
             <td><code>{{ s.code }}</code></td>
             <td>{{ s.name || '-' }}</td>
             <td><span class="tiny-tag">{{ s.mode === 'model' ? 'ML' : '规则' }}</span></td>
@@ -368,14 +485,16 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
             <td>{{ s.rsi == null ? '-' : fmt(s.rsi) }}</td>
             <td :class="(s.score || 0) > 0 ? 'up' : 'down'">{{ s.score == null ? '-' : fmt(s.score) }}</td>
             <td>
-              <span v-if="s.signal" class="signal-badge" :style="signalStyle(s.signal)">{{ s.signal }}</span>
+              <span v-if="s.signal" class="signal-badge" :style="signalStyle(s)" :class="signalClass(s)">{{ s.signal }}</span>
               <span v-else class="muted">-</span>
+              <div v-if="s.reason && s.reason !== s.signal" class="reason-hint">{{ s.reason }}</div>
               <div v-if="s.swapTo" class="swap-hint">🔄 建议换为 <code>{{ s.swapTo }}</code>（得分 {{ fmt(s.swapScore) }}）</div>
             </td>
             <td class="actions-cell">
               <button class="btn-mini" :disabled="addWatchlistBusy[s.code]" @click="addToWatchlist(s.code, s.name)" title="加入自选">⭐</button>
-              <button class="btn-mini" :disabled="buyBusy[s.code]" @click="buySignal(s.code, s.name)" title="模拟买入100股">💰</button>
-              <button v-if="s.swapTo" class="btn-mini" @click="swapToSignal(s)" title="卖出100股换仓">🔄</button>
+              <button v-if="tab === 'long'" class="btn-mini" :disabled="buyBusy[s.code]" @click="buySignal(s.code, s.name)" title="按分配策略买入">💰</button>
+              <button v-if="tab === 'short'" class="btn-mini" :disabled="shortBusy[s.code]" @click="shortSignal(s.code, s.name)" title="融券做空">📉</button>
+              <button v-if="s.swapTo" class="btn-mini" @click="swapToSignal(s)" title="卖出换仓">🔄</button>
             </td>
           </tr>
         </tbody>
@@ -412,7 +531,7 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
 .btn-mini:hover { background: var(--accent); color: white; }
 .btn-mini:disabled { opacity: 0.4; cursor: not-allowed; }
 .row-in-position { background: rgba(230,168,23,.06); }
-.batch-actions { display: flex; gap: 6px; }
+.batch-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 .btn-ghost.sm { font-size: 12px; padding: 3px 10px; }
 .down { color: #ff5252; }
 .signal-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
@@ -422,4 +541,9 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
 .stat-badge.muted { background: var(--card-2); color: var(--text-dim); border: 1px solid var(--border); }
 .stat-badge.pos { background: #e6a81722; color: #e6a817; border: 1px solid #e6a81744; }
 .swap-hint { font-size: 11px; color: var(--accent); margin-top: 3px; }
+.reason-hint { font-size: 11px; color: var(--text-mute); margin-top: 3px; }
+.signal-tabs { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.signal-tabs button { padding: 4px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-2); color: var(--text-dim); cursor: pointer; font-size: 13px; }
+.signal-tabs button.active { background: var(--accent); color: white; border-color: var(--accent); }
+.alloc-preview { margin-top: 10px; padding: 8px 12px; border-radius: 8px; background: rgba(79,140,255,.1); border: 1px solid #4f8cff44; color: #4f8cff; font-size: 13px; }
 </style>

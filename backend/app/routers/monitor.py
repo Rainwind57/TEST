@@ -23,14 +23,28 @@ class SignalConfigBody(BaseModel):
     source: str = "watchlist"     # 标的来源：watchlist=自选股 / board=板块 / model_topn=模型TopN
     sourceBoard: str = "all"      # source=board/model_topn 时的板块
     sourceTopN: int = 20          # source=model_topn 时取前N只
+    bullPct: float = 0.75         # 看多分位阈值（模型模式）
+    bearPct: float = 0.25         # 看空分位阈值（模型模式）
+    allocMode: str = "equal"      # 分配策略：equal=等权 / fixed=固定金额 / risk=风险预算
+    perPositionPct: float = 0.2   # 单标仓位上限（0-1）
+    maxPositions: int = 5         # 最大持仓数
+    tradeDirections: str = "both"  # 交易方向：long=只做多 / short=只做空 / both=两者
 
 
 @router.get("/status")
 def status():
+    signals = scheduler.last_signals()
     return {
         "enabled": scheduler.is_enabled(),
         "lastRun": scheduler.last_run(),
-        "signals": scheduler.last_signals(),
+        "signals": signals,
+        # P1 多空分离：按结构化 direction/action 分组，前端无需再自行过滤
+        "longCandidates": [s for s in signals
+                           if s.get("direction") == "long" and s.get("action") == "buy"],
+        "shortCandidates": [s for s in signals
+                            if s.get("direction") == "short" and s.get("action") == "short"],
+        "positionAdjust": [s for s in signals
+                           if s.get("action") in ("sell", "swap", "hold") or s.get("inPosition")],
         "config": scheduler.get_signal_config(),
     }
 
@@ -54,6 +68,9 @@ def set_signal_config(body: SignalConfigBody, uid: int = Depends(require_user_id
             body.mode, body.modelId, body.ranking, body.ruleFactor,
             board=body.board, pool_size=body.poolSize, adjust_id=body.adjustId,
             source=body.source, source_board=body.sourceBoard, source_topn=body.sourceTopN,
+            bull_pct=body.bullPct, bear_pct=body.bearPct,
+            alloc_mode=body.allocMode, per_position_pct=body.perPositionPct,
+            max_positions=body.maxPositions, trade_directions=body.tradeDirections,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -92,6 +109,27 @@ def equity_history(limit: int = 60):
 
 class AutoTradeBody(BaseModel):
     enabled: bool
+
+
+class AllocPreviewBody(BaseModel):
+    codes: list[str]
+
+
+@router.post("/alloc-preview")
+async def alloc_preview(body: AllocPreviewBody, uid: int = Depends(require_user_id)):
+    """一键买入前的分配预览：用统一分配引擎计算每只计划股数/金额/仓位占比。"""
+    from .. import db as _db
+    conn = _db.get_conn()
+    state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
+    conn.close()
+    cash = state["cash"] if state else 0.0
+    cfg = scheduler.get_signal_config()
+    plan = await scheduler.plan_allocations(body.codes, cash, {
+        "mode": cfg.get("allocMode", "equal"),
+        "perPositionPct": cfg.get("perPositionPct", 0.2),
+        "maxPositions": cfg.get("maxPositions", 5),
+    })
+    return plan
 
 
 @router.post("/auto-trade")

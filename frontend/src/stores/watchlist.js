@@ -53,6 +53,10 @@ export const useWatchlistStore = defineStore('watchlist', {
         this.noData = this.codes.filter(c => !this.quotes[c])
       }
     },
+    async fetchQuote(code) {
+      const data = await api.get('/quote', { params: { codes: code, source: this.source } })
+      return data[code] || null
+    },
     setSource(src) {
       this.source = src
       this.refreshQuotes()

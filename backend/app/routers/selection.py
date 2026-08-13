@@ -385,11 +385,24 @@ class BacktestBody(BaseModel):
 async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
     # 模型策略：指定 modelId 时走 ML 信号分层回测，响应结构与技术因子回测一致，
     # 前端图表零成本复用（打通”主回测页导入模型”，旧版 modelId 无门可入）。
-    # hist 钳制：下限 min_hist_for_ml 在 ml.backtest_model 内部处理；上限 1500 防 datalen
-    # 过大导致 Sina API 返回 null/异常，先在此处钳制避免 body.hist 极大值传入
-    clamped_hist = max(60, min(body.hist, 1500))
-    if body.startDate:
-        clamped_hist = min(clamped_hist + 240, 1500)
+    # hist 钳制：下限 60 防过小，上限 5000（约 20 年）防异常值；
+    # 超大窗口由 adapters.fetch_kline 内部东财分页自动处理，不再受 1500 限制
+    clamped_hist = max(60, min(body.hist, 5000))
+    # 时间段覆盖抬升：抓取窗口从今天回溯，必须覆盖到 startDate 之前（含因子暖机+长周期回看）；
+    # 仅 endDate 时还需覆盖 (today - endDate) 的额外区间（与 ml.backtest_model 口径一致）
+    if body.startDate or body.endDate:
+        import datetime as _dt
+        today = _dt.date.today()
+        from_date = _dt.date.fromisoformat(body.startDate) if body.startDate else None
+        to_date = _dt.date.fromisoformat(body.endDate) if body.endDate else None
+        if from_date:
+            need = (today - from_date).days + 60 + 240
+        elif to_date and to_date < today:
+            need = (today - to_date).days + clamped_hist + 60
+        else:
+            need = clamped_hist
+        if need > clamped_hist:
+            clamped_hist = min(need, 5000)
     if body.modelId:
         try:
             res = await ml.backtest_model(
@@ -399,7 +412,10 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
                 start_date=body.startDate, end_date=body.endDate,
                 config=body.model_dump(),
                 boards=body.boards,
+                direction="long_only" if body.longOnly else "long_short",
             )
+            if res.get("ok") is False:
+                raise ValueError(res.get("error") or res.get("hint") or "回测区间无有效调仓日")
             res["config"] = body.model_dump()  # 补 config 供前端导出报告/保存策略复用
             # 注入模型元数据到 config，使报告 HTML 能渲染模型详情块
             try:

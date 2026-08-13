@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 _kline_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()
 KLINE_CACHE_TTL = 300  # 秒
 KLINE_CACHE_MAX = 500  # LRU 上限，防内存无限增长
+TENCENT_CAP = 1000     # 腾讯 fqkline 单请求约 1024 条上限，留余量取 1000
+SINA_CAP = 1500        # 新浪日K 单请求上限（超过返回 null）
 
 
 def _kline_cache_set(key: str, value: tuple[float, list]) -> None:
@@ -573,10 +575,21 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
             _kline_cache_set(cache_key, (time.time(), disk_rows))
             return result
 
-    # 主源 Sina（当前环境稳定），Sina 空则降级腾讯
-    kline = await _fetch_sina_kline(code, days)
-    if not kline:
-        kline = await _fetch_tencent_kline_inner(code, days)
+    # 大窗口（>SINA_CAP 日）Sina/Tencent 均会截断或返回 null，走东财分页拉取
+    if days > SINA_CAP:
+        kline = await _fetch_eastmoney_kline_large(code, days)
+    else:
+        # 主源 Sina（当前环境稳定），Sina 空则降级腾讯
+        kline = await _fetch_sina_kline(code, days)
+        if not kline:
+            # 腾讯 fqkline 单请求约 1024 条上限，超出则走东财分页避免静默截断
+            if days > TENCENT_CAP:
+                kline = await _fetch_eastmoney_kline_large(code, days)
+            else:
+                kline = await _fetch_tencent_kline_inner(code, days)
+        # bj 代码中部分 8xxxxx（如 830799）Sina/Tencent 均返回空，降级东财日K
+        if not kline and (code.startswith("bj") or code[2:].startswith(("8", "920", "4"))):
+            kline = await _fetch_eastmoney_kline(code, days)
 
     # 空结果禁止写缓存：旧版把限流返回的空 K 线也落盘+入内存缓存，此后 300s 内
     # 所有调用都拿到空数据，单次网络抖动被放大成 5 分钟故障。
@@ -590,9 +603,33 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
     return result
 
 
+async def fetch_kline_window(code: str, end_date: str, total_days: int,
+                             fq: str = "qfq") -> list[dict]:
+    """抓取 [end_date - total_days, end_date] 窗口的日K，窗口终止于 end_date 而非今天。
+
+    复用 fetch_kline 的全量缓存与东财分页：从今天回拉足够天数覆盖 end_date 再往前
+    total_days，随后裁剪掉 end_date 之后的数据，取尾部 total_days 条。
+    解决「回测时间段早于今天-实际窗口」导致的 0 调仓日 + 前视数据混入。
+    """
+    today = datetime.date.today()
+    try:
+        end_str = str(end_date).replace("/", "-")[:10]
+        to_dt = datetime.date.fromisoformat(end_str)
+    except (ValueError, TypeError):
+        to_dt = today
+        end_str = today.isoformat()
+    gap_days = max(0, (today - to_dt).days)
+    fetch_days = max(total_days, total_days + gap_days) + 60
+    full = await fetch_kline(code, fetch_days)
+    clipped = [r for r in full if str(r.get("date", "")) <= end_str]
+    if len(clipped) > total_days:
+        return clipped[-total_days:]
+    return clipped
+
+
 async def _fetch_tencent_kline_inner(code: str, days: int) -> list[dict]:
-    """腾讯 K 线（备源）。不可用时返回空。上限 2000 日防超时。"""
-    days = min(days, 1500)
+    """腾讯 K 线（备源）。不可用时返回空。单请求约 1024 条上限，超过走东财分页。"""
+    days = min(days, TENCENT_CAP)
     url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
     try:
         resp = await _http_get(url, 10)
@@ -615,8 +652,8 @@ async def _fetch_tencent_kline_inner(code: str, days: int) -> list[dict]:
 
 async def _fetch_sina_kline(code: str, days: int) -> list[dict]:
     """新浪日K线（北交所主力源：920xxx 全历史，腾讯仅当日；8xxxxx 数据止于换码前）。
-    上限 1500 日：超过此值新浪返回 null（非数组），实测阈值在 1500~2000 之间。"""
-    days = min(days, 1500)
+    上限 SINA_CAP 日：超过此值新浪返回 null（非数组），实测阈值在 1500~2000 之间。"""
+    days = min(days, SINA_CAP)
     url = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
            f"?symbol={code}&scale=240&ma=no&datalen={max(1, days)}")
     try:
@@ -665,7 +702,77 @@ async def _fetch_eastmoney_kline(code: str, days: int) -> list[dict]:
             })
         except (TypeError, ValueError):
             continue
+    out.sort(key=lambda r: r["date"])
     return out
+
+
+async def _fetch_eastmoney_kline_large(code: str, days: int) -> list[dict]:
+    """东财日K线分页拉取（>1500日超大窗口）。end+lmt 返回「最近N条」（正序），
+    按日期倒退分批拼接。游标用 min(date) 计算（顺序无关），以「游标不再前进」判停，
+    不因单批条数 < lmt（API 可能静默截断到 200~500 条）而提前退出。"""
+    market = "1" if code.startswith("sh") else "0"
+    pure = code[2:]
+    if code.startswith("bj"):
+        market = "0"
+
+    chunks = []
+    end_str = "20500101"
+    remaining = days
+    last_earliest = None
+
+    while remaining > 0:
+        chunk_size = min(remaining, 1000)
+        url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+               f"?secid={market}.{pure}"
+               "&fields1=f1,f2,f3"
+               "&fields2=f51,f52,f53,f54,f55,f56,f57"
+               f"&klt=101&fqt=1&end={end_str}&lmt={chunk_size}")
+        try:
+            resp = await _http_get(url, 10)
+            klines = (resp.json() or {}).get("data", {}).get("klines") or []
+        except Exception:
+            break
+
+        if not klines:
+            break
+
+        parsed = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                parsed.append({
+                    "date": parts[0],
+                    "open": float(parts[1]), "close": float(parts[2]),
+                    "high": float(parts[3]), "low": float(parts[4]),
+                    "volume": float(parts[5]),
+                })
+            except (TypeError, ValueError):
+                continue
+
+        if not parsed:
+            break
+
+        chunks.append(parsed)
+        remaining -= len(parsed)
+
+        # 游标取本批最小日期（顺序无关），倒退 1 天继续拉更早数据
+        earliest = min(p["date"] for p in parsed)
+        # 游标不再前进（本批最早日期未早于上一批）→ 已无更早数据
+        if last_earliest is not None and earliest >= last_earliest:
+            break
+        last_earliest = earliest
+        try:
+            end_dt = datetime.datetime.strptime(earliest.replace("-", ""), "%Y%m%d") - datetime.timedelta(days=1)
+            end_str = end_dt.strftime("%Y%m%d")
+        except (ValueError, TypeError):
+            break
+
+    # 合并所有批次并按日期升序排序，保证 oldest-first（不依赖各批次返回顺序）
+    result = [row for ch in chunks for row in ch]
+    result.sort(key=lambda r: r["date"])
+    return result
 
 
 def _kline_stale(rows: list[dict], max_age_days: int = 3) -> bool:
