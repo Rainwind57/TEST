@@ -208,7 +208,7 @@ class TestMonitor_配置透传_P0:
 
     def test_monitor_config_has_board_and_poolsize(self, auth_headers):
         """GET /monitor/config 返回 board / poolSize / adjustId"""
-        cfg = api("GET", "/monitor/config", headers=auth_headers)
+        cfg = api("GET", "/api/monitor/config", headers=auth_headers)
         assert "board" in cfg, f"缺失 board: {list(cfg.keys())}"
         assert "poolSize" in cfg, f"缺失 poolSize: {list(cfg.keys())}"
         assert "adjustId" in cfg, f"缺失 adjustId: {list(cfg.keys())}"
@@ -221,7 +221,7 @@ class TestMonitor_配置透传_P0:
         if not models:
             pytest.skip("无可用模型")
         mid = _pick_computable(models)["id"]
-        cfg = api("POST", "/monitor/config", headers=auth_headers, json_body={
+        cfg = api("POST", "/api/monitor/config", headers=auth_headers, json_body={
             "mode": "model",
             "modelId": mid,
             "ranking": "full",
@@ -231,13 +231,13 @@ class TestMonitor_配置透传_P0:
         assert cfg["board"] == "sh_main", f"board 未保存: {cfg}"
         assert cfg["poolSize"] == 200, f"poolSize 未保存: {cfg}"
         # 恢复默认
-        api("POST", "/monitor/config", headers=auth_headers, json_body={
+        api("POST", "/api/monitor/config", headers=auth_headers, json_body={
             "mode": "rule", "board": "all", "poolSize": 150,
         })
 
     def test_monitor_status_includes_config(self, auth_headers):
         """GET /monitor/status 包含完整 config"""
-        status = api("GET", "/monitor/status", headers=auth_headers)
+        status = api("GET", "/api/monitor/status", headers=auth_headers)
         assert "config" in status, "status 缺失 config"
         cfg = status["config"]
         for k in ("mode", "modelId", "ranking", "board", "poolSize", "adjustId"):
@@ -254,15 +254,15 @@ class TestMonitor_扫描透传:
             pytest.skip("无可用模型")
         mid = _pick_computable(models)["id"]
         # 设置模型模式
-        api("POST", "/monitor/config", headers=auth_headers, json_body={
+        api("POST", "/api/monitor/config", headers=auth_headers, json_body={
             "mode": "model", "modelId": mid, "ranking": "full",
         })
         # 立即扫描
-        result = api("POST", "/monitor/scan?force=true", headers=auth_headers)
+        result = api("POST", "/api/monitor/scan?force=true", headers=auth_headers)
         assert result["ok"], f"扫描失败: {result.get('reason', result)}"
         assert "signals" in result
         # 恢复规则模式
-        api("POST", "/monitor/config", headers=auth_headers, json_body={
+        api("POST", "/api/monitor/config", headers=auth_headers, json_body={
             "mode": "rule",
         })
 
@@ -417,14 +417,22 @@ class TestCloneModel:
         models = api("GET", "/api/ml/models", headers=auth_headers)
         if not models:
             pytest.skip("无可用模型")
-        mid = _pick_computable(models)["id"]
+        picked = _pick_computable(models)
+        if not picked:
+            pytest.skip("无可计算模型")
+        mid = picked["id"]
         from app import ml
         import os as _os
-        new_meta = ml.clone_model_with_adjust(mid, {"momentum5": 2.0, "rsi": 0.5})
+        # 用模型自身特征名构造权重，验证 featureWeights 按现有特征保留
+        fnames = picked.get("featureNames") or []
+        if len(fnames) < 2:
+            pytest.skip("模型特征不足，无法验证多特征权重")
+        w1, w2 = fnames[0], fnames[1]
+        new_meta = ml.clone_model_with_adjust(mid, {w1: 2.0, w2: 0.5})
         assert len(new_meta["featureNames"]) > 0
         assert new_meta["featureWeights"] is not None
-        assert new_meta["featureWeights"]["momentum5"] == 2.0
-        assert new_meta["featureWeights"]["rsi"] == 0.5
+        assert new_meta["featureWeights"][w1] == 2.0
+        assert new_meta["featureWeights"][w2] == 0.5
         # 清理
         _os.remove(new_meta["path"])
         json_path = new_meta["path"].replace(".joblib", ".json")
@@ -446,12 +454,12 @@ class TestStability:
 
     def test_monitor_status_stable(self, auth_headers):
         for i in range(10):
-            status = api("GET", "/monitor/status", headers=auth_headers)
+            status = api("GET", "/api/monitor/status", headers=auth_headers)
             assert "config" in status, f"第 {i} 次无 config"
 
     def test_monitor_config_stable(self, auth_headers):
         for i in range(10):
-            cfg = api("GET", "/monitor/config", headers=auth_headers)
+            cfg = api("GET", "/api/monitor/config", headers=auth_headers)
             assert "mode" in cfg, f"第 {i} 次无 mode"
 
     def test_model_params_stable(self, auth_headers):

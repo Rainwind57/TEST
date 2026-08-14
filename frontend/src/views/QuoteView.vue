@@ -730,7 +730,7 @@ onUnmounted(() => clearInterval(timer))
         </div>
         <div class="field">
           <label>天数</label>
-          <input v-model.number="klineDays" type="number" min="30" max="1023" style="width:80px" @change="loadKline" />
+          <input v-model.number="klineDays" type="number" min="30" max="2000" style="width:80px" @change="loadKline" />
         </div>
         <span class="sep">|</span>
         <button v-for="ind in ['MACD','KDJ','BOLL']" :key="ind"

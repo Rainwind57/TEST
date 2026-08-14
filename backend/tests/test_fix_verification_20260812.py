@@ -88,8 +88,8 @@ def test_build_dataset_hist_insufficient_error_message(monkeypatch):
                         lambda boards, limit: asyncio.ensure_future(
                             fake_market_list("all", limit)))
 
-    # 请求 2023 年数据，但 K 线从 2025 开始 → 应抛错且提示增大 hist
-    with pytest.raises(ValueError, match="增大 hist"):
+    # 请求 2023 年数据，但 K 线从 2025 开始 → 应抛错且提示时间段/历史长度问题
+    with pytest.raises(ValueError, match="时间段"):
         asyncio.run(ml.build_dataset("all", 10, 5, hist=60,
                                      start_date="2023-01-01", end_date="2023-06-30"))
 

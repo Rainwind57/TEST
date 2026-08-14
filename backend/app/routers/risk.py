@@ -108,9 +108,8 @@ async def _run_attribution(codes: list[str], weights: list[float] | None = None)
 @router.get("/attribution")
 async def attribution():
     """对当前模拟盘持仓做收益归因 + 风险分解。"""
-    conn = db.get_conn()
-    positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
     if not positions:
         raise HTTPException(422, "当前无持仓，无法做风险归因")
     codes = [r["code"] for r in positions]

@@ -41,13 +41,16 @@ const router = createRouter({
   routes
 })
 
-// 路由守卫：未登录访问受保护页 → 跳登录（带 redirect 回跳）；登录页放行
+import { useAuthStore } from '../stores/auth'
+
+// 路由守卫：未登录访问受保护页 → 跳登录（带 redirect 回跳）；登录页放行。
+// 凭证已迁到 httpOnly Cookie + 内存，页面加载时 main.js 先 await bootstrap() 恢复登录态
 router.beforeEach((to, from, next) => {
-  const token = localStorage.getItem('quant_token')
+  const auth = useAuthStore()
   if (to.name === 'login') {
     return next()
   }
-  if (!token) {
+  if (!auth.isLoggedIn) {
     return next({ name: 'login', query: { redirect: to.fullPath } })
   }
   next()

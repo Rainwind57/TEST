@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
 
 from .. import db, intraday
-from ..auth import get_user_id_from_auth
+from ..auth import get_user_id_from_request
 from .auth import require_user_id
 from . import selection as sel
 from .intraday import IntradayBody
@@ -15,7 +15,7 @@ VALID_KINDS = ("select", "backtest", "regression", "intraday", "ml")
 
 
 def _uid(request: Request) -> int:
-    return get_user_id_from_auth(request.headers.get("Authorization")) or 0
+    return get_user_id_from_request(request) or 0
 
 
 # ---------------- saved_strategies ----------------

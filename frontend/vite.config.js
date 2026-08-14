@@ -8,5 +8,12 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5899,
     strictPort: true,
+    // 开发代理：前端走相对路径 /api，由 Vite 转发到后端，消除硬编码 baseURL
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8899',
+        changeOrigin: true,
+      },
+    },
   },
 })

@@ -305,10 +305,17 @@ async def run_select(body: SelectBody, uid: int = 0):
     scored_rows = []
     for row in candidates:
         entry = dict(row)
+        detail = {}
         for key in snap_keys:
-            entry[key] = snapshot_factor_value(row, key)
+            v = snapshot_factor_value(row, key)
+            entry[key] = v
+            detail[key] = {"raw": v}
         for key in tech_keys:
-            entry[key] = tech_values.get(row["code"], {}).get(key)
+            v = tech_values.get(row["code"], {}).get(key)
+            entry[key] = v
+            detail[key] = {"raw": v}
+        # 前端 SelectView 因子列读 factorDetail[f.key].raw，旧版只平铺 entry[key] → 全显 --
+        entry["factorDetail"] = detail
         scored_rows.append(entry)
 
     for uf_key, uf in uf_defs.items():
@@ -324,6 +331,7 @@ async def run_select(body: SelectBody, uid: int = 0):
             scores = compute_user_factor_scores(scored_rows, definition)
         for idx, row in enumerate(scored_rows):
             row[uf_key] = scores[idx]
+            row["factorDetail"][uf_key] = {"raw": scores[idx]}
 
     from .. import factor_expr
     if body.expression:
@@ -707,6 +715,10 @@ async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
         "config": body.model_dump(),
         "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
         "longOnly": body.longOnly,
+        "direction": "long_only" if body.longOnly else "long_short",
+        "actualHistDays": clamped_hist,
+        "effectiveStart": ic_series[0]["date"] if ic_series else None,
+        "effectiveEnd": ic_series[-1]["date"] if ic_series else None,
     }
     if body.longOnly:
         result["longOnlyNote"] = "当前为仅多头模式（可实盘），主指标基于做多Top组。多空组合(longShort)需做空个股，A股散户不可实盘，仅供研究参考。"
@@ -1018,20 +1030,19 @@ async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
         raise HTTPException(400, "codes 不能为空")
 
     if body.action == "watchlist":
-        conn = db.get_conn()
-        added = 0
-        for code in body.codes:
-            code = code.strip().lower()
-            if not db.is_tradable(code):
-                continue
-            existing = conn.execute("SELECT 1 FROM watchlist WHERE code = ?", (code,)).fetchone()
-            if existing:
-                continue
-            conn.execute("INSERT INTO watchlist (code, added_at) VALUES (?, ?)",
-                         (code, datetime.datetime.now().isoformat()))
-            added += 1
-        conn.commit()
-        conn.close()
+        with db.get_conn() as conn:
+            added = 0
+            for code in body.codes:
+                code = code.strip().lower()
+                if not db.is_tradable(code):
+                    continue
+                existing = conn.execute("SELECT 1 FROM watchlist WHERE code = ?", (code,)).fetchone()
+                if existing:
+                    continue
+                conn.execute("INSERT INTO watchlist (code, added_at) VALUES (?, ?)",
+                             (code, datetime.datetime.now().isoformat()))
+                added += 1
+            conn.commit()
         return {"ok": True, "added": added}
 
     if body.action == "buy":
@@ -1067,14 +1078,13 @@ async def apply_selection(body: ApplyBody, uid: int = Depends(require_user_id)):
         # 买入成功的 code 自动同步到 watchlist（使盯盘可跟踪）
         if bought_codes:
             try:
-                conn = db.get_conn()
-                for c in bought_codes:
-                    existing = conn.execute("SELECT 1 FROM watchlist WHERE code=?", (c,)).fetchone()
-                    if not existing:
-                        conn.execute("INSERT INTO watchlist (code, added_at) VALUES (?, ?)",
-                                    (c, datetime.datetime.now().isoformat()))
-                conn.commit()
-                conn.close()
+                with db.get_conn() as conn:
+                    for c in bought_codes:
+                        existing = conn.execute("SELECT 1 FROM watchlist WHERE code=?", (c,)).fetchone()
+                        if not existing:
+                            conn.execute("INSERT INTO watchlist (code, added_at) VALUES (?, ?)",
+                                        (c, datetime.datetime.now().isoformat()))
+                    conn.commit()
             except Exception:
                 pass
         return {"ok": True, "results": results, "syncedToWatchlist": bought_codes if bought_codes else []}

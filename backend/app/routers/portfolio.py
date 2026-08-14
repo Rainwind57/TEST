@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
 
 from .. import adapters, db
-from ..auth import get_user_id_from_auth
+from ..auth import get_user_id_from_request
 from .auth import require_user_id
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
@@ -20,16 +20,15 @@ class OrderBody(BaseModel):
 
 
 async def _build_portfolio_view():
-    conn = db.get_conn()
-    cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-    positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
-    trades = conn.execute(
-        "SELECT time, side, code, name, qty, price, amount FROM trades ORDER BY id DESC LIMIT 30"
-    ).fetchall()
-    equity_rows = conn.execute(
-        "SELECT ts, value FROM equity_history ORDER BY id DESC LIMIT 300"
-    ).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+        positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
+        trades = conn.execute(
+            "SELECT time, side, code, name, qty, price, amount FROM trades ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+        equity_rows = conn.execute(
+            "SELECT ts, value FROM equity_history ORDER BY id DESC LIMIT 300"
+        ).fetchall()
 
     codes = [p["code"] for p in positions]
     quotes = {}
@@ -98,75 +97,69 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
 
     price = q["price"]
     amount = price * body.qty
-    conn = db.get_conn()
-    cur = conn.cursor()
-    cur.execute("BEGIN IMMEDIATE")  # 获取写锁，防并发下单双花（旧版读改写非原子）
-    cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-    pos = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
-    pos_side = pos["side"] if pos else "long"
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")  # 获取写锁，防并发下单双花（旧版读改写非原子）
+        cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+        pos = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
+        pos_side = pos["side"] if pos else "long"
 
-    if body.side == "buy":
-        if pos and pos_side == "short":
-            conn.close()
-            raise HTTPException(422, "该代码持有空单，请先回补（side=cover）")
-        cost = amount * COMMISSION
-        if amount + cost > cash:
-            conn.close()
-            raise HTTPException(422, f"资金不足（含佣金{COMMISSION:.2%}）")
-        new_cash = cash - amount - cost
-        if pos:
-            new_qty = pos["qty"] + body.qty
-            new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount + cost) / new_qty
-            cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ? WHERE code = ?",
-                        (new_qty, new_avg_cost, q["name"], code))
-        else:
-            cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'long')",
-                        (code, q["name"], body.qty, price + cost / body.qty))
-    elif body.side == "sell":
-        if not pos or pos_side != "long" or pos["qty"] < body.qty:
-            conn.close()
-            raise HTTPException(422, "多头持仓不足")
-        cost = amount * (COMMISSION + STAMP_DUTY)
-        new_cash = cash + amount - cost
-        remain = pos["qty"] - body.qty
-        if remain <= 0:
-            cur.execute("DELETE FROM positions WHERE code = ?", (code,))
-        else:
-            cur.execute("UPDATE positions SET qty = ? WHERE code = ?", (remain, code))
-    elif body.side == "short":
-        # 融券开空：按现价"卖出借入股份"，现金增加，负债以负市值体现
-        if pos and pos_side == "long":
-            conn.close()
-            raise HTTPException(422, "该代码持有多头，请先卖出（side=sell）后再做空")
-        cost = amount * COMMISSION
-        new_cash = cash + amount - cost
-        if pos:
-            new_qty = pos["qty"] + body.qty
-            new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount) / new_qty
-            cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ?, side = 'short' WHERE code = ?",
-                        (new_qty, new_avg_cost, q["name"], code))
-        else:
-            cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'short')",
-                        (code, q["name"], body.qty, price))
-    else:  # cover：买入回补空单
-        if not pos or pos_side != "short" or pos["qty"] < body.qty:
-            conn.close()
-            raise HTTPException(422, "空头持仓不足")
-        cost = amount * COMMISSION
-        new_cash = cash - amount - cost
-        remain = pos["qty"] - body.qty
-        if remain <= 0:
-            cur.execute("DELETE FROM positions WHERE code = ?", (code,))
-        else:
-            cur.execute("UPDATE positions SET qty = ? WHERE code = ?", (remain, code))
+        if body.side == "buy":
+            if pos and pos_side == "short":
+                raise HTTPException(422, "该代码持有空单，请先回补（side=cover）")
+            cost = amount * COMMISSION
+            if amount + cost > cash:
+                raise HTTPException(422, f"资金不足（含佣金{COMMISSION:.2%}）")
+            new_cash = cash - amount - cost
+            if pos:
+                new_qty = pos["qty"] + body.qty
+                new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount + cost) / new_qty
+                cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ? WHERE code = ?",
+                            (new_qty, new_avg_cost, q["name"], code))
+            else:
+                cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'long')",
+                            (code, q["name"], body.qty, price + cost / body.qty))
+        elif body.side == "sell":
+            if not pos or pos_side != "long" or pos["qty"] < body.qty:
+                raise HTTPException(422, "多头持仓不足")
+            cost = amount * (COMMISSION + STAMP_DUTY)
+            new_cash = cash + amount - cost
+            remain = pos["qty"] - body.qty
+            if remain <= 0:
+                cur.execute("DELETE FROM positions WHERE code = ?", (code,))
+            else:
+                cur.execute("UPDATE positions SET qty = ? WHERE code = ?", (remain, code))
+        elif body.side == "short":
+            # 融券开空：按现价"卖出借入股份"，现金增加，负债以负市值体现
+            if pos and pos_side == "long":
+                raise HTTPException(422, "该代码持有多头，请先卖出（side=sell）后再做空")
+            cost = amount * COMMISSION
+            new_cash = cash + amount - cost
+            if pos:
+                new_qty = pos["qty"] + body.qty
+                new_avg_cost = (pos["avg_cost"] * pos["qty"] + amount) / new_qty
+                cur.execute("UPDATE positions SET qty = ?, avg_cost = ?, name = ?, side = 'short' WHERE code = ?",
+                            (new_qty, new_avg_cost, q["name"], code))
+            else:
+                cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'short')",
+                            (code, q["name"], body.qty, price))
+        else:  # cover：买入回补空单
+            if not pos or pos_side != "short" or pos["qty"] < body.qty:
+                raise HTTPException(422, "空头持仓不足")
+            cost = amount * COMMISSION
+            new_cash = cash - amount - cost
+            remain = pos["qty"] - body.qty
+            if remain <= 0:
+                cur.execute("DELETE FROM positions WHERE code = ?", (code,))
+            else:
+                cur.execute("UPDATE positions SET qty = ? WHERE code = ?", (remain, code))
 
-    cur.execute("UPDATE portfolio_state SET cash = ? WHERE id = 1", (new_cash,))
-    cur.execute(
-        "INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), body.side, code, q["name"], body.qty, price, amount)
-    )
-    conn.commit()
-    conn.close()
+        cur.execute("UPDATE portfolio_state SET cash = ? WHERE id = 1", (new_cash,))
+        cur.execute(
+            "INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), body.side, code, q["name"], body.qty, price, amount)
+        )
+        conn.commit()
 
     view = await _build_portfolio_view()
     _record_equity(view["totalAssets"])
@@ -174,16 +167,15 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
 
 
 def _record_equity(value: float):
-    conn = db.get_conn()
-    conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
-                 (datetime.datetime.now().isoformat(), value))
-    conn.commit()
-    conn.close()
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
+                     (datetime.datetime.now().isoformat(), value))
+        conn.commit()
 
 
 @router.post("/reset")
 async def reset_portfolio(request: Request):
-    if not get_user_id_from_auth(request.headers.get("Authorization")):
+    if not get_user_id_from_request(request):
         raise HTTPException(401, "请先登录后再重置模拟盘")
     db.reset_portfolio()
     return await _build_portfolio_view()

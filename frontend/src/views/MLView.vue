@@ -63,10 +63,10 @@ const suggestedHist = computed(() => {
     if (!s && !e) continue
     const from = s ? new Date(s + 'T00:00:00') : today
     const to = e ? new Date(e + 'T00:00:00') : today
-    const backToFrom = Math.max(0, Math.floor((today - from) / 86400000))
-    const extraEnd = to < today ? Math.floor((today - to) / 86400000) : 0
-    // 60 缓冲 + 因子最长回看 240 + extraEnd（与后端 build_dataset/backtest_model 口径一致）
-    need = Math.max(need, backToFrom + 60 + 240 + extraEnd)
+    // 区间跨度 + 因子回看缓冲（60 缓冲 + 最长回看 240 ≈ 260）。
+    // 两端都填=区间跨度；只填一端=该端到今天的距离；不再叠加 today→to 的重复距离。
+    const spanDays = Math.max(0, Math.floor((to - from) / 86400000))
+    need = Math.max(need, spanDays + 260)
   }
   return Math.max(0, Math.ceil(need))
 })
@@ -284,6 +284,8 @@ async function runMLBacktest(m) {
       btResult.value = null
       return
     }
+    if (btResult.value?.snapshotStartNote) toast(btResult.value.snapshotStartNote)
+    if (btResult.value?.inSampleWarning) toast(btResult.value.inSampleWarning)
     toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
   } catch (e) { toast(e.message) }
   finally { btLoading.value = '' }
@@ -383,6 +385,8 @@ async function exportMLBacktest(fmt) {
       direction: btResult.value.direction || 'long_short',
       survivorshipBiasWarning: btResult.value.survivorshipBiasWarning || '',
       snapshotWarning: btResult.value.snapshotWarning || '',
+      snapshotStartNote: btResult.value.snapshotStartNote || '',
+      inSampleWarning: btResult.value.inSampleWarning || '',
       histWarning: btResult.value.histWarning || '',
       icIr: btResult.value.icIr ?? null,
       icTStat: btResult.value.icTStat ?? null,
@@ -541,7 +545,7 @@ onUnmounted(() => { pollActive = false })
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>训练起始日</label><input v-model="trainStart" type="date" /></div>
         <div class="field"><label>训练结束日</label><input v-model="trainEnd" type="date" /></div>
-        <span class="hint">留空=用最近 hist 天全部样本；限定时间段后请确保「历史长度」≥ 时间段跨度+260日（不足时已自动回填）<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
+        <span class="hint">留空=用最近 hist 天全部样本；两端都填=只训练该区间，只填起始日=训练至今天，只填结束日=取最近 hist 天截至该日。限定时间段后请确保「历史长度」≥ 时间段跨度+260日（不足时已自动回填）<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
       </div>
       <!-- 任务1：因子选择折叠面板 -->
       <div class="factor-select-box">
@@ -670,7 +674,7 @@ onUnmounted(() => { pollActive = false })
             <option value="sse">上证指数</option>
           </select>
         </div>
-        <span class="hint">「ML回测」的验证区间（分时段验证），留空=整个历史<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
+        <span class="hint">「ML回测」的验证区间（分时段验证），留空=整个历史；只填起始日=回测至今天，只填结束日=取最近 hist 天截至该日<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
       </div>
       <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」「创建人造模型」或导入模型文件</div>
       <table v-else class="data-table">

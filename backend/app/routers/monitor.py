@@ -98,12 +98,11 @@ async def scan(force: bool = False, uid: int = Depends(require_user_id)):
 
 @router.get("/equity")
 def equity_history(limit: int = 60):
-    conn = db.get_conn()
-    rows = conn.execute(
-        "SELECT ts, value FROM equity_history ORDER BY id DESC LIMIT ?",
-        (max(1, min(limit, 500)),)
-    ).fetchall()[::-1]
-    conn.close()
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ts, value FROM equity_history ORDER BY id DESC LIMIT ?",
+            (max(1, min(limit, 500)),)
+        ).fetchall()[::-1]
     return [{"ts": r["ts"], "value": r["value"]} for r in rows]
 
 
@@ -119,9 +118,8 @@ class AllocPreviewBody(BaseModel):
 async def alloc_preview(body: AllocPreviewBody, uid: int = Depends(require_user_id)):
     """一键买入前的分配预览：用统一分配引擎计算每只计划股数/金额/仓位占比。"""
     from .. import db as _db
-    conn = _db.get_conn()
-    state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
-    conn.close()
+    with _db.get_conn() as conn:
+        state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
     cash = state["cash"] if state else 0.0
     cfg = scheduler.get_signal_config()
     plan = await scheduler.plan_allocations(body.codes, cash, {

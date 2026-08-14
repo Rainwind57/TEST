@@ -63,52 +63,65 @@ class ApplyBody(BaseModel):
 
 @router.post("/apply")
 async def apply_to_portfolio(body: ApplyBody, uid: int = Depends(require_user_id)):
-    """按优化建仓模拟盘（按总资产×权重整手买入）。"""
+    """按优化权重建仓模拟盘（多头权重买入，负权重做空）。"""
     if len(body.codes) != len(body.weights):
         raise HTTPException(400, "codes 与 weights 长度不一致")
     w = np.array(body.weights, dtype=np.float64)
-    if len(w) == 0 or w.sum() <= 0:
-        raise HTTPException(400, "权重和需为正")
-    w = w / w.sum()
+    if len(w) == 0:
+        raise HTTPException(400, "codes 不能为空")
+    # 多头/空头各自归一化到 1：多空对冲组合 w.sum() 可能 ≈0，不能整体归一
+    long_w = np.clip(w, 0, None)
+    short_w = np.clip(-w, 0, None)
+    long_sum = float(long_w.sum())
+    short_sum = float(short_w.sum())
+    if long_sum <= 0 and short_sum <= 0:
+        raise HTTPException(400, "权重需至少一侧为正")
+    if long_sum > 0:
+        long_w = long_w / long_sum
+    if short_sum > 0:
+        short_w = short_w / short_sum
+    long_target = {code: float(wi) for code, wi in zip(body.codes, long_w) if wi > 0}
+    short_target = {code: float(wi) for code, wi in zip(body.codes, short_w) if wi > 0}
 
-    conn = db.get_conn()
-    cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-    positions_rows = conn.execute("SELECT code, qty FROM positions").fetchall()
-    conn.close()
-    positions = {p["code"]: p["qty"] for p in positions_rows}
+    with db.get_conn() as conn:
+        cash = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+        positions_rows = conn.execute("SELECT code, qty, side FROM positions").fetchall()
+    long_pos = {p["code"]: p["qty"] for p in positions_rows if (p["side"] or "long") == "long"}
+    short_pos = {p["code"]: p["qty"] for p in positions_rows if p["side"] == "short"}
 
-    all_codes = list(set(body.codes) | set(positions.keys()))
+    all_codes = list(set(body.codes) | set(long_pos.keys()) | set(short_pos.keys()))
     quotes = await adapters.fetch_tencent_quotes(all_codes)
-    market_value = sum(
-        quotes.get(code, {}).get("price", 0) * qty for code, qty in positions.items()
-    )
-    total = body.totalAssets if body.totalAssets else (cash + market_value)
+    long_mv = sum(quotes.get(c, {}).get("price", 0) * q for c, q in long_pos.items())
+    short_mv = sum(quotes.get(c, {}).get("price", 0) * q for c, q in short_pos.items())
+    total = body.totalAssets if body.totalAssets else (cash + long_mv)
 
     applied = []
-    target_by_code = {code: float(wi) for code, wi in zip(body.codes, w)}
-    # 先卖再买：释放持仓超出目标权重的部分
-    for code, qty in positions.items():
-        price = quotes.get(code, {}).get("price", 0)
-        if price <= 0:
-            continue
-        if code not in target_by_code:
-            # 调出组合 → 全卖
+    # 先释放不在目标内的持仓：多头卖、空头回补
+    for code, qty in long_pos.items():
+        if code not in long_target:
             try:
                 await place_order(OrderBody(code=code, side="sell", qty=qty))
-                applied.append({"code": code, "side": "sell", "qty": qty, "reason": "调出组合"})
+                applied.append({"code": code, "side": "sell", "qty": qty, "reason": "调出多头组合"})
             except Exception as e:
                 applied.append({"code": code, "side": "sell", "error": str(e)})
+    for code, qty in short_pos.items():
+        if code not in short_target:
+            try:
+                await place_order(OrderBody(code=code, side="cover", qty=qty))
+                applied.append({"code": code, "side": "cover", "qty": qty, "reason": "调出空头组合"})
+            except Exception as e:
+                applied.append({"code": code, "side": "cover", "error": str(e)})
 
-    for code, wi in target_by_code.items():
+    # 多头腿：买/卖调整
+    for code, wi in long_target.items():
         price = quotes.get(code, {}).get("price", 0)
         if price <= 0:
             applied.append({"code": code, "weight": wi, "error": "无行情"})
             continue
         target_qty = int(total * wi / price / 100) * 100
-        current_qty = positions.get(code, 0)
+        current_qty = long_pos.get(code, 0)
         if target_qty < current_qty:
-            sell_qty = min(current_qty - target_qty, current_qty)
-            sell_qty = max(100, sell_qty // 100 * 100)
+            sell_qty = (current_qty - target_qty) // 100 * 100
             if sell_qty >= 100:
                 try:
                     await place_order(OrderBody(code=code, side="sell", qty=sell_qty))
@@ -116,7 +129,7 @@ async def apply_to_portfolio(body: ApplyBody, uid: int = Depends(require_user_id
                 except Exception as e:
                     applied.append({"code": code, "weight": wi, "error": str(e)})
         elif target_qty > current_qty:
-            buy_qty = target_qty - current_qty
+            buy_qty = (target_qty - current_qty) // 100 * 100
             if buy_qty < 100:
                 applied.append({"code": code, "weight": wi, "error": "调整量不足 1 手"})
                 continue
@@ -127,6 +140,35 @@ async def apply_to_portfolio(body: ApplyBody, uid: int = Depends(require_user_id
                 applied.append({"code": code, "weight": wi, "error": str(e)})
         else:
             applied.append({"code": code, "weight": wi, "action": "hold"})
+
+    # 空头腿：short/cover 调整（负权重 → 做空）
+    for code, wi in short_target.items():
+        price = quotes.get(code, {}).get("price", 0)
+        if price <= 0:
+            applied.append({"code": code, "weight": -wi, "error": "无行情"})
+            continue
+        target_qty = int(total * wi / price / 100) * 100
+        current_qty = short_pos.get(code, 0)
+        if target_qty < current_qty:
+            cover_qty = (current_qty - target_qty) // 100 * 100
+            if cover_qty >= 100:
+                try:
+                    await place_order(OrderBody(code=code, side="cover", qty=cover_qty))
+                    applied.append({"code": code, "side": "cover", "qty": cover_qty, "weight": -wi})
+                except Exception as e:
+                    applied.append({"code": code, "weight": -wi, "error": str(e)})
+        elif target_qty > current_qty:
+            short_qty = (target_qty - current_qty) // 100 * 100
+            if short_qty < 100:
+                applied.append({"code": code, "weight": -wi, "error": "调整量不足 1 手"})
+                continue
+            try:
+                await place_order(OrderBody(code=code, side="short", qty=short_qty))
+                applied.append({"code": code, "side": "short", "qty": short_qty, "weight": -wi})
+            except Exception as e:
+                applied.append({"code": code, "weight": -wi, "error": str(e)})
+        else:
+            applied.append({"code": code, "weight": -wi, "action": "hold"})
     return {"applied": applied, "totalAssets": total}
 
 

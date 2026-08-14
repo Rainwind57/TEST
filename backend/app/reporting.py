@@ -75,6 +75,8 @@ def payload_from_result(result: dict) -> dict:
         "icSeries": result.get("icSeries") or [],
         "survivorshipBiasWarning": result.get("survivorshipBiasWarning", ""),
         "snapshotWarning": result.get("snapshotWarning", ""),
+        "snapshotStartNote": result.get("snapshotStartNote", ""),
+        "inSampleWarning": result.get("inSampleWarning", ""),
         "histWarning": result.get("histWarning", ""),
         "actualHistDays": result.get("actualHistDays"),
         "effectiveStart": result.get("effectiveStart"),
@@ -136,6 +138,12 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     sw = payload.get("snapshotWarning", "")
     if sw:
         warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 前视偏差警告：{_htmlescape(sw)}</div>')
+    sn = payload.get("snapshotStartNote", "")
+    if sn:
+        warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 回测起点调整：{_htmlescape(sn)}</div>')
+    isw = payload.get("inSampleWarning", "")
+    if isw:
+        warnings.append(f'<div class="warn-banner" style="border-color:#4f8cff;background:#101a2a">ℹ️ 样本内回测：{_htmlescape(isw)}</div>')
     sb = payload.get("survivorshipBiasWarning", "")
     if sb:
         warnings.append(f'<div class="warn-banner">⚠️ 生存偏差：{_htmlescape(sb)}</div>')

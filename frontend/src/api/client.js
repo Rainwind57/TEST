@@ -1,19 +1,27 @@
 import axios from 'axios'
 import { useToast } from '../stores/toast'
 
-const baseURL = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8899/api'
+// baseURL：优先环境变量；未配置时用相对路径 /api（开发走 Vite 代理，生产同源部署或由网关转发），
+// 避免旧版硬编码 127.0.0.1:8899 导致部署到其他主机后全部请求落空
+const baseURL = import.meta.env.VITE_API_BASE || '/api'
 export { baseURL }
 
 const api = axios.create({
   baseURL,
-  timeout: 300000  // 旧版 60s：选股/回测/ML 大池操作经常跑不完被误判超时，放宽到 5 分钟
+  timeout: 300000,  // 旧版 60s：选股/回测/ML 大池操作经常跑不完被误判超时，放宽到 5 分钟
+  withCredentials: true,  // 携带 httpOnly Cookie（quant_token）实现持久化登录态
 })
 
+// token 仅存内存（由 auth store 维护），不再写 localStorage（XSS 窃取面收窄）。
+// 请求同时带 Authorization 头 + Cookie 双通道，兼容跨源/直连部署场景。
+let _token = ''
+export function setAuthToken(t) { _token = t }
+export function clearAuthToken() { _token = '' }
+
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('quant_token')
-  if (token) {
+  if (_token) {
     config.headers = config.headers || {}
-    config.headers.Authorization = `Bearer ${token}`
+    config.headers.Authorization = `Bearer ${_token}`
   }
   return config
 })
@@ -32,11 +40,12 @@ api.interceptors.response.use(
   err => {
     const status = err?.response?.status
     if (status === 401) {
-      // token 失效/未登录：清除凭证并跳登录页（带 redirect 回跳）
-      localStorage.removeItem('quant_token')
-      localStorage.removeItem('quant_user')
+      // 登录态失效：清内存凭证并跳登录页（带 redirect 回跳）。
+      // /auth/me 属于 bootstrap 探测，401 时若已在登录页则不重复跳转
+      clearAuthToken()
       const path = window.location.pathname + window.location.search
-      if (!path.startsWith('/login')) {
+      const isMeProbe = (err?.config?.url || '').includes('/auth/me')
+      if (!path.startsWith('/login') && !isMeProbe) {
         window.location.href = '/login?redirect=' + encodeURIComponent(path)
       }
       return Promise.reject(new Error('登录已失效，请重新登录'))
@@ -62,22 +71,22 @@ export async function longTask(url, payload, { timeout = 300000 } = {}) {
 }
 
 export async function downloadFile(url, payload, filename) {
-  const token = localStorage.getItem('quant_token')
   const res = await axios.post(baseURL + url, payload, {
     responseType: 'blob',
     timeout: 300000,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    withCredentials: true,
+    headers: _token ? { Authorization: `Bearer ${_token}` } : {},
   })
   await saveBlob(res, filename)
 }
 
 // GET 下载（报告历史文件等只读端点），响应处理与 downloadFile 一致
 export async function downloadGet(url, filename) {
-  const token = localStorage.getItem('quant_token')
   const res = await axios.get(baseURL + url, {
     responseType: 'blob',
     timeout: 120000,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    withCredentials: true,
+    headers: _token ? { Authorization: `Bearer ${_token}` } : {},
   })
   await saveBlob(res, filename)
 }

@@ -51,9 +51,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if path in _exempt_paths or not path.startswith("/api/"):
             return await call_next(request)
-        ip = request.client.host if request.client else "unknown"
-        token = request.headers.get("Authorization", "")
-        uid = auth.get_user_id_from_auth(token) if token.startswith("Bearer ") else None
+        # 代理部署下 request.client.host 是反代地址，同网段请求会共享限流桶；
+        # 优先取 X-Forwarded-For 首个真实客户端 IP，缺省回退 client.host。
+        xff = request.headers.get("x-forwarded-for", "")
+        ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
+        uid = auth.get_user_id_from_request(request)
         limit = _USER_LIMIT if uid else _ANON_LIMIT
         key = f"{ip}:{'u' if uid else 'a'}"
         now = time.time()

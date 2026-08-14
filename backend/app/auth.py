@@ -10,7 +10,6 @@ import hashlib
 import secrets
 import datetime
 import time
-import warnings
 from collections import defaultdict, deque
 
 from . import db
@@ -60,41 +59,24 @@ def _check_register_rate(client_ip: str) -> bool:
     dq.append(now)
     return True
 
-# JWT 密钥：优先读环境变量 QUANT_JWT_SECRET；未设时从 DB settings 表读取持久化密钥；
-# 都不存在时随机生成并持久化，避免重启后 token 全部失效（P2修复）。
-_JWT_ENV = os.environ.get("QUANT_JWT_SECRET")
-if _JWT_ENV:
-    JWT_SECRET = _JWT_ENV
-else:
-    try:
-        _saved = db.get_setting("jwt_secret", "")
-        if _saved:
-            JWT_SECRET = _saved
-        else:
-            JWT_SECRET = secrets.token_hex(32)
-            db.set_setting("jwt_secret", JWT_SECRET)
-    except Exception:
-        JWT_SECRET = secrets.token_hex(32)
-        warnings.warn(
-            "QUANT_JWT_SECRET 未设置且 DB 不可用，使用临时随机密钥（启动后 init_db 完成会自动持久化）",
-            RuntimeWarning, stacklevel=2,
-        )
+# JWT 密钥：优先读环境变量 QUANT_JWT_SECRET；未设时生成临时随机密钥（不落盘）。
+# 旧版把密钥明文持久化进 SQLite settings 表，拿到 quant.db 即可伪造任意用户 token；
+# 改为不落盘后，未设环境变量时重启会使已签发 token 失效（安全优先，生产务必注入环境变量）。
+JWT_SECRET = os.environ.get("QUANT_JWT_SECRET") or secrets.token_hex(32)
 
 
 def ensure_secret_persisted() -> None:
-    """DB 初始化完成后调用：若密钥为临时生成且未持久化，则写入 settings 表。"""
-    if _JWT_ENV:
-        return
-    try:
-        if db.get_setting("jwt_secret", "") == "":
-            db.set_setting("jwt_secret", JWT_SECRET)
-    except Exception:
-        pass
+    """兼容旧调用点：密钥不再持久化，此函数保留为空实现。"""
+    return
 JWT_TTL = 7 * 24 * 3600  # 7 天
 
 
-def _hash_password(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+_PBKDF2_ITERATIONS = 600_000  # OWASP 2023 建议 ≥60 万次
+_PBKDF2_ITERATIONS_LEGACY = 100_000  # 存量用户旧迭代次数，登录成功后自动升级
+
+
+def _hash_password(password: str, salt: str, iterations: int = _PBKDF2_ITERATIONS) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), iterations).hex()
 
 
 def _make_token(user_id: int, username: str) -> str:
@@ -143,21 +125,19 @@ def register_user(username: str, password: str, client_ip: str = "") -> dict:
         raise ValueError("用户名至少 3 个字符")
     if len(password) < 6:
         raise ValueError("密码至少 6 个字符")
-    conn = db.get_conn()
-    existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
-    if existing:
-        conn.close()
-        raise ValueError("用户名已存在")
-    salt = secrets.token_hex(8)
-    pwd_hash = _hash_password(password, salt)
-    now = datetime.datetime.now().isoformat()
-    cur = conn.execute(
-        "INSERT INTO users (username, password, salt, created_at) VALUES (?, ?, ?, ?)",
-        (username, pwd_hash, salt, now)
-    )
-    conn.commit()
-    uid = cur.lastrowid
-    conn.close()
+    with db.get_conn() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if existing:
+            raise ValueError("用户名已存在")
+        salt = secrets.token_hex(8)
+        pwd_hash = _hash_password(password, salt)
+        now = datetime.datetime.now().isoformat()
+        cur = conn.execute(
+            "INSERT INTO users (username, password, salt, created_at) VALUES (?, ?, ?, ?)",
+            (username, pwd_hash, salt, now)
+        )
+        conn.commit()
+        uid = cur.lastrowid
     return {"id": uid, "username": username, "token": _make_token(uid, username)}
 
 
@@ -166,14 +146,23 @@ def login_user(username: str, password: str, client_ip: str = "") -> dict:
         err = _check_login_rate(client_ip, username)
         if err:
             raise ValueError(err)
-    conn = db.get_conn()
-    row = conn.execute("SELECT id, username, password, salt FROM users WHERE username = ?",
-                      (username,)).fetchone()
-    conn.close()
+    with db.get_conn() as conn:
+        row = conn.execute("SELECT id, username, password, salt FROM users WHERE username = ?",
+                          (username,)).fetchone()
     if not row:
         raise ValueError("用户不存在或密码错误")
-    if not hmac.compare_digest(_hash_password(password, row["salt"]), row["password"]):
-        raise ValueError("用户不存在或密码错误")
+    pwd_hash = _hash_password(password, row["salt"])
+    if not hmac.compare_digest(pwd_hash, row["password"]):
+        # 兼容旧迭代次数（10 万）的存量密码：验证通过后升级到新迭代
+        legacy_hash = _hash_password(password, row["salt"], _PBKDF2_ITERATIONS_LEGACY)
+        if not hmac.compare_digest(legacy_hash, row["password"]):
+            raise ValueError("用户不存在或密码错误")
+        try:
+            with db.get_conn() as conn2:
+                conn2.execute("UPDATE users SET password = ? WHERE id = ?", (pwd_hash, row["id"]))
+                conn2.commit()
+        except Exception:
+            pass
     if client_ip:
         _clear_login_rate(client_ip, username)
     return {"id": row["id"], "username": row["username"], "token": _make_token(row["id"], row["username"])}
@@ -186,3 +175,19 @@ def get_user_id_from_auth(auth_header: str | None) -> int | None:
     token = auth_header[7:]
     payload = verify_token(token)
     return payload.get("uid") if payload else None
+
+
+def get_user_id_from_request(request) -> int | None:
+    """从请求提取 user_id：优先 Authorization 头，其次 quant_token httpOnly Cookie。
+
+    Cookie 为持久化凭证（前端不再把 token 写入 localStorage，降低 XSS 窃取面）。
+    """
+    uid = get_user_id_from_auth(request.headers.get("Authorization"))
+    if uid:
+        return uid
+    cookie_token = request.cookies.get("quant_token")
+    if cookie_token:
+        payload = verify_token(cookie_token)
+        if payload:
+            return payload.get("uid")
+    return None

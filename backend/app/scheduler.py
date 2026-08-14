@@ -130,11 +130,13 @@ def last_signals():
     return _last_signals
 
 
-def _enrich_signal(s: dict, position_codes: set, allow_short: bool = True) -> dict:
+def _enrich_signal(s: dict, positions: dict, allow_short: bool = True) -> dict:
     """为信号附加结构化字段 direction/action/reason，替代前端中文串匹配。
 
     allow_short=False 时（模型声明 long_only 或 allowShort=False），
     非持仓股的看空信号不产出空单动作（action=none）。
+    持仓股按持仓方向映射动作：空单遇看多/平仓/减仓→cover（平空），
+    多单遇看空/平仓/减仓→sell。
     """
     tag = s.get("signal") or ""
     code = s["code"]
@@ -145,14 +147,24 @@ def _enrich_signal(s: dict, position_codes: set, allow_short: bool = True) -> di
     elif any(k in tag for k in ("看空", "超买", "走弱")):
         direction = "short"
 
+    pos_side = positions[code].get("side", "long") if code in positions else None
+
     if s.get("swapTo"):
         action = "swap"
-    elif code in position_codes:
-        if "平仓" in tag:
+    elif code in positions and pos_side == "short":
+        # 空单：看多/平仓/减仓 → 回补平空（此前误标 hold，UI 永不显示平空）
+        if direction == "long" or "平仓" in tag or "减仓" in tag:
+            action = "cover"
+            if "减仓" in tag:
+                s["reduce"] = True
+        else:
+            action = "hold"
+    elif code in positions:
+        # 多单：看空/平仓/减仓 → 卖出
+        if direction == "short" or "平仓" in tag or "减仓" in tag:
             action = "sell"
-        elif "减仓" in tag:
-            action = "sell"
-            s["reduce"] = True
+            if "减仓" in tag:
+                s["reduce"] = True
         else:
             action = "hold"
     else:
@@ -179,9 +191,8 @@ def _enrich_signal(s: dict, position_codes: set, allow_short: bool = True) -> di
 
 
 def enrich_signals(signals: list[dict], positions: dict, allow_short: bool = True) -> list[dict]:
-    pos_codes = set(positions.keys())
     for s in signals:
-        _enrich_signal(s, pos_codes, allow_short)
+        _enrich_signal(s, positions, allow_short)
     return signals
 
 
@@ -311,10 +322,9 @@ async def _refresh_equity():
         return
     global _last_run
     try:
-        conn = db.get_conn()
-        state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
-        positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
-        conn.close()
+        with db.get_conn() as conn:
+            state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
+            positions = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
         if not state:
             return
         cash = state["cash"]
@@ -327,11 +337,10 @@ async def _refresh_equity():
             sign = -1.0 if p["side"] == "short" else 1.0
             market_value += sign * price * p["qty"]
         total = cash + market_value
-        conn = db.get_conn()
-        conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
-                     (datetime.datetime.now().isoformat(), total))
-        conn.commit()
-        conn.close()
+        with db.get_conn() as conn:
+            conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
+                         (datetime.datetime.now().isoformat(), total))
+            conn.commit()
         _last_run = {"task": "refresh_equity", "ts": datetime.datetime.now().isoformat(),
                      "totalValue": total, "cash": cash, "marketValue": market_value}
         db.log_scheduler_run("refresh_equity", True, _last_run)
@@ -362,43 +371,42 @@ async def scan_now(force: bool = False) -> dict:
 async def _scan_signals_impl():
     global _last_signals
     try:
-        conn = db.get_conn()
-        cfg = get_signal_config()
+        with db.get_conn() as conn:
+            cfg = get_signal_config()
 
-        # 标的池来源：watchlist（默认）/ 板块(board) / 模型TopN(model_topn)
-        source = cfg.get("source", "watchlist")
-        if source == "board":
-            board = cfg.get("sourceBoard", "all")
-            pool = await adapters.fetch_market_list_multi([board], cfg.get("poolSize", 300))
-            codes_from_source = [r["code"] for r in pool]
-        elif source == "model_topn" and cfg.get("modelId"):
-            from . import ml as _ml
-            try:
-                ranked = await _ml.score_latest(
-                    cfg["modelId"],
-                    board=cfg.get("sourceBoard", "all"),
-                    pool_size=cfg.get("poolSize", 300),
-                )
-                top_n = cfg.get("sourceTopN", 20)
-                codes_from_source = [r["code"] for r in ranked[:top_n]]
-            except Exception:
-                logger.warning("盯盘模型TopN打分失败，回退为自选股池", exc_info=True)
+            # 标的池来源：watchlist（默认）/ 板块(board) / 模型TopN(model_topn)
+            source = cfg.get("source", "watchlist")
+            if source == "board":
+                board = cfg.get("sourceBoard", "all")
+                pool = await adapters.fetch_market_list_multi([board], cfg.get("poolSize", 300))
+                codes_from_source = [r["code"] for r in pool]
+            elif source == "model_topn" and cfg.get("modelId"):
+                from . import ml as _ml
+                try:
+                    ranked = await _ml.score_latest(
+                        cfg["modelId"],
+                        board=cfg.get("sourceBoard", "all"),
+                        pool_size=cfg.get("poolSize", 300),
+                    )
+                    top_n = cfg.get("sourceTopN", 20)
+                    codes_from_source = [r["code"] for r in ranked[:top_n]]
+                except Exception:
+                    logger.warning("盯盘模型TopN打分失败，回退为自选股池", exc_info=True)
+                    codes_from_source = [r["code"] for r in conn.execute(
+                        "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
+            else:
                 codes_from_source = [r["code"] for r in conn.execute(
                     "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
-        else:
-            codes_from_source = [r["code"] for r in conn.execute(
-                "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
 
-        all_codes = codes_from_source
-        positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()}
-        # 构建名称查找表（优先 watchlist name，其次 positions name）
-        name_map = {}
-        for r in conn.execute("SELECT code, name FROM watchlist WHERE name IS NOT NULL AND name != ''").fetchall():
-            name_map[r["code"]] = r["name"]
-        for r in conn.execute("SELECT code, name FROM positions WHERE name IS NOT NULL AND name != ''").fetchall():
-            if r["code"] not in name_map:
+            all_codes = codes_from_source
+            positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()}
+            # 构建名称查找表（优先 watchlist name，其次 positions name）
+            name_map = {}
+            for r in conn.execute("SELECT code, name FROM watchlist WHERE name IS NOT NULL AND name != ''").fetchall():
                 name_map[r["code"]] = r["name"]
-        conn.close()
+            for r in conn.execute("SELECT code, name FROM positions WHERE name IS NOT NULL AND name != ''").fetchall():
+                if r["code"] not in name_map:
+                    name_map[r["code"]] = r["name"]
 
         # 过滤不可交易标的（指数/ETF），只对可交易个股生成信号与下单
         codes = [c for c in all_codes if db.is_tradable(c)]
@@ -698,10 +706,9 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
     max_n = int(cfg.get("maxPositions", 5))
     per_pct = float(cfg.get("perPositionPct", 0.2))
 
-    conn = db.get_conn()
-    state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
-    pos_rows = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
+        pos_rows = conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()
     if not state:
         return
     cash = state["cash"]
@@ -715,7 +722,7 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
     buy_candidates = [s for s in signals if s.get("action") == "buy" and s["code"] not in long_codes]
     short_candidates = [s for s in signals if s.get("action") == "short" and s["code"] not in short_codes]
     sell_candidates = [s for s in signals if s.get("action") == "sell" and s["code"] in long_codes]
-    cover_candidates = [s for s in signals if s.get("direction") == "long" and s["code"] in short_codes]
+    cover_candidates = [s for s in signals if s.get("action") == "cover" and s["code"] in short_codes]
 
     if dirs == "long":
         short_candidates = []
@@ -723,7 +730,7 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
     elif dirs == "short":
         buy_candidates = []
         sell_candidates = []
-        cover_candidates = []
+        # cover_candidates 保留：平掉现有空单是 short-only 策略的一部分，清空会导致空单永远无法平仓
 
     executed = {"buy": 0, "short": 0, "sell": 0, "cover": 0}
 
@@ -741,29 +748,27 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             if qty < 100 or price <= 0:
                 continue
             cost = amount * COMM
-            conn = db.get_conn()
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-            if amount + cost > cur_cash:
-                conn.close()
-                continue
-            new_cash = cur_cash - amount - cost
-            existing = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
-            if existing:
-                new_qty = existing["qty"] + qty
-                new_avg = (existing["avg_cost"] * existing["qty"] + amount + cost) / new_qty
-                cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=? WHERE code=?",
-                           (new_qty, new_avg, alloc.get("name", ""), code))
-            else:
-                cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'long')",
-                           (code, alloc.get("name", ""), qty, price + cost / qty))
-            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
-            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "buy", code,
-                        alloc.get("name", ""), qty, price, amount))
-            conn.commit()
-            conn.close()
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+                if amount + cost > cur_cash:
+                    continue
+                new_cash = cur_cash - amount - cost
+                existing = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
+                if existing:
+                    new_qty = existing["qty"] + qty
+                    new_avg = (existing["avg_cost"] * existing["qty"] + amount + cost) / new_qty
+                    cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=? WHERE code=?",
+                               (new_qty, new_avg, alloc.get("name", ""), code))
+                else:
+                    cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'long')",
+                               (code, alloc.get("name", ""), qty, price + cost / qty))
+                cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+                cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "buy", code,
+                            alloc.get("name", ""), qty, price, amount))
+                conn.commit()
             executed["buy"] += 1
             _record_auto_equity()
 
@@ -781,29 +786,27 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             if qty < 100 or price <= 0:
                 continue
             cost = amount * COMM
-            conn = db.get_conn()
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            existing = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
-            if existing and (existing["side"] or "long") == "long":
-                conn.close()
-                continue
-            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
-            new_cash = cur_cash + amount - cost
-            if existing:
-                new_qty = existing["qty"] + qty
-                new_avg = (existing["avg_cost"] * existing["qty"] + amount) / new_qty
-                cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=?, side='short' WHERE code=?",
-                           (new_qty, new_avg, alloc.get("name", ""), code))
-            else:
-                cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'short')",
-                           (code, alloc.get("name", ""), qty, price))
-            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
-            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "short", code,
-                        alloc.get("name", ""), qty, price, amount))
-            conn.commit()
-            conn.close()
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                existing = cur.execute("SELECT * FROM positions WHERE code = ?", (code,)).fetchone()
+                if existing and (existing["side"] or "long") == "long":
+                    continue
+                cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()["cash"]
+                new_cash = cur_cash + amount - cost
+                if existing:
+                    new_qty = existing["qty"] + qty
+                    new_avg = (existing["avg_cost"] * existing["qty"] + amount) / new_qty
+                    cur.execute("UPDATE positions SET qty=?, avg_cost=?, name=?, side='short' WHERE code=?",
+                               (new_qty, new_avg, alloc.get("name", ""), code))
+                else:
+                    cur.execute("INSERT INTO positions (code, name, qty, avg_cost, side) VALUES (?, ?, ?, ?, 'short')",
+                               (code, alloc.get("name", ""), qty, price))
+                cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+                cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "short", code,
+                            alloc.get("name", ""), qty, price, amount))
+                conn.commit()
             executed["short"] += 1
             _record_auto_equity()
 
@@ -823,27 +826,25 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             q = quotes.get(sig["code"])
             price = q["price"] if q and q.get("price") and q["price"] > 0 else pos["avg_cost"]
             amount = price * sell_qty
-            conn = db.get_conn()
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
-            if not cur_pos or (cur_pos["side"] or "long") != "long" or cur_pos["qty"] < sell_qty:
-                conn.close()
-                continue
-            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
-            sell_cost = amount * (COMM + STAMP)
-            new_cash = cur_cash + amount - sell_cost
-            remain = cur_pos["qty"] - sell_qty
-            if remain <= 0:
-                cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
-            else:
-                cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
-            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
-            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
-                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "sell", sig["code"],
-                        pos["name"] or sig["code"], sell_qty, price, amount))
-            conn.commit()
-            conn.close()
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
+                if not cur_pos or (cur_pos["side"] or "long") != "long" or cur_pos["qty"] < sell_qty:
+                    continue
+                cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
+                sell_cost = amount * (COMM + STAMP)
+                new_cash = cur_cash + amount - sell_cost
+                remain = cur_pos["qty"] - sell_qty
+                if remain <= 0:
+                    cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
+                else:
+                    cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
+                cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+                cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
+                           (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "sell", sig["code"],
+                            pos["name"] or sig["code"], sell_qty, price, amount))
+                conn.commit()
             executed["sell"] += 1
             _record_auto_equity()
 
@@ -862,26 +863,24 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
             price = q["price"] if q and q.get("price") and q["price"] > 0 else pos["avg_cost"]
             amount = price * cover_qty
             cost = amount * COMM
-            conn = db.get_conn()
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
-            if not cur_pos or cur_pos["side"] != "short" or cur_pos["qty"] < cover_qty:
-                conn.close()
-                continue
-            cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
-            new_cash = cur_cash - amount - cost
-            remain = cur_pos["qty"] - cover_qty
-            if remain <= 0:
-                cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
-            else:
-                cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
-            cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
-            cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
-                       (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "cover", sig["code"],
-                        pos["name"] or sig["code"], cover_qty, price, amount))
-            conn.commit()
-            conn.close()
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                cur_pos = cur.execute("SELECT * FROM positions WHERE code=?", (sig["code"],)).fetchone()
+                if not cur_pos or cur_pos["side"] != "short" or cur_pos["qty"] < cover_qty:
+                    continue
+                cur_cash = cur.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()["cash"]
+                new_cash = cur_cash - amount - cost
+                remain = cur_pos["qty"] - cover_qty
+                if remain <= 0:
+                    cur.execute("DELETE FROM positions WHERE code=?", (sig["code"],))
+                else:
+                    cur.execute("UPDATE positions SET qty=? WHERE code=?", (remain, sig["code"]))
+                cur.execute("UPDATE portfolio_state SET cash=? WHERE id=1", (new_cash,))
+                cur.execute("INSERT INTO trades (time, side, code, name, qty, price, amount) VALUES (?,?,?,?,?,?,?)",
+                           (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "cover", sig["code"],
+                            pos["name"] or sig["code"], cover_qty, price, amount))
+                conn.commit()
             executed["cover"] += 1
             _record_auto_equity()
 
@@ -891,20 +890,18 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
 def _record_auto_equity():
     """自动调仓后记录净值快照，保持 equity_history 与手工下单一致。"""
     try:
-        conn = db.get_conn()
-        state = conn.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()
-        if not state:
-            conn.close()
-            return
-        cash = state["cash"]
-        positions = conn.execute("SELECT code, qty, avg_cost, side FROM positions").fetchall()
-        # 自动调仓时用最近交易价（avg_cost）估算市值（无需额外网络请求）
-        mkt_val = sum((-p["avg_cost"] if p["side"] == "short" else p["avg_cost"]) * p["qty"]
-                      for p in positions)
-        total = cash + mkt_val
-        conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
-                     (datetime.datetime.now().isoformat(), total))
-        conn.commit()
-        conn.close()
+        with db.get_conn() as conn:
+            state = conn.execute("SELECT cash FROM portfolio_state WHERE id=1").fetchone()
+            if not state:
+                return
+            cash = state["cash"]
+            positions = conn.execute("SELECT code, qty, avg_cost, side FROM positions").fetchall()
+            # 自动调仓时用最近交易价（avg_cost）估算市值（无需额外网络请求）
+            mkt_val = sum((-p["avg_cost"] if p["side"] == "short" else p["avg_cost"]) * p["qty"]
+                          for p in positions)
+            total = cash + mkt_val
+            conn.execute("INSERT INTO equity_history (ts, value) VALUES (?, ?)",
+                         (datetime.datetime.now().isoformat(), total))
+            conn.commit()
     except Exception:
         pass

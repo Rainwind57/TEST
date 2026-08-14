@@ -563,7 +563,10 @@ async def fetch_kline(code: str, days: int = 150, force_refresh: bool = False) -
         if cached and time.time() - cached[0] < KLINE_CACHE_TTL:
             _kline_cache.move_to_end(cache_key)
             full = cached[1]
-            return full[-days:] if len(full) > days else full
+            # 缓存条数 >= days 才切片返回；不足则落网络分支回源补齐，
+            # 避免长窗口请求（fetch_kline_window 上千天）拿到被截断的短序列
+            if len(full) >= days:
+                return full[-days:]
 
         cached_adjust = db.get_cached_kline_adjust(code)
         if cached_adjust and cached_adjust != ADJUST_FLAG:

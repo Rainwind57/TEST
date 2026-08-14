@@ -1,4 +1,5 @@
 """因子截面与单因子回归路由。"""
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
@@ -23,6 +24,46 @@ async def get_factors(codes: str):
     except Exception:
         quotes = {}
 
+    # 行业映射（一次性拉取）
+    try:
+        sector_map = await adapters.fetch_sector_map()
+    except Exception:
+        sector_map = {}
+
+    # 财务/资金流/北向：行情快照不含，逐股并发拉取（旧版未拉 → 这些因子恒为 None）
+    extra = {}
+    sem = asyncio.Semaphore(10)
+
+    async def fetch_extra(code):
+        row = {}
+        async with sem:
+            try:
+                fin = await adapters.fetch_finance_summary(code)
+            except Exception:
+                fin = {}
+            row["roe"] = fin.get("roe")
+            row["net_margin"] = fin.get("netMargin")
+            row["revenue_yoy"] = fin.get("revenueYoY")
+            row["profit_yoy"] = fin.get("profitYoY")
+            row["gross_margin"] = fin.get("grossMargin")
+            row["debt_ratio"] = fin.get("debtRatio")
+            row["eps"] = fin.get("eps")
+            row["bps"] = fin.get("bps")
+            row["roa"] = fin.get("roa")
+            try:
+                mf = await adapters.fetch_money_flow(code)
+            except Exception:
+                mf = {}
+            row["main_net_pct"] = mf.get("mainNetPct")
+            try:
+                nh = await adapters.fetch_north_holding(code)
+            except Exception:
+                nh = {}
+            row["north_holding_pct"] = nh.get("holdRatio")
+        extra[code] = row
+
+    await asyncio.gather(*(fetch_extra(c) for c in code_list))
+
     rows = []
     for code in code_list:
         q = quotes.get(code)
@@ -39,6 +80,7 @@ async def get_factors(codes: str):
         for key, meta in FACTORS.items():
             row[key] = meta["calc"](kline, i)
 
+        ex = extra.get(code, {})
         snap_row = {}
         if q:
             pct_chg = (q["price"] / q["preClose"] - 1) * 100 if q.get("preClose") else None
@@ -46,6 +88,7 @@ async def get_factors(codes: str):
                 "pctChg": pct_chg, "turnover": q.get("turnover"), "amount": q.get("amount"),
                 "pe": q.get("pe"), "pb": q.get("pb"),
                 "mktCap": q.get("mktCap"), "circMktCap": q.get("circMktCap"),
+                **ex, "sector": sector_map.get(code, ""),
             }
         for key in SNAPSHOT_FACTORS:
             row[key] = snapshot_factor_value(snap_row, key) if snap_row else None
@@ -92,6 +135,7 @@ async def run_regression(body: RegressionBody, uid: int = Depends(require_user_i
 
     xs: list[float] = []
     ys: list[float] = []
+    from ..numpy_factors import kline_to_arrays, compute_factor_series, series_at
     for code in body.codes:
         try:
             kline = await adapters.fetch_kline(code, hist)
@@ -100,8 +144,12 @@ async def run_regression(body: RegressionBody, uid: int = Depends(require_user_i
         if len(kline) < 40:
             continue
         closes = [k["close"] for k in kline]
+        # 向量化预计算因子全序列（旧版逐 i 重算 factor["calc"]，O(hist²)）；
+        # 序列不支持时回退标量 calc
+        arr = kline_to_arrays(kline)
+        series = compute_factor_series(body.factor, arr)
         for i in range(20, len(closes) - n):
-            fv = factor["calc"](kline, i)
+            fv = series_at(series, i) if series is not None else factor["calc"](kline, i)
             if fv is None:
                 continue
             base = closes[i]

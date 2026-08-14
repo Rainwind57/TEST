@@ -16,6 +16,11 @@ const takeProfit = ref(0.02)
 const stopLoss = ref(-0.01)
 const sharesPerTrade = ref(100)
 const maxTrades = ref(10)
+// 成本参数（P3：旧版 saveStrategy 漏成本，回放时丢失口径）
+const commissionRate = ref(0.00025)
+const stampDuty = ref(0.001)
+const slippage = ref(0.001)
+const applyCost = ref(true)
 
 const loading = ref(false)
 const result = ref(null)
@@ -28,6 +33,8 @@ async function run() {
       signalLookback: Number(signalLookback.value), entryThreshold: Number(entryThreshold.value),
       takeProfit: Number(takeProfit.value), stopLoss: Number(stopLoss.value),
       sharesPerTrade: Number(sharesPerTrade.value), maxTrades: Number(maxTrades.value),
+      commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
+      slippage: Number(slippage.value), applyCost: applyCost.value,
     })
     toast(`回测完成，${result.value.metrics.nTrades} 笔交易`)
   } catch (e) { toast(e.message) }
@@ -45,6 +52,8 @@ async function saveStrategy() {
         signalLookback: Number(signalLookback.value), entryThreshold: Number(entryThreshold.value),
         takeProfit: Number(takeProfit.value), stopLoss: Number(stopLoss.value),
         sharesPerTrade: Number(sharesPerTrade.value), maxTrades: Number(maxTrades.value),
+        commissionRate: Number(commissionRate.value), stampDuty: Number(stampDuty.value),
+        slippage: Number(slippage.value), applyCost: applyCost.value,
       },
     })
     toast('策略已保存，可在策略中心一键运行')
@@ -93,6 +102,12 @@ const pnlOption = computed(() => {
         <div class="field"><label>止损</label><input v-model="stopLoss" type="number" step="0.005" /></div>
         <div class="field"><label>每笔股数</label><input v-model="sharesPerTrade" type="number" /></div>
         <div class="field"><label>最大交易数</label><input v-model="maxTrades" type="number" /></div>
+      </div>
+      <div class="panel-toolbar" style="margin-top:10px">
+        <div class="field"><label>佣金率</label><input v-model="commissionRate" type="number" step="0.00005" :disabled="!applyCost" /></div>
+        <div class="field"><label>印花税</label><input v-model="stampDuty" type="number" step="0.0005" :disabled="!applyCost" /></div>
+        <div class="field"><label>滑点</label><input v-model="slippage" type="number" step="0.0005" :disabled="!applyCost" /></div>
+        <div class="field"><label class="switch-label" style="font-weight:400"><input type="checkbox" v-model="applyCost" /> 计入成本</label></div>
       </div>
       <button class="btn-primary" style="margin-top:10px" :disabled="loading" @click="run">{{ loading ? '回测中…' : '开始回测' }}</button>
       <button class="btn-ghost" style="margin-top:10px;margin-left:8px" @click="saveStrategy">保存为策略</button>

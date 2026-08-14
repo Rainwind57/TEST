@@ -200,12 +200,19 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         today = _dt.date.today()
         from_date = _dt.date.fromisoformat(start_date) if (isinstance(start_date, str) and start_date) else None
         to_date = _dt.date.fromisoformat(end_date) if (isinstance(end_date, str) and end_date) else None
-        if from_date:
-            # 覆盖 start_date 即覆盖整个 [start_date, end_date]（end_date ≤ today）
+        if from_date and to_date:
+            if to_date < from_date:
+                raise ValueError(f"结束日({end_date})早于起始日({start_date})，请检查时间段设置")
+            # 两端都填：窗口为 [from, to]，hist 只需覆盖区间跨度 + 因子回看；
+            # today→to_date 的 gap 由 fetch_kline_window 内部自行处理，此处再加会重复
+            days_to_cover = (to_date - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        elif from_date:
+            # 仅 start：从今天往前抓，需覆盖 today→from_date 再留因子回看
             days_to_cover = (today - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
         elif to_date and to_date < today:
-            # 仅 end_date：hist 窗口结束于 end_date，需额外覆盖 (today - end_date) + base hist
-            days_to_cover = (today - to_date).days + hist + 60 + n
+            # 仅 end：窗口终止于 to_date，hist 表示 to_date 之前的样本量；
+            # gap 同样由 fetch_kline_window 自行处理，此处只需基础量
+            days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         else:
             days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         if days_to_cover > hist:
@@ -277,10 +284,17 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
             meta_dates.append(arr["date"][i])
 
     if not rows:
+        period_hint = (
+            f"指定时间段 {start_date or '最早'} ~ {end_date or '今天'} 无可用样本"
+            f"（K线可能未覆盖该时间段，或历史长度 {hist} 日不足/数据源无更早数据），"
+            f"请增大历史长度(hist)、缩短时间段或放宽板块范围后再试。"
+        ) if (start_date or end_date) else (
+            f"请增大候选池规模(poolSize)、加长历史(hist)或放宽板块范围后再试。"
+        )
         raise ValueError(
             f"有效样本不足，无法构建数据集：候选池 {stat['total']} 只，K线拉取失败 {stat['kline_fail']} 只，"
             f"历史不足 {60 + n} 日被剔除 {stat['kline_short']} 只，因子缺失切片 {stat['factor_missing']} 个。"
-            f"请增大候选池规模(poolSize)、加长历史(hist)或放宽板块范围后再试。"
+            f"{period_hint}"
         )
 
     # 按 (date, code) 排序后再切分，杜绝时序 CV 训练集混入晚于测试集的日期样本。
@@ -498,14 +512,16 @@ def evaluate_dataset(dataset: dict, model_type: str = "gbdt", n_splits: int = 5,
     for pred, actual, d in zip(valid_pred, valid_y, valid_dates):
         date_ic[d].append((pred, actual))
     per_date_ic = []
+    per_date_rank_ic = []
     for d in sorted(date_ic):
         items = date_ic[d]
         if len(items) >= 3:
             ps = np.array([p for p, _ in items])
             ys = np.array([y for _, y in items])
             per_date_ic.append(_pearson(ps, ys))
+            per_date_rank_ic.append(_spearman(ps, ys))
     overall_ic = float(np.mean(per_date_ic)) if per_date_ic else 0.0
-    overall_rank_ic = 0.0  # rank_ic 同理按日算；保持兼容不重算
+    overall_rank_ic = float(np.mean(per_date_rank_ic)) if per_date_rank_ic else 0.0
     _, _, ls_returns_all = _bucket_returns(valid_pred, valid_y, 5)
     oos_sharpe = _oos_sharpe_by_date(oos_records)
 
@@ -1194,12 +1210,19 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         today = _dt.date.today()
         from_date = _dt.date.fromisoformat(start_date) if (isinstance(start_date, str) and start_date) else None
         to_date = _dt.date.fromisoformat(end_date) if (isinstance(end_date, str) and end_date) else None
-        if from_date:
-            # 覆盖 start_date 即覆盖整个 [start_date, end_date]（end_date ≤ today）
+        if from_date and to_date:
+            if to_date < from_date:
+                raise ValueError(f"回测结束日({end_date})早于起始日({start_date})，请检查时间段设置")
+            # 两端都填：窗口为 [from, to]，hist 只需覆盖区间跨度 + 因子回看；
+            # today→to_date 的 gap 由 fetch_kline_window 内部自行处理，此处再加会重复
+            days_to_cover = (to_date - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
+        elif from_date:
+            # 仅 start：从今天往前抓，需覆盖 today→from_date 再留因子回看
             days_to_cover = (today - from_date).days + 60 + n + _MAX_FACTOR_LOOKBACK
         elif to_date and to_date < today:
-            # 仅 end_date：hist 窗口结束于 end_date，需额外覆盖 (today - end_date) + base hist
-            days_to_cover = (today - to_date).days + hist + 60 + n
+            # 仅 end：窗口终止于 to_date，hist 表示 to_date 之前的样本量；
+            # gap 同样由 fetch_kline_window 自行处理，此处只需基础量
+            days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         else:
             days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         if days_to_cover > hist:
@@ -1270,6 +1293,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     ref_code = max(series, key=lambda c: len(series[c]))
     ref_dates = [row["date"] for row in series[ref_code]]
     snapshot_cutoff_date = None
+    snapshot_auto_start = None
     if snap_keys:
         from datetime import date as _date
         today_str = _date.today().isoformat()
@@ -1282,6 +1306,11 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         # 避免 96%+ 调仓日因前视跳过无意义遍历（大幅减少耗时且不丢有效截面）
         if not start_date and snapshot_cutoff_date:
             start_date = snapshot_cutoff_date
+            snapshot_auto_start = snapshot_cutoff_date
+            logger.info(
+                "模型含快照因子且未指定回测起始日，起点自动设为快照生效日 %s（最近60个交易日，避免前视）",
+                snapshot_cutoff_date,
+            )
 
     code_cache = {}
     for code, kl in series.items():
@@ -1575,8 +1604,9 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             "actualWindow": {"start": actual_start, "end": actual_end},
         }
 
-    # 调仓间隔 n 日 → 年化采样数 = 252/n（旧版误用 252，年化收益高估 n 倍、Sharpe 高估 √n 倍）
-    ppy = 252.0 / max(1, n)
+    # 调仓间隔 = 自适应步长 step（≥ n，长历史时自动放大）→ 年化采样数 = 252/step
+    # 旧版误用 252/n：step>n 时收益高估 step/n 倍、Sharpe 高估 √(step/n) 倍
+    ppy = 252.0 / max(1, step)
 
     group_summary = []
     for idx in range(groups):
@@ -1736,10 +1766,23 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             snap_str += f"等{len(snap_labels)}项"
         result["snapshotWarning"] = (
             f"含快照因子：{snap_str}。"
-            "当前最新值被应用到回测所有历史截面（beginning-of-sample look-ahead bias），"
-            "回测绩效（IC/Sharpe/分组收益）系统性高估，不可直接指导实盘。"
+            "快照因子为当前最新值，仅可用于最近 60 个交易日内的截面；"
+            "更早历史截面的快照值属前视数据，已自动跳过。"
             "快照因子回测仅用于探索因子方向，实盘因子组应全部使用历史时序特征。"
         )
+    if snapshot_auto_start:
+        result["snapshotStartNote"] = (
+            f"模型含快照因子且未指定回测起始日，起点已自动设为快照生效日 {snapshot_auto_start}"
+            f"（最近 60 个交易日），更早历史截面因前视偏差已跳过。"
+            f"如需回测完整历史，请改用不含快照因子的模型或明确指定起始日。"
+        )
+    # 样本内回测标注：落盘模型在含回测区间的历史上训练，回测绩效为 in-sample
+    result["inSampleWarning"] = (
+        "本回测为样本内（in-sample）：模型在包含回测区间的历史上训练，"
+        "回测区间已被模型见过，IC/Sharpe/分组收益系统性高估，不可作为实盘证据。"
+        "如需样本外验证，请在训练面板设定早于回测区间的训练时间段后重新训练模型，"
+        "或参考评估(CV)的 oosIc/oosRankIc。"
+    )
     # 报告存档由路由层负责（带 user_id），此处跳过
     return result
 

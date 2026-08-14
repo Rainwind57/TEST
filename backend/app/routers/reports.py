@@ -32,6 +32,8 @@ class ExportBody(BaseModel):
     direction: str = "long_short"
     survivorshipBiasWarning: str = ""
     snapshotWarning: str = ""
+    snapshotStartNote: str = ""
+    inSampleWarning: str = ""
     histWarning: str = ""
     icIr: float | None = None
     icTStat: float | None = None
@@ -62,6 +64,8 @@ def _payload_from_body(body: ExportBody) -> dict:
         "direction": body.direction,
         "survivorshipBiasWarning": body.survivorshipBiasWarning,
         "snapshotWarning": body.snapshotWarning,
+        "snapshotStartNote": body.snapshotStartNote,
+        "inSampleWarning": body.inSampleWarning,
         "histWarning": body.histWarning,
         "icIr": body.icIr,
         "icTStat": body.icTStat,
@@ -156,12 +160,11 @@ def delete_report(run_id: int, uid: int = Depends(require_user_id)):
 
 
 def _get_run(run_id: int, uid: int) -> dict:
-    conn = db.get_conn()
-    row = conn.execute(
-        "SELECT * FROM backtest_runs WHERE id = ? AND (user_id = ? OR user_id = 0)",
-        (run_id, uid)
-    ).fetchone()
-    conn.close()
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM backtest_runs WHERE id = ? AND (user_id = ? OR user_id = 0)",
+            (run_id, uid)
+        ).fetchone()
     if not row:
         raise HTTPException(404, "报告记录不存在")
     return db._parse_backtest_run(row)

@@ -48,15 +48,19 @@ const assetClass = ref('a-share')
 
 // 起止日联动 hist：hist 是拉取 K 线的数据窗口天数（从今天往前回溯），给因子计算+暖机用。
 // 覆盖条件：窗口须回溯到 startDate 之前（暖机 60 + 长周期因子 240）；
+// 双端场景只按 startDate 回溯即可（今天往前覆盖 startDate 天然包含 endDate）；
 // 仅 endDate 时窗口结束于 endDate，需额外覆盖 (today - endDate) 区间。
 watch([startDate, endDate], ([s, e]) => {
   if (s || e) {
     const today = new Date(); today.setHours(0, 0, 0, 0)
-    const from = s ? new Date(s + 'T00:00:00') : today
-    const to = e ? new Date(e + 'T00:00:00') : today
-    const backToFrom = Math.max(0, Math.floor((today - from) / 86400000))
-    const extraEnd = to < today ? Math.floor((today - to) / 86400000) : 0
-    const need = backToFrom + 60 + 240 + extraEnd
+    const from = s ? new Date(s + 'T00:00:00') : null
+    const to = e ? new Date(e + 'T00:00:00') : null
+    let need = 300
+    if (from) {
+      need = Math.floor((today - from) / 86400000) + 60 + 240
+    } else if (to && to < today) {
+      need = Math.floor((today - to) / 86400000) + 60 + 240
+    }
     hist.value = Math.max(300, Math.ceil(need))
   } else {
     hist.value = 300

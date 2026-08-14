@@ -14,9 +14,8 @@ from app import scheduler, db
 def test_scheduler_runs_table_created():
     """init_db 应建 scheduler_runs 表（P0-3c）。"""
     db.init_db()
-    conn = db.get_conn()
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduler_runs)").fetchall()}
-    conn.close()
+    with db.get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduler_runs)").fetchall()}
     assert {"task", "ts", "success", "payload", "error"} <= cols
 
 

@@ -80,11 +80,28 @@ async function saveStrategy() {
   const name = prompt('策略名称', `${strategySource.value === 'model' ? modelType.value : factor.value}_opt_${nTrials.value}trials`)
   if (!name) return
   try {
-    await api.post('/optimize/save-strategy', {
-      name,
-      baseConfig: baseCfg(),
-      bestParams: result.value.bestParams,
-    })
+    if (strategySource.value === 'model') {
+      // ML 超参寻优产出 finalModel：保存为 ML 回测策略（kind=ml），
+      // 避免误走 /optimize/save-strategy 回退成 momentum 因子策略
+      const mid = result.value.finalModel?.id
+      if (!mid) { toast('寻优未产出最终模型，无法保存为策略'); return }
+      await api.post('/strategies', {
+        name, kind: 'ml',
+        config: {
+          modelId: mid,
+          board: 'all', boards: boards.value,
+          poolSize: Number(poolSize.value), groups: Number(groups.value), n: Number(n.value),
+          hist: Number(hist.value), benchmark: benchmark.value,
+          commissionRate: 0.00025, stampDuty: 0.001, slippage: 0.001, applyCost: true,
+        },
+      })
+    } else {
+      await api.post('/optimize/save-strategy', {
+        name,
+        baseConfig: baseCfg(),
+        bestParams: result.value.bestParams,
+      })
+    }
     toast('已回写为策略')
   } catch (e) { toast(e.message) }
 }

@@ -104,9 +104,8 @@ async def stock_exists(code: str):
 
 @router.get("/watchlist")
 def get_watchlist():
-    conn = db.get_conn()
-    rows = conn.execute("SELECT code, name FROM watchlist ORDER BY added_at").fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT code, name FROM watchlist ORDER BY added_at").fetchall()
     return [{"code": r["code"], "name": r["name"] or ""} for r in rows]
 
 
@@ -115,24 +114,21 @@ def add_watchlist(body: WatchAddBody, uid: int = Depends(require_user_id)):
     code = body.code.strip().lower()
     if not db.is_tradable(code):
         raise HTTPException(400, f"无法添加非交易标的（{code} 为指数/ETF），请选择可交易个股")
-    conn = db.get_conn()
-    existing = conn.execute("SELECT 1 FROM watchlist WHERE code = ?", (code,)).fetchone()
-    if existing:
-        conn.close()
-        raise HTTPException(409, "已在自选列表中")
-    conn.execute("INSERT INTO watchlist (code, name, added_at) VALUES (?, ?, ?)",
-                 (code, (body.name or "").strip(), datetime.datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    with db.get_conn() as conn:
+        existing = conn.execute("SELECT 1 FROM watchlist WHERE code = ?", (code,)).fetchone()
+        if existing:
+            raise HTTPException(409, "已在自选列表中")
+        conn.execute("INSERT INTO watchlist (code, name, added_at) VALUES (?, ?, ?)",
+                     (code, (body.name or "").strip(), datetime.datetime.now().isoformat()))
+        conn.commit()
     return {"ok": True}
 
 
 @router.delete("/watchlist/{code}")
 def delete_watchlist(code: str, uid: int = Depends(require_user_id)):
-    conn = db.get_conn()
-    conn.execute("DELETE FROM watchlist WHERE code = ?", (code,))
-    conn.commit()
-    conn.close()
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM watchlist WHERE code = ?", (code,))
+        conn.commit()
     return {"ok": True}
 
 

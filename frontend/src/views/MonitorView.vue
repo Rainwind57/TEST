@@ -45,6 +45,9 @@ const tradeDirections = ref('both')
 // 信号分组 Tab + 分配预览
 const tab = ref('long')
 const allocPlan = ref(null)
+// 交易方向守门：后端已按 tradeDirections 过滤信号，前端同步禁用反向下单，避免误操作
+const allowLong = computed(() => tradeDirections.value !== 'short')
+const allowShort = computed(() => tradeDirections.value !== 'long')
 
 async function loadStatus() {
   try {
@@ -462,8 +465,8 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
 
       <div v-if="signals.length" class="batch-actions">
         <button class="btn-ghost sm" @click="batchAddWatchlist">📋 全部加入自选</button>
-        <button class="btn-ghost sm" @click="batchBuy('long')">💰 做多信号批量买入</button>
-        <button class="btn-ghost sm" @click="batchBuy('short')">📉 做空信号批量下单</button>
+        <button class="btn-ghost sm" v-if="allowLong" @click="batchBuy('long')">💰 做多信号批量买入</button>
+        <button class="btn-ghost sm" v-if="allowShort" @click="batchBuy('short')">📉 做空信号批量下单</button>
       </div>
 
       <div v-if="!signals.length" class="empty-hint">
@@ -492,8 +495,8 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
             </td>
             <td class="actions-cell">
               <button class="btn-mini" :disabled="addWatchlistBusy[s.code]" @click="addToWatchlist(s.code, s.name)" title="加入自选">⭐</button>
-              <button v-if="tab === 'long'" class="btn-mini" :disabled="buyBusy[s.code]" @click="buySignal(s.code, s.name)" title="按分配策略买入">💰</button>
-              <button v-if="tab === 'short'" class="btn-mini" :disabled="shortBusy[s.code]" @click="shortSignal(s.code, s.name)" title="融券做空">📉</button>
+              <button v-if="tab === 'long' && allowLong" class="btn-mini" :disabled="buyBusy[s.code]" @click="buySignal(s.code, s.name)" title="按分配策略买入">💰</button>
+              <button v-if="tab === 'short' && allowShort" class="btn-mini" :disabled="shortBusy[s.code]" @click="shortSignal(s.code, s.name)" title="融券做空">📉</button>
               <button v-if="s.swapTo" class="btn-mini" @click="swapToSignal(s)" title="卖出换仓">🔄</button>
             </td>
           </tr>
