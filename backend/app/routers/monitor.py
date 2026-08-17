@@ -26,8 +26,8 @@ class SignalConfigBody(BaseModel):
     bullPct: float = 0.75         # 看多分位阈值（模型模式）
     bearPct: float = 0.25         # 看空分位阈值（模型模式）
     allocMode: str = "equal"      # 分配策略：equal=等权 / fixed=固定金额 / risk=风险预算
-    perPositionPct: float = 0.2   # 单标仓位上限（0-1）
-    maxPositions: int = 5         # 最大持仓数
+    perPositionPct: float = 0.1   # 单标仓位上限（0-1，软上限保护）
+    maxPositions: int = 20        # 本次最多买入只数
     tradeDirections: str = "both"  # 交易方向：long=只做多 / short=只做空 / both=两者
 
 
@@ -124,8 +124,8 @@ async def alloc_preview(body: AllocPreviewBody, uid: int = Depends(require_user_
     cfg = scheduler.get_signal_config()
     plan = await scheduler.plan_allocations(body.codes, cash, {
         "mode": cfg.get("allocMode", "equal"),
-        "perPositionPct": cfg.get("perPositionPct", 0.2),
-        "maxPositions": cfg.get("maxPositions", 5),
+        "perPositionPct": cfg.get("perPositionPct", 0.1),
+        "maxPositions": cfg.get("maxPositions", 20),
     })
     return plan
 

@@ -286,6 +286,40 @@ const longShortOption = computed(() => {
   }
 })
 
+const positionOption = computed(() => {
+  if (!result.value) return {}
+  const pl = result.value.positionLedger || []
+  if (!pl.length) return {}
+  const longCount = pl.map(p => p.longCount !== undefined ? p.longCount : (p.long ? p.long.length : 0))
+  const shortCount = pl.map(p => p.shortCount !== undefined ? p.shortCount : (p.short ? p.short.length : 0))
+  const net = pl.map((p, i) => longCount[i] - shortCount[i])
+  const turnover = pl.map((p, i) => {
+    if (p.turnover !== undefined) return p.turnover
+    if (i === 0) return longCount[0] + shortCount[0]
+    const prev = new Set([...(pl[i - 1].long || []), ...(pl[i - 1].short || [])])
+    const curr = new Set([...(p.long || []), ...(p.short || [])])
+    let same = 0; prev.forEach(c => { if (curr.has(c)) same++ })
+    return prev.size + curr.size - 2 * same
+  })
+  return {
+    backgroundColor: 'transparent',
+    grid: { left: 60, right: 50, top: 40, bottom: 60 },
+    tooltip: { trigger: 'axis' },
+    legend: { textStyle: { color: '#5b6675' }, top: 0 },
+    xAxis: { type: 'category', data: pl.map(p => p.date), axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6', rotate: 45 } },
+    yAxis: [
+      { type: 'value', name: '持仓数', nameTextStyle: { color: '#8a94a6' }, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' }, splitLine: { lineStyle: { color: '#e9edf5' } } },
+      { type: 'value', name: '换手数', nameTextStyle: { color: '#8a94a6' }, axisLine: { lineStyle: { color: '#d7dce8' } }, axisLabel: { color: '#8a94a6' }, splitLine: { show: false } }
+    ],
+    series: [
+      { name: '多头持仓', type: 'line', data: longCount, showSymbol: false, lineStyle: { color: '#ff4d4f', width: 2 } },
+      { name: '空头持仓', type: 'line', data: shortCount, showSymbol: false, lineStyle: { color: '#21c08b', width: 2 } },
+      { name: '净持仓(多-空)', type: 'line', data: net, showSymbol: false, lineStyle: { color: '#4f8cff', width: 2, type: 'dashed' } },
+      { name: '换手股数', type: 'bar', yAxisIndex: 1, data: turnover, itemStyle: { color: 'rgba(79,140,255,.25)' } }
+    ]
+  }
+})
+
 const pct = v => v == null ? '-' : (v * 100).toFixed(2) + '%'
 const num = (v, d = 4) => v == null ? '-' : Number(v).toFixed(d)
 
@@ -435,6 +469,7 @@ onMounted(async () => {
       <div class="card chart-card"><div class="card-head"><h3>分层收益（组1=因子值最低，组N=因子值最高）</h3></div><EChart :option="groupBarOption" height="320px" /></div>
       <div class="card chart-card"><div class="card-head"><h3>IC / RankIC 时序列</h3></div><EChart :option="icLineOption" height="320px" /></div>
       <div class="card chart-card"><div class="card-head"><h3>多空组合累计收益曲线</h3></div><EChart :option="longShortOption" height="320px" /></div>
+      <div class="card chart-card" v-if="(result.positionLedger || []).length"><div class="card-head"><h3>仓位变化过程</h3><span class="hint">多头/空头持仓数、净持仓与逐期换手</span></div><EChart :option="positionOption" height="320px" /></div>
     </template>
   </div>
 </template>

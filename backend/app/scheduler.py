@@ -66,8 +66,8 @@ def get_signal_config() -> dict:
         "bearPct": float(db.get_setting("monitor_bear_pct", "0.25")),
         # 一键买入分配策略（P0 透明化持仓分配）
         "allocMode": db.get_setting("monitor_alloc_mode", "equal"),      # equal|fixed|risk
-        "perPositionPct": float(db.get_setting("monitor_alloc_per_pos_pct", "0.2")),
-        "maxPositions": int(db.get_setting("monitor_alloc_max_positions", "5")),
+        "perPositionPct": float(db.get_setting("monitor_alloc_per_pos_pct", "0.1")),
+        "maxPositions": int(db.get_setting("monitor_alloc_max_positions", "20")),
         # 交易方向：long=只做多 / short=只做空 / both=两者（P1 多空分离）
         "tradeDirections": db.get_setting("monitor_trade_directions", "both"),
     }
@@ -79,7 +79,7 @@ def set_signal_config(mode: str, model_id: str = "", ranking: str = "full",
                      source: str = "watchlist", source_board: str = "all",
                      source_topn: int = 20, bull_pct: float = 0.75,
                      bear_pct: float = 0.25, alloc_mode: str = "equal",
-                     per_position_pct: float = 0.2, max_positions: int = 5,
+                     per_position_pct: float = 0.1, max_positions: int = 20,
                      trade_directions: str = "both") -> dict:
     if mode not in ("rule", "model"):
         raise ValueError("mode 必须为 rule 或 model")
@@ -216,36 +216,97 @@ def _rule_or_pct_signal(rules: dict, features: list | None, pct: float, cfg: dic
 async def plan_allocations(buy_codes: list[str], cash: float, policy: dict) -> dict:
     """统一分配引擎：等权/固定金额/风险预算，整手取整，下单前可预览。
 
-    policy: {mode:'equal'|'fixed'|'risk', perPositionPct:0.2, maxPositions:5}
+    P0「剩余资金尽力分配」：
+    - maxPositions 为「本次最多买入只数」软上限（不再把用户选择的候选一刀砍死）；
+    - 单标预算 = 剩余现金 / 剩余标的数（尽力均分），perPositionPct 仅作单标软上限保护；
+    - risk 模式按当日振幅倒数（低波动=低风险=高预算）做风险预算分配；
+    - 任一只因资金不足/不足一手被跳过时，其预算自动回流到剩余现金（不扣减），
+      使等权份额随剩余标的减少而放大，实现「能买几只买几只」；
+    - 整手取整产生的零头留在现金池中自然下滚到下一只（cash_left 只扣实际成交金额）；
+    - 被跳过标的显式标注原因（无行情/资金不足/不足一手），前端预览可见。
+
+    policy: {mode:'equal'|'fixed'|'risk', perPositionPct:0.1, maxPositions:20}
     """
     mode = policy.get("mode", "equal")
-    per_pct = float(policy.get("perPositionPct", 0.2))
-    max_pos = int(policy.get("maxPositions", 5))
-    codes = list(buy_codes)[:max_pos]
-    if not codes:
-        return {"count": 0, "allocations": [], "perPct": per_pct, "usedPct": 0.0}
+    per_pct = float(policy.get("perPositionPct", 0.1))
+    max_pos = int(policy.get("maxPositions", 20))
+    codes = list(buy_codes)
+    if not codes or cash <= 0:
+        return {"count": 0, "allocations": [], "perPct": per_pct,
+                "usedPct": 0.0, "maxPositions": max_pos, "cashLeft": cash}
     try:
         quotes = await adapters.fetch_tencent_quotes(codes)
     except Exception:
         quotes = {}
-    budget = cash * per_pct
-    out = []
-    cash_left = cash
-    remaining = len(codes)
+
+    budget_cap = cash * per_pct  # 单标软上限（保护性，不压死最小一手）
+
+    out: list[dict] = []
+    # 无行情标的先标注原因，不参与后续分配
+    buyable: list[dict] = []
     for code in codes:
         q = quotes.get(code)
         price = q.get("price", 0) if q else 0
         name = q.get("name", "") if q else ""
         if not price or price <= 0:
-            remaining -= 1
             out.append({"code": code, "name": name, "price": 0.0, "plannedQty": 0,
                         "plannedAmount": 0.0, "plannedPct": 0.0, "error": "无行情"})
             continue
+        buyable.append({"code": code, "name": name, "price": price})
+
+    # 本次最多买入只数软上限
+    buyable = buyable[:max_pos]
+
+    # risk 模式：用当日振幅 (high-low)/preClose 作波动率代理，低波动=低风险=高预算
+    if mode == "risk":
+        for item in buyable:
+            q = quotes.get(item["code"])
+            high = q.get("high"); low = q.get("low"); pre_close = q.get("preClose")
+            amp = abs((high or 0) - (low or 0)) / pre_close if pre_close else None
+            item["riskWeight"] = (1.0 / amp) if amp and amp > 0 else None
+
+    cash_left = cash
+    remaining = len(buyable)
+    for idx, item in enumerate(buyable):
+        code = item["code"]
+        price = item["price"]
+        name = item["name"]
+        if remaining <= 0 or cash_left < price * 100:
+            out.append({"code": code, "name": name, "price": price, "plannedQty": 0,
+                        "plannedAmount": 0.0, "plannedPct": 0.0, "error": "资金不足"})
+            remaining -= 1
+            continue
         if mode == "fixed":
-            per = min(budget, cash_left)
-        else:  # equal / risk（风险预算暂按等权近似）：按剩余现金与剩余标的迭代重算
-            per = min(budget, cash_left / remaining) if remaining > 0 else 0.0
+            # 固定金额：每只固定 budget_cap（不足则用剩余现金兜底）
+            per = min(budget_cap, cash_left) if budget_cap > 0 else cash_left
+        elif mode == "risk":
+            # 风险预算：按剩余标的的低波动权重分配剩余现金（被跳过标的权重自动回流）
+            rw_remaining = [it.get("riskWeight") for it in buyable[idx:] if it.get("riskWeight")]
+            if item.get("riskWeight") and rw_remaining:
+                per = cash_left * (item["riskWeight"] / sum(rw_remaining))
+            else:
+                per = cash_left / remaining if remaining > 0 else 0.0
+            if budget_cap > 0 and per > budget_cap:
+                per = budget_cap
+            # 软上限压到不足一手、但等权份额本可买一手时，按等权份额买（软上限不压死最小一手）
+            if per < price * 100 and (cash_left / remaining if remaining > 0 else 0) >= price * 100:
+                per = cash_left / remaining
+        else:
+            # equal：按剩余现金/剩余标的尽力均分
+            per = cash_left / remaining if remaining > 0 else 0.0
+            if budget_cap > 0 and per > budget_cap:
+                per = budget_cap
+            # 软上限压到不足一手、但等权份额本可买一手时，按等权份额买（软上限不压死最小一手）
+            if per < price * 100 and (cash_left / remaining if remaining > 0 else 0) >= price * 100:
+                per = cash_left / remaining
         qty = int(per / price) // 100 * 100
+        if qty < 100:
+            # 不足一手：预算不扣减（自动回流），标注原因
+            reason = "资金不足" if cash_left < price * 100 else "不足一手"
+            out.append({"code": code, "name": name, "price": price, "plannedQty": 0,
+                        "plannedAmount": 0.0, "plannedPct": 0.0, "error": reason})
+            remaining -= 1
+            continue
         amt = qty * price
         out.append({"code": code, "name": name, "price": price, "plannedQty": qty,
                     "plannedAmount": amt, "plannedPct": amt / cash if cash else 0.0})
@@ -257,6 +318,8 @@ async def plan_allocations(buy_codes: list[str], cash: float, policy: dict) -> d
         "allocations": out,
         "perPct": per_pct,
         "usedPct": total_amt / cash if cash else 0.0,
+        "maxPositions": max_pos,
+        "cashLeft": cash_left,
     }
 
 
@@ -399,7 +462,7 @@ async def _scan_signals_impl():
                     "SELECT code, name FROM watchlist ORDER BY added_at").fetchall()]
 
             all_codes = codes_from_source
-            positions = {r["code"]: r for r in conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()}
+            positions = {r["code"]: dict(r) for r in conn.execute("SELECT code, name, qty, avg_cost, side FROM positions").fetchall()}
             # 构建名称查找表（优先 watchlist name，其次 positions name）
             name_map = {}
             for r in conn.execute("SELECT code, name FROM watchlist WHERE name IS NOT NULL AND name != ''").fetchall():
@@ -703,8 +766,8 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
 
     cfg = get_signal_config()
     dirs = cfg.get("tradeDirections", "both")
-    max_n = int(cfg.get("maxPositions", 5))
-    per_pct = float(cfg.get("perPositionPct", 0.2))
+    max_n = int(cfg.get("maxPositions", 20))
+    per_pct = float(cfg.get("perPositionPct", 0.1))
 
     with db.get_conn() as conn:
         state = conn.execute("SELECT cash FROM portfolio_state WHERE id = 1").fetchone()
@@ -712,7 +775,7 @@ async def _execute_auto_trade(signals: list[dict], positions: dict):
     if not state:
         return
     cash = state["cash"]
-    pos_by_code = {r["code"]: r for r in pos_rows}
+    pos_by_code = {r["code"]: dict(r) for r in pos_rows}
     long_codes = {c for c, p in pos_by_code.items() if (p["side"] or "long") == "long"}
     short_codes = {c for c, p in pos_by_code.items() if p["side"] == "short"}
 

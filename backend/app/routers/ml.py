@@ -46,6 +46,10 @@ async def evaluate(body: EvalBody, uid: int = Depends(require_user_id)):
         raise HTTPException(422, str(e))
     if dataset.get("snapshotWarning"):
         result["snapshotWarning"] = dataset["snapshotWarning"]
+    # P0 数据区间回显：训练/评估响应附带实际生效的数据起止日与历史长度
+    result["dataStart"] = dataset.get("data_start")
+    result["dataEnd"] = dataset.get("data_end")
+    result["effectiveHistDays"] = dataset.get("effective_hist_days")
     return result
 
 @router.post("/train")
@@ -71,6 +75,10 @@ async def train(body: EvalBody, uid: int = Depends(require_user_id)):
     result = {"model": meta, "evaluation": eval_result}
     if dataset.get("snapshotWarning"):
         result["snapshotWarning"] = dataset["snapshotWarning"]
+    # P0 数据区间回显：训练响应附带实际生效的数据起止日与历史长度
+    result["dataStart"] = dataset.get("data_start")
+    result["dataEnd"] = dataset.get("data_end")
+    result["effectiveHistDays"] = dataset.get("effective_hist_days")
     return result
 
 

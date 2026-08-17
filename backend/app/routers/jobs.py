@@ -97,6 +97,10 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             result = await loop.run_in_executor(jobs.get_executor(), ml.evaluate_dataset, dataset, cfg.modelType, cfg.nSplits, cfg.gap)
             if dataset.get("snapshotWarning"):
                 result["snapshotWarning"] = dataset["snapshotWarning"]
+            # P0 数据区间回显：实际生效数据起止日与历史长度
+            result["dataStart"] = dataset.get("data_start")
+            result["dataEnd"] = dataset.get("data_end")
+            result["effectiveHistDays"] = dataset.get("effective_hist_days")
             return result
         jobs.submit(jid, _run())
     elif kind == "ml-train":
@@ -112,6 +116,10 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             result = {"model": meta, "evaluation": ev}
             if dataset.get("snapshotWarning"):
                 result["snapshotWarning"] = dataset["snapshotWarning"]
+            # P0 数据区间回显：实际生效数据起止日与历史长度
+            result["dataStart"] = dataset.get("data_start")
+            result["dataEnd"] = dataset.get("data_end")
+            result["effectiveHistDays"] = dataset.get("effective_hist_days")
             return result
         jobs.submit(jid, _run())
     elif kind == "ml-optimize":

@@ -44,6 +44,9 @@ Thumbs.db
 *.sqlite3
 token.txt
 
+# 运行时缓存（退市股清单持久缓存，7天自动刷新）
+backend/delisted_stocks.json
+
 # Docker
 docker-compose.override.yml
 

@@ -171,6 +171,21 @@ def init_db():
 
         conn.commit()
 
+    # 迁移：分配策略旧默认 0.2/5 → 新默认 0.1/20（一次性，防止旧库持久化值覆盖新代码默认）
+    _migrate_alloc_defaults()
+
+
+def _migrate_alloc_defaults() -> None:
+    """批量买入分配默认值迁移（一次性）：旧默认 perPositionPct=0.2 / maxPositions=5
+    会被 set_signal_config 持久化到 settings 表，若不迁移将一直覆盖新代码默认 0.1/20。"""
+    if get_setting("alloc_defaults_migrated_v2") == "1":
+        return
+    if get_setting("monitor_alloc_per_pos_pct", "0.1") == "0.2":
+        set_setting("monitor_alloc_per_pos_pct", "0.1")
+    if get_setting("monitor_alloc_max_positions", "20") == "5":
+        set_setting("monitor_alloc_max_positions", "20")
+    set_setting("alloc_defaults_migrated_v2", "1")
+
 
 def reset_portfolio():
     with get_conn() as conn:

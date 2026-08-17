@@ -39,8 +39,8 @@ const bullPct = ref(0.75)
 const bearPct = ref(0.25)
 // 一键买入分配策略（P0）+ 交易方向（P1）
 const allocMode = ref('equal')
-const perPositionPct = ref(0.2)
-const maxPositions = ref(5)
+const perPositionPct = ref(0.1)
+const maxPositions = ref(20)
 const tradeDirections = ref('both')
 // 信号分组 Tab + 分配预览
 const tab = ref('long')
@@ -68,8 +68,8 @@ async function loadStatus() {
       bullPct.value = s.config.bullPct ?? 0.75
       bearPct.value = s.config.bearPct ?? 0.25
       allocMode.value = s.config.allocMode || 'equal'
-      perPositionPct.value = s.config.perPositionPct ?? 0.2
-      maxPositions.value = s.config.maxPositions || 5
+      perPositionPct.value = s.config.perPositionPct ?? 0.1
+      maxPositions.value = s.config.maxPositions || 20
       tradeDirections.value = s.config.tradeDirections || 'both'
       monitorConfig.value = s.config
     }
@@ -314,7 +314,13 @@ const signalStats = computed(() => {
 const allocSummary = computed(() => {
   if (!allocPlan.value) return null
   const p = allocPlan.value
-  return `将买入/做空 ${p.count} 只 · 每只约 ${(p.perPct * 100).toFixed(0)}% 仓位 · 预计占用现金 ${(p.usedPct * 100).toFixed(1)}%`
+  const skipped = (p.allocations || []).filter(a => !a.plannedQty)
+  const reasonCounts = {}
+  skipped.forEach(a => { const r = a.error || '其他'; reasonCounts[r] = (reasonCounts[r] || 0) + 1 })
+  const reasonText = Object.entries(reasonCounts).map(([r, n]) => `${r}×${n}`).join('、')
+  let s = `将买入/做空 ${p.count} 只 · 单标上限 ${(p.perPct * 100).toFixed(0)}% · 预计占用现金 ${(p.usedPct * 100).toFixed(1)}%`
+  if (skipped.length) s += ` · 跳过 ${skipped.length} 只（${reasonText}）`
+  return s
 })
 
 const lastScanTime = computed(() => {
@@ -350,9 +356,9 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
       </div>
       <div class="panel-toolbar" style="margin-top:10px">
         <div class="field"><label>信号引擎</label>
-          <select v-model="mode">
+          <select v-model="mode" :title="mode === 'model' ? '与选股同一 ML 引擎，口径一致' : '内置技术规则，与选股引擎不同源，结论可能不同'">
             <option value="rule">内置规则（动量+RSI）</option>
-            <option value="model">ML模型打分</option>
+            <option value="model">ML模型打分（与选股同源）</option>
           </select>
         </div>
         <div v-if="mode === 'model'" class="field"><label>模型</label>
@@ -406,7 +412,7 @@ onMounted(() => { refresh(); loadModels(); loadAdjusts() })
           </select>
         </div>
         <div class="field"><label>单标仓位上限</label>
-          <input v-model.number="perPositionPct" type="number" min="0.05" max="1" step="0.05" class="num-inp" title="占总资金比例，0.2=20%" />
+          <input v-model.number="perPositionPct" type="number" min="0.05" max="1" step="0.05" class="num-inp" title="单标软上限，占总资金比例，0.1=10%（不足一手时按等权份额兜底）" />
         </div>
         <div class="field"><label>最大持仓数</label>
           <input v-model.number="maxPositions" type="number" min="1" max="20" step="1" class="num-inp" />

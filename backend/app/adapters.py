@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -512,6 +513,140 @@ async def fetch_market_list_multi(boards: list[str], limit: int = 300,
     if out:
         _market_list_cache[cache_key] = (time.time(), out)
     return out[:limit]
+
+
+# ---------------- 退市股清单（生存偏差修复） ----------------
+
+_DELISTED_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "delisted_stocks.json")
+_DELISTED_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_DELISTED_CACHE_TTL = 7 * 24 * 3600  # 名单几乎不变，7 天
+
+
+async def fetch_delisted_stocks() -> list[dict]:
+    """沪深退市股清单（原 A 股代码 + 上市/退市日期），供回测纳入消除生存偏差。
+
+    主源上交所 commonQuery（JSON，稳定）；深交所 xlsx 尽力尝试（接口不稳则仅沪市）。
+    结果落地 JSON 持久缓存（7 天），交易所接口易抖且名单变化极慢。
+    返回 [{code:'sh600001', name:'邯郸钢铁', list_date:'19980122', delist_date:'20091229'}]
+    """
+    cached = _DELISTED_CACHE.get("all")
+    if cached and time.time() - cached[0] < _DELISTED_CACHE_TTL:
+        return cached[1]
+    try:
+        if (os.path.exists(_DELISTED_CACHE_FILE)
+                and time.time() - os.path.getmtime(_DELISTED_CACHE_FILE) < _DELISTED_CACHE_TTL):
+            with open(_DELISTED_CACHE_FILE, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            if rows:
+                _DELISTED_CACHE["all"] = (time.time(), rows)
+                return rows
+    except Exception:
+        pass
+
+    rows: list[dict] = []
+    try:
+        rows += await _fetch_sse_delisted()
+    except Exception as e:
+        logger.warning("上交所退市名单获取失败: %s", e)
+    try:
+        rows += await _fetch_szse_delisted()
+    except Exception as e:
+        logger.warning("深交所退市名单获取失败（本次仅覆盖沪市）: %s", e)
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        c = r.get("code")
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(r)
+    if out:
+        _DELISTED_CACHE["all"] = (time.time(), out)
+        try:
+            with open(_DELISTED_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+        except Exception:
+            pass
+    return out
+
+
+async def _fetch_sse_delisted() -> list[dict]:
+    """上交所终止上市股票（原 A 股代码 + 上市/退市日期）。"""
+    url = "https://query.sse.com.cn/commonQuery.do?" + urlencode({
+        "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L",
+        "type": "inParams",
+        "STOCK_TYPE": "1",
+        "isPagination": "true",
+        "pageHelp.cacheSize": "1",
+        "pageHelp.beginPage": "1",
+        "pageHelp.pageSize": "10000",
+        "pageHelp.pageNo": "1",
+    })
+    resp = await _http_get(url, 20, headers={
+        "Referer": "http://www.sse.com.cn/", "User-Agent": "Mozilla/5.0"})
+    data = resp.json() or {}
+    out = []
+    for r in data.get("result") or []:
+        code = (r.get("A_STOCK_CODE") or "").strip()
+        delist = (r.get("DELIST_DATE") or "-").strip()
+        if not code or delist in ("", "-"):
+            continue
+        out.append({
+            "code": "sh" + code,
+            "name": (r.get("COMPANY_ABBR") or "").strip(),
+            "list_date": (r.get("LIST_DATE") or "").strip(),
+            "delist_date": delist,
+        })
+    return out
+
+
+async def _fetch_szse_delisted() -> list[dict]:
+    """深交所终止上市股票（xlsx，尽力尝试；失败/为空返回 []）。"""
+    try:
+        import pandas as pd
+        from io import BytesIO
+    except Exception:
+        return []
+    url = "http://www.szse.cn/api/report/ShowReport?" + urlencode({
+        "SHOWTYPE": "xlsx", "CATALOGID": "1807_stock_delist",
+        "TABKEY": "tab1", "random": "0.5",
+    })
+    try:
+        resp = await _http_get(url, 15, headers={
+            "User-Agent": "Mozilla/5.0", "Referer": "http://www.szse.cn/"})
+        if not resp.content:
+            return []
+        df = pd.read_excel(BytesIO(resp.content), dtype=str)
+    except Exception as e:
+        logger.warning("深交所退市名单解析失败: %s", e)
+        return []
+
+    def pick(*keys: str):
+        for c in df.columns:
+            if any(k in str(c) for k in keys):
+                return c
+        return None
+
+    c_code = pick("代码")
+    c_name = pick("简称", "名称")
+    c_list = pick("上市日期")
+    c_delist = pick("终止上市日期", "终止", "退市日期")
+    if not c_code or not c_delist:
+        return []
+    out = []
+    for _, row in df.iterrows():
+        code = str(row.get(c_code) or "").strip().zfill(6)
+        dd = str(row.get(c_delist) or "").strip().replace("-", "")
+        if not code or dd in ("", "nan", "None"):
+            continue
+        out.append({
+            "code": "sz" + code,
+            "name": (str(row.get(c_name) or "").strip() if c_name else ""),
+            "list_date": (str(row.get(c_list) or "").strip().replace("-", "") if c_list else ""),
+            "delist_date": dd,
+        })
+    return out
 
 
 async def _fetch_sina_market(board: str, limit: int, sort_field: str, matcher) -> list[dict]:

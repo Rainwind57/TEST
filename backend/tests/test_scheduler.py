@@ -11,6 +11,26 @@ import pytest
 from app import scheduler, db
 
 
+def test_alloc_defaults_migration():
+    """旧默认 0.2/5 应一次性迁移到 0.1/20（防止旧库持久化值覆盖新代码默认）。"""
+    db.init_db()
+    # 模拟旧库状态：清迁移标记并回写旧默认值
+    db.set_setting("alloc_defaults_migrated_v2", "0")
+    db.set_setting("monitor_alloc_per_pos_pct", "0.2")
+    db.set_setting("monitor_alloc_max_positions", "5")
+    db._migrate_alloc_defaults()
+    assert db.get_setting("monitor_alloc_per_pos_pct") == "0.1"
+    assert db.get_setting("monitor_alloc_max_positions") == "20"
+    assert db.get_setting("alloc_defaults_migrated_v2") == "1"
+    # 二次调用幂等（标记已置 1，不再迁移用户后续显式设置的 0.2）
+    db.set_setting("monitor_alloc_per_pos_pct", "0.2")
+    db._migrate_alloc_defaults()
+    assert db.get_setting("monitor_alloc_per_pos_pct") == "0.2"
+    # 清理：恢复新默认，避免污染其他测试
+    db.set_setting("monitor_alloc_per_pos_pct", "0.1")
+    db.set_setting("monitor_alloc_max_positions", "20")
+
+
 def test_scheduler_runs_table_created():
     """init_db 应建 scheduler_runs 表（P0-3c）。"""
     db.init_db()
@@ -110,6 +130,28 @@ def test_scan_now_skips_non_trading_day(monkeypatch):
     result = asyncio.run(scheduler.scan_now(force=False))
     assert result["ok"] is False
     assert "非交易日" in result["reason"]
+
+
+def test_positions_dict_converts_rows_to_dict():
+    """持仓字典必须把 sqlite3.Row 显式转 dict，否则 .get('side') 会抛 AttributeError。
+
+    回归背景：db 连接统一 row_factory=sqlite3.Row，持仓行若原样存入字典，
+    后续 positions[code].get('side') 会因 Row 无 .get() 而崩溃（有持仓后扫描必失败）。
+    """
+    src_scan = inspect.getsource(scheduler._scan_signals_impl)
+    src_trade = inspect.getsource(scheduler._execute_auto_trade)
+    # 扫描与自动调仓两处持仓字典都必须用 dict(r) 包裹
+    assert 'dict(r) for r in conn.execute("SELECT code, name, qty, avg_cost, side FROM positions")' in src_scan
+    assert "pos_by_code = {r[\"code\"]: dict(r) for r in pos_rows}" in src_trade
+
+
+def test_enrich_signal_uses_dict_positions():
+    """enrich_signals 对字典值持仓能正常读出 side，不依赖 sqlite3.Row。"""
+    positions = {"sh600000": {"code": "sh600000", "side": "long", "qty": 100}}
+    sig = {"code": "sh600000", "signal": "看空"}
+    scheduler.enrich_signals([sig], positions, allow_short=True)
+    assert sig["direction"] == "short"
+    assert sig["action"] == "sell"
 
 
 def test_set_signal_config_rejects_missing_model(tmp_path, monkeypatch):

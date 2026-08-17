@@ -84,6 +84,7 @@ const featureWeights = reactive({})
 const threshold = ref(null)
 const lastAdjustId = ref('')
 const adjustNote = ref('')
+const adjustHasSavedWeights = ref(false)
 const cloneSaving = ref(false)
 const monitorModelId = ref('')
 
@@ -106,6 +107,8 @@ async function openAdjust(m) {
     for (const k of Object.keys(adjGroupOpen)) delete adjGroupOpen[k]
     threshold.value = adjustMeta.value.threshold ?? null
     const existingWeights = adjustMeta.value.featureWeights || {}
+    // 有已保存权重时优先回显；无权重时用中性默认值 1.0（对树模型=特征不缩放），并标注「未调参/默认」
+    adjustHasSavedWeights.value = Object.keys(existingWeights).length > 0
     const importanceMap = {}
     ;(adjustMeta.value.featureImportance || []).forEach(f => { importanceMap[f.feature] = f.importance })
     const featureNames = adjustMeta.value.featureNames || []
@@ -214,7 +217,7 @@ async function runTrain() {
   try {
     const { jobId } = await api.post('/jobs', { kind: 'ml-train', config: evalConfig() })
     const res = await pollJob(jobId, (p, m) => trainMsg.value = m || `进度 ${p || 0}%`)
-    result.value = res.evaluation
+    result.value = { ...res.evaluation, dataStart: res.dataStart, dataEnd: res.dataEnd, effectiveHistDays: res.effectiveHistDays }
     await loadModels()
     // 写入跨页共享 store，主回测页 onMounted 消费并自动选中该模型（打通 ML→主回测闭环）
     research.setCurrentModel(res.model)
@@ -240,10 +243,11 @@ function gotoBacktest(m) {
   router.push('/backtest')
 }
 
-// 用模型对候选池最新截面打分（ML→选股闭环，支持人工调参权重/阈值）
+// 用模型对候选池最新截面打分（ML→选股闭环，支持人工调参权重/阈值 + 方向约束）
 const scoreLongList = ref([])     // 做多候选（最高分）
 const scoreShortList = ref([])    // 做空候选（最低分，allowShort 时）
 const scoreDirection = ref('long_short')
+const scoreDirectionSelect = ref('')  // 空=跟随模型声明方向
 async function runScore(m) {
   scoring.value = m.id
   scoreResult.value = null
@@ -251,6 +255,7 @@ async function runScore(m) {
   scoreShortList.value = []
   try {
     const payload = { modelId: m.id, board: 'all', boards: boards.value, poolSize: Number(poolSize.value), assetClass: assetClass.value }
+    if (scoreDirectionSelect.value) payload.direction = scoreDirectionSelect.value
     if (adjustPanel.value === m.id) {
       const adj = adjustPayload()
       if (Object.keys(adj.featureWeights).length || adj.threshold !== null) payload.adjust = adj
@@ -581,6 +586,10 @@ onUnmounted(() => { pollActive = false })
 
     <div v-if="result" class="card">
       <div class="card-head"><h3>OOS 评估</h3><span class="hint">样本量 {{ result.nSamples }} · 特征 {{ result.nFeatures }}</span></div>
+      <div v-if="result.dataStart || result.dataEnd" class="hint" style="padding:6px 0">
+        📅 实际数据区间：<strong>{{ result.dataStart || '-' }} ~ {{ result.dataEnd || '-' }}</strong>
+        <span v-if="result.effectiveHistDays"> · 生效历史长度 {{ result.effectiveHistDays }} 日</span>
+      </div>
       <div class="kpi-row">
         <div class="kpi"><div class="n">{{ fmt(result.oosIc) }}</div><div class="l">OOS IC</div></div>
         <div class="kpi"><div class="n">{{ fmt(result.oosRankIc) }}</div><div class="l">OOS RankIC</div></div>
@@ -674,6 +683,15 @@ onUnmounted(() => { pollActive = false })
             <option value="sse">上证指数</option>
           </select>
         </div>
+        <div class="field">
+          <label>打分方向</label>
+          <select v-model="scoreDirectionSelect" title="打分选股的方向约束；留空=跟随模型声明方向">
+            <option value="">跟随模型</option>
+            <option value="long_short">多空对冲</option>
+            <option value="long_only">仅做多</option>
+            <option value="short_only">仅做空</option>
+          </select>
+        </div>
         <span class="hint">「ML回测」的验证区间（分时段验证），留空=整个历史；只填起始日=回测至今天，只填结束日=取最近 hist 天截至该日<template v-if="suggestedHist > 0">｜建议历史长度 ≥ {{ suggestedHist }} 日<strong v-if="histInsufficient" style="color:#e6a817">（当前 {{ hist }} 不足，请增大历史长度）</strong></template></span>
       </div>
       <div v-if="!models.length" class="empty-hint">暂无模型，点击上方「训练并落盘」「创建人造模型」或导入模型文件</div>
@@ -703,6 +721,9 @@ onUnmounted(() => { pollActive = false })
         <div class="card-head">
           <h4>人工调参：{{ adjustPanel }}</h4>
           <span class="hint">调整特征权重或预测阈值，保存后打分/回测即时生效</span>
+        </div>
+        <div v-if="!adjustHasSavedWeights" class="adj-note" style="margin:8px 0 0">
+          该模型无已保存的调参权重，当前初始值为中性默认值 1.0（未调参/默认）。对树模型，权重=1 表示特征不缩放。
         </div>
         <div class="adj-threshold">
           <label>预测阈值偏移</label>

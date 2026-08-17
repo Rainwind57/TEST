@@ -348,6 +348,11 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         "feature_names": sem_factor_keys + snapshot_keys,
         "n": n,
         "snapshotWarning": snapshot_warning,
+        # P0 数据区间回显：前端结果页展示实际生效的数据起止日与历史长度
+        "data_start": min(meta_dates) if meta_dates else None,
+        "data_end": max(meta_dates) if meta_dates else None,
+        # 实际生效历史长度 = 样本覆盖的交易日数（而非请求的 hist 拉取天数）
+        "effective_hist_days": len(set(meta_dates)),
     }
 
 
@@ -1164,7 +1169,8 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
                          end_date: str | None = None,
                          config: dict | None = None,
                          boards: list[str] | None = None,
-                         direction: str | None = None) -> dict:
+                         direction: str | None = None,
+                         include_delisted: bool = True) -> dict:
     """用落盘模型预测分作为截面信号做分层回测，响应结构与 /api/select/backtest 一致，
     前端图表零成本复用。每个调仓日对每只股票取当日因子特征→模型预测分→分层。
 
@@ -1250,6 +1256,33 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     if snap_keys:
         await _enrich_pool_extra(pool, snap_keys)
     codes = [row["code"] for row in pool]
+    # 生存偏差修复：纳入「上市/退市区间与回测窗口重叠」的退市股（东财无退市股历史，
+    # 退市股 K 线走新浪/腾讯保留的历史），使回测样本与真实可得标的一致。
+    delisted_codes: set[str] = set()
+    delisted_note = None
+    if include_delisted and asset_class != "future":
+        try:
+            dl = await adapters.fetch_delisted_stocks()
+        except Exception as e:
+            logger.warning("退市股清单获取失败，回退为仅当前上市池: %s", e)
+            dl = []
+        if dl:
+            win_start = start_date or "0000-01-01"
+            win_end = end_date or "9999-12-31"
+            existing = set(codes)
+            for d in dl:
+                code = d.get("code")
+                if not code or code in existing or code in delisted_codes:
+                    continue
+                ld = d.get("list_date") or "00000000"
+                dd = d.get("delist_date") or "99991231"
+                if ld <= win_end and dd >= win_start:
+                    delisted_codes.add(code)
+                    pool.append({"code": code, "name": d.get("name", ""), "delisted": True})
+            if delisted_codes:
+                codes = [row["code"] for row in pool]
+                delisted_note = f"已纳入 {len(delisted_codes)} 只退市股"
+                logger.info("ML回测纳入退市股 %d 只（窗口 %s ~ %s）", len(delisted_codes), win_start, win_end)
     is_st = {} if asset_class == "future" else {
         r["code"]: ("ST" in r.get("name", "") or "*ST" in r.get("name", ""))
         for r in pool
@@ -1261,7 +1294,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     async def fetch_one(code):
         nonlocal fetch_fail
         async with sem:
-            if end_date and asset_class != "future":
+            if code in delisted_codes:
+                # 退市股东财无历史，走新浪/腾讯（保留退市前K线）；上限 1500（新浪单请求上限）
+                kline = await _kline_retry(adapters.fetch_kline, code, min(hist + n + 25, 1500))
+            elif end_date and asset_class != "future":
                 kline = await _kline_window_retry(code, end_date, hist + n + 25)
             else:
                 kline = await _kline_retry(kline_fn, code, hist + n + 25)
@@ -1290,7 +1326,9 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             bench_series = None
 
     # 快照特征：仅对最近 60 个交易日沿用（避免历史截面用今日财报数据→前视）
-    ref_code = max(series, key=lambda c: len(series[c]))
+    # ref_code 取当前上市池中最长 K 线的股票（退市股 K 线止于退市日，不能作快照生效日参照）
+    ref_pool = [c for c in series if c not in delisted_codes] or list(series.keys())
+    ref_code = max(ref_pool, key=lambda c: len(series[c]))
     ref_dates = [row["date"] for row in series[ref_code]]
     snapshot_cutoff_date = None
     snapshot_auto_start = None
@@ -1742,7 +1780,12 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         "yearlyReturns": yearly_returns,
         "stockContribution": stock_contrib,
         "bucketDates": bucket_dates,
-        "survivorshipBiasWarning": "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估",
+        "survivorshipBiasWarning": (
+            f"已纳入 {len(delisted_codes)} 只退市股（沪市为主），消除部分生存偏差；"
+            "深交所退市名单视数据源可用性可能未全覆盖，历史收益仍可能略偏高"
+            if delisted_note else
+            "候选池为当前上市股票快照，已退市股票不在回测池中，历史收益可能系统性高估"
+        ),
     }
     # M6 离散规则信号模式标记 + 规则回显（报告展示）
     if use_signal_rules:
