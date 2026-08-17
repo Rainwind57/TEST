@@ -232,6 +232,16 @@ tbody tr:last-child td { border-bottom: none; }
 .order-panel input { width: 100px; }
 .order-estimate { font-size: 12px; color: var(--text-mute); min-width: 160px; }
 
+.td-actions { white-space: nowrap; }
+.td-actions button {
+  padding: 3px 10px; font-size: 12px; border-radius: 4px; cursor: pointer;
+  background: transparent; margin-right: 4px;
+}
+.td-actions .act-buy { color: var(--up); border: 1px solid var(--up); }
+.td-actions .act-buy:hover { background: var(--up); color: #fff; }
+.td-actions .act-sell { color: var(--down); border: 1px solid var(--down); }
+.td-actions .act-sell:hover { background: var(--down); color: #fff; }
+
 .clickable-row { cursor: pointer; }
 .mb-24 { margin-bottom: 24px; }
 

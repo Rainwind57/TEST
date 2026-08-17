@@ -71,6 +71,14 @@ function pickBoardStock(code) {
   onCodeInput()
 }
 
+// 持仓行内买卖：预填下单面板（代码 / 方向 / 数量），复用现有 order 流程
+function prefillOrder(p, side) {
+  orderCode.value = p.code
+  orderSide.value = side
+  orderQty.value = p.qty
+  onCodeInput()
+}
+
 // P1：下单成功后提示加入自选（便捷而非门槛）
 function addCurrentToWatchlist() {
   const code = normalizeCode(orderCode.value)
@@ -91,7 +99,8 @@ async function placeOrder() {
   if (!orderQty.value || orderQty.value % 100 !== 0) { toast('数量需为100的整数倍'); return }
   try {
     await portfolio.order(code, orderSide.value, Number(orderQty.value))
-    toast(orderSide.value === 'buy' ? '买入成功' : '卖出成功')
+    const sideLabel = { buy: '买入', sell: '卖出', short: '做空', cover: '回补' }
+    toast(`${sideLabel[orderSide.value] || '下单'}成功`)
   } catch (e) {
     toast(e.message)
   }
@@ -205,9 +214,9 @@ onUnmounted(() => clearInterval(timer))
     <div class="card mb-24">
       <div class="card-head"><h2>持仓</h2><span class="count">{{ portfolio.positions.length ? `共 ${portfolio.positions.length} 只` : '' }}</span></div>
       <table>
-        <thead><tr><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>市值</th><th>浮动盈亏</th><th>盈亏率</th></tr></thead>
+        <thead><tr><th>名称</th><th>数量</th><th>成本价</th><th>现价</th><th>市值</th><th>浮动盈亏</th><th>盈亏率</th><th>操作</th></tr></thead>
         <tbody>
-          <tr v-if="!portfolio.positions.length" class="empty-row"><td colspan="7">暂无持仓</td></tr>
+          <tr v-if="!portfolio.positions.length" class="empty-row"><td colspan="8">暂无持仓</td></tr>
           <tr v-for="p in portfolio.positions" :key="p.code">
             <td class="td-name">{{ p.name }}<span class="td-code">{{ stripPrefix(p.code) }}</span></td>
             <td>{{ p.qty }}</td>
@@ -216,6 +225,13 @@ onUnmounted(() => clearInterval(timer))
             <td>{{ p.marketValue.toLocaleString(undefined, { maximumFractionDigits: 2 }) }}</td>
             <td :class="p.pnl > 0 ? 'up' : p.pnl < 0 ? 'down' : 'flat'">{{ p.pnl >= 0 ? '+' : '' }}{{ p.pnl.toFixed(2) }}</td>
             <td :class="p.pnl > 0 ? 'up' : p.pnl < 0 ? 'down' : 'flat'">{{ fmtPct(p.pnlPct) }}</td>
+            <td class="td-actions">
+              <template v-if="p.side !== 'short'">
+                <button class="act-buy" @click="prefillOrder(p, 'buy')" title="预填买入（加仓）">买入</button>
+                <button class="act-sell" @click="prefillOrder(p, 'sell')" title="预填卖出（默认数量=持仓量，即清仓）">卖出</button>
+              </template>
+              <button v-else class="act-sell" @click="prefillOrder(p, 'cover')" title="回补空单（默认数量=持仓量，即平仓）">回补</button>
+            </td>
           </tr>
         </tbody>
       </table>
