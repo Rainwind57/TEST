@@ -1396,6 +1396,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     long_short_points = []
     top_group_returns = []
     position_ledger = []
+    discrete_signals = []  # 逐日离散信号（多/空/平/调仓），供报告「离散买卖信号」
     prev_long: set[str] = set()
     prev_short: set[str] = set()
     bench_by_date = {}
@@ -1571,6 +1572,9 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
                 # 后端直算的持仓数/换手（报告图直接使用，避免前端每次重算）
                 "longCount": len(cur_long),
                 "shortCount": len(cur_short),
+                # 净持仓比例 =（多头数−空头数）/（多头数+空头数），∈[-1,1]，反映多空暴露方向
+                "netRatio": round(
+                    (len(cur_long) - len(cur_short)) / max(len(cur_long) + len(cur_short), 1), 4),
                 "turnover": turnover,
                 # 调仓明细：本期相对上期的买入/卖出（供报告「调仓信号」渲染）
                 "longAdded": long_added,
@@ -1580,6 +1584,21 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             })
             prev_long = cur_long
             prev_short = cur_short
+
+            # 逐日离散信号（多/空/平/调仓）：由调仓明细展开，供报告「离散买卖信号」
+            for c in long_added:
+                discrete_signals.append({"date": date_t, "code": c, "signal": "多", "detail": "开多"})
+            for c in short_added:
+                discrete_signals.append({"date": date_t, "code": c, "signal": "空", "detail": "开空"})
+            for c in long_removed:
+                discrete_signals.append({"date": date_t, "code": c, "signal": "平", "detail": "平多"})
+            for c in short_removed:
+                discrete_signals.append({"date": date_t, "code": c, "signal": "平", "detail": "平空"})
+            if long_added or long_removed or short_added or short_removed:
+                discrete_signals.append({
+                    "date": date_t, "code": None, "signal": "调仓",
+                    "detail": f"多头{len(cur_long)}只 / 空头{len(cur_short)}只",
+                })
 
         # B5 个股累计贡献：多头 +收益，空头 -收益（按方向裁剪后的持仓）
         code_ret = dict(zip(cross_codes, cross_rets))
@@ -1776,6 +1795,7 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         "universeSize": len(pool), "effectiveStocks": len(series), "rebalanceCount": len(ic_series),
         "actualHistDays": hist, "effectiveStart": effective_start, "effectiveEnd": effective_end,
         "positionLedger": position_ledger,
+        "signals": discrete_signals,
         "featureImportance": feature_importance,
         "yearlyReturns": yearly_returns,
         "stockContribution": stock_contrib,

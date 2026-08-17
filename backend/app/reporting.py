@@ -72,6 +72,7 @@ def payload_from_result(result: dict) -> dict:
         "groupSummary": result.get("groupSummary") or [],
         "longShort": result.get("longShort") or [],
         "positionLedger": result.get("positionLedger") or [],
+        "signals": result.get("signals") or [],
         "icSeries": result.get("icSeries") or [],
         "survivorshipBiasWarning": result.get("survivorshipBiasWarning", ""),
         "snapshotWarning": result.get("snapshotWarning", ""),
@@ -541,6 +542,7 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     ic_json = _json.dumps(payload.get("icSeries") or [], ensure_ascii=False)
     fi_json = _json.dumps(payload.get("featureImportance") or [], ensure_ascii=False)
     bd_json = _json.dumps(payload.get("bucketDates") or [], ensure_ascii=False)
+    sig_json = _json.dumps(payload.get("signals") or [], ensure_ascii=False)
     dir_json = _json.dumps(direction)
     label = (payload.get("factorLabel") or title).replace("<", "&lt;").replace(">", "&gt;")
 
@@ -589,7 +591,8 @@ th{{background:#16213c;color:#cfe0ff}}
 <div class="card"><h3>分组净值曲线</h3><p class="sub" style="margin:4px 0 8px">各组累计净值（%），组间分层越清晰→因子区分度越强。</p><div id="chartGroupEq" class="chart"></div></div>
 <div class="card"><h3>IC / RankIC 时序列</h3><p class="sub" style="margin:4px 0 8px">IC（皮尔逊）/ RankIC（斯皮尔曼）时序。>0 天数多→因子预测方向稳，|IC|大→区分度强。</p><div id="chartIC" class="chart"></div></div>
 <div class="card" id="fiCard" style="display:none"><h3>特征贡献</h3><p class="sub" style="margin:4px 0 8px">模型特征重要性 Top-N（条形图），横向越长→该因子对预测分贡献越大。</p><div id="chartFI" class="chart"></div></div>
-<div class="card" id="chartPosCard" style="display:none"><h3>持仓与换手变化</h3><p class="sub" style="margin:4px 0 8px">每期多头/空头持仓数量及换手股数。换手高→模型对不同股票区分度强、信号变化活跃。</p><div id="chartPos" class="chart"></div></div>
+<div class="card" id="chartPosCard" style="display:none"><h3>仓位变化过程</h3><p class="sub" style="margin:4px 0 8px">逐期多头/空头持仓数量与净持仓比例（净多=多空之差占比）。净持仓&gt;0 偏多、&lt;0 偏空，反映策略多空暴露变化与调仓节奏。</p><div id="chartPos" class="chart"></div></div>
+<div class="card" id="signalsCard" style="display:none"><h3>离散买卖信号</h3><p class="sub" style="margin:4px 0 8px">引擎逐期输出的离散信号（多=开多 / 空=开空 / 平=平仓 / 调仓=组合整体换仓），最近 30 条，最新在上。</p><div id="signalsTable"></div></div>
 <div class="card" id="rebalanceCard" style="display:none"><h3>调仓信号明细</h3><p class="sub" style="margin:4px 0 8px">每期相对上期的买入/卖出股票（最近 10 期）。多头买入=新增做多，多头卖出=平多；空头同理。</p><div id="rebalanceTable"></div></div>
 <script>
 const LS={ls_json}, GS={gs_json}, IC={ic_json}, BD={bd_json}, DIR={dir_json};
@@ -663,14 +666,16 @@ if (PL.length > 0) {{
     let same = 0; prev.forEach(c => {{ if (curr.has(c)) same++; }});
     return (prev.size + curr.size - 2*same);
   }});
+  const posNetRatio = PL.map((p, i) => p.netRatio !== undefined ? p.netRatio : (posLongCount[i] - posShortCount[i]) / Math.max(posLongCount[i] + posShortCount[i], 1));
   echarts.init(document.getElementById('chartPos')).setOption({{
     tooltip:{{trigger:'axis'}}, legend:{{textStyle:{{color:'#8e9bbd'}},top:0}},
-    grid:{{left:60,right:30,top:40,bottom:60}},
+    grid:{{left:60,right:50,top:40,bottom:60}},
     xAxis:{{type:'category',data:posDates,axisLabel:{{color:'#8e9bbd',rotate:45}}}},
-    yAxis:[{{type:'value',name:'持仓数',axisLabel:{{color:'#8e9bbd'}}}},{{type:'value',name:'换手数',axisLabel:{{color:'#8e9bbd'}}}}],
+    yAxis:[{{type:'value',name:'持仓数',axisLabel:{{color:'#8e9bbd'}}}},{{type:'value',name:'换手数',axisLabel:{{color:'#8e9bbd'}}}},{{type:'value',name:'净持仓比例',min:-1,max:1,axisLabel:{{color:'#8e9bbd',formatter:v=>Math.round(v*100)+'%'}}}}],
     series:[
       {{name:'多头持仓',type:'line',data:posLongCount,showSymbol:false,itemStyle:{{color:'#ff4d4f'}}}},
       {{name:'空头持仓',type:'line',data:posShortCount,showSymbol:false,itemStyle:{{color:'#21c08b'}}}},
+      {{name:'净持仓比例',type:'line',yAxisIndex:2,data:posNetRatio,showSymbol:false,itemStyle:{{color:'#f39c12'}}}},
       {{name:'换手股数',type:'bar',yAxisIndex:1,data:posTurnover,itemStyle:{{color:'rgba(79,140,255,.35)'}}}}
     ]
   }});
@@ -696,6 +701,18 @@ if (PL.length > 0) {{
     document.getElementById('rebalanceTable').innerHTML =
       '<table><tr><th>调仓日</th><th>多头买入</th><th>多头卖出</th><th>空头买入</th><th>空头卖出</th></tr>' + rowsHtml + '</table>';
   }}
+}}
+const SIG = {sig_json};
+if (SIG.length > 0) {{
+  document.getElementById('signalsCard').style.display = 'block';
+  const esc2 = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  const sigColor = sig => sig === '多' ? '#ff4d4f' : sig === '空' ? '#21c08b' : sig === '平' ? '#f39c12' : '#4f8cff';
+  const sigRows = SIG.slice(-30).reverse().map(s => {{
+    const codeCell = s.code ? '<span style="font-family:monospace">' + esc2(s.code) + '</span>' : '<span style="color:#8e9bbd">组合</span>';
+    return '<tr><td>' + esc2(s.date) + '</td><td>' + codeCell + '</td><td style="color:' + sigColor(s.signal) + '">' + esc2(s.signal) + '</td><td>' + esc2(s.detail) + '</td></tr>';
+  }}).join('');
+  document.getElementById('signalsTable').innerHTML =
+    '<table><tr><th>日期</th><th>代码</th><th>信号</th><th>说明</th></tr>' + sigRows + '</table>';
 }}
 </script>
 </body></html>"""
