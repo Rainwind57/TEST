@@ -77,6 +77,7 @@ def payload_from_result(result: dict) -> dict:
         "survivorshipBiasWarning": result.get("survivorshipBiasWarning", ""),
         "snapshotWarning": result.get("snapshotWarning", ""),
         "snapshotStartNote": result.get("snapshotStartNote", ""),
+        "snapshotMissingNote": result.get("snapshotMissingNote", ""),
         "inSampleWarning": result.get("inSampleWarning", ""),
         "histWarning": result.get("histWarning", ""),
         "actualHistDays": result.get("actualHistDays"),
@@ -142,6 +143,9 @@ def render_html(payload: dict, title: str = "回测报告") -> str:
     sn = payload.get("snapshotStartNote", "")
     if sn:
         warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 回测起点调整：{_htmlescape(sn)}</div>')
+    smn = payload.get("snapshotMissingNote", "")
+    if smn:
+        warnings.append(f'<div class="warn-banner" style="border-color:#e6a817;background:#1a1410">⚠️ 快照因子数据缺失：{_htmlescape(smn)}</div>')
     isw = payload.get("inSampleWarning", "")
     if isw:
         warnings.append(f'<div class="warn-banner" style="border-color:#4f8cff;background:#101a2a">ℹ️ 样本内回测：{_htmlescape(isw)}</div>')

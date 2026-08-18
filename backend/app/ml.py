@@ -289,9 +289,14 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
             hist = days_to_cover
     codes = [row["code"] for row in pool]
     sem_factor_keys = [k for k in FACTORS]
-    # 因子选择：selected_factors 非空时只保留用户勾选的因子
+    # 因子选择：selected_factors 非空时只保留用户勾选的因子；
+    # 未知键（不在技术/快照因子清单内）显式回显，避免静默丢弃
+    ignored_factors: list[str] = []
     if selected_factors:
+        valid_keys = set(FACTORS) | set(SNAPSHOT_FACTORS)
         sel = set(selected_factors)
+        ignored_factors = list(dict.fromkeys(
+            k for k in selected_factors if k not in valid_keys))
         sem_factor_keys = [k for k in sem_factor_keys if k in sel]
         snapshot_keys = [k for k in snapshot_keys if k in sel]
     if snapshot_keys:
@@ -426,6 +431,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         "codes": meta_codes,
         "dates": meta_dates,
         "feature_names": sem_factor_keys + snapshot_keys,
+        "ignoredFactors": ignored_factors,
         "n": n,
         "snapshotWarning": snapshot_warning,
         # P0 数据区间回显：前端结果页展示实际生效的数据起止日与历史长度
@@ -1270,6 +1276,10 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     feature_names = bundle["feature_names"]
     model = bundle["model"]
     params = bundle["preprocess"]
+    # P0：人造模型回测按「非零权重因子 ∪ 规则引用因子」裁剪特征清单，
+    # 避免旧模型写死的全因子全集（含全部快照因子）误触发前视压缩。
+    if bundle.get("model_type") == "manual":
+        feature_names, model = _crop_manual_model_bundle(model, feature_names)
     snap_set = set(SNAPSHOT_FACTORS) - {"sector"}
     tech_keys = [k for k in feature_names if k not in snap_set]
 
@@ -1452,13 +1462,17 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     # 快照特征（仅回测区间末端 60 日内有效，早期无法取当日值）
     row_by_code = {r["code"]: r for r in pool}
     snapshot_vals = {}
+    snapshot_missing = 0
     if snap_keys:
         for code in series:
             r = row_by_code.get(code)
             if not r:
                 continue
             sv = [snapshot_factor_value(r, k) for k in snap_keys]
-            # 缺失快照值用 0.0 填充：财务 API 偶发失败不应导致整只股票被丢弃
+            # 区分「前视不可用」（更早截面已被跳过）与「数据缺失」（接口未返回）：
+            # 数据缺失计数回显，而非静默一律填 0。
+            if any(v is None for v in sv):
+                snapshot_missing += 1
             sv_filled = [v if v is not None else 0.0 for v in sv]
             snapshot_vals[code] = sv_filled
 
@@ -1933,14 +1947,21 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
             f"（最近 60 个交易日），更早历史截面因前视偏差已跳过。"
             f"如需回测完整历史，请改用不含快照因子的模型或明确指定起始日。"
         )
-    # 样本内回测标注：落盘模型在含回测区间的历史上训练，回测绩效为 in-sample
-    result["inSampleWarning"] = (
-        "本回测为样本内（in-sample）：模型在包含回测区间的历史上训练，"
-        "回测区间已被模型见过，IC/Sharpe/分组收益系统性高估，不可作为实盘证据。"
-        "如需样本外验证，请在训练面板设定早于回测区间的训练时间段后重新训练模型，"
-        "或参考评估(CV)的 oosIc/oosRankIc。"
-    )
+    if snap_keys and snapshot_missing:
+        result["snapshotMissingNote"] = (
+            f"{snapshot_missing} 只股票的快照因子值缺失（财务/资金流接口未返回），"
+            f"已按 0 填充，这些股票对应快照因子在回测中不生效。"
+        )
+    # 样本内回测标注：仅对训练模型有效；人造模型无训练过程，不标 in-sample（避免误报）
+    if bundle.get("model_type") != "manual":
+        result["inSampleWarning"] = (
+            "本回测为样本内（in-sample）：模型在包含回测区间的历史上训练，"
+            "回测区间已被模型见过，IC/Sharpe/分组收益系统性高估，不可作为实盘证据。"
+            "如需样本外验证，请在训练面板设定早于回测区间的训练时间段后重新训练模型，"
+            "或参考评估(CV)的 oosIc/oosRankIc。"
+        )
     # 报告存档由路由层负责（带 user_id），此处跳过
+    result["ok"] = True
     return result
 
 
@@ -2376,6 +2397,40 @@ def _build_attribution(last: dict | None, feature_names: list[str], top_n: int =
 MANUAL_FEATURES = sorted(list(FACTORS.keys()) + [k for k in SNAPSHOT_FACTORS if SNAPSHOT_FACTORS[k].get("format") != "categorical"])
 
 
+def _rule_factor_names(rule_text: str, candidates: list[str]) -> set[str]:
+    """提取规则字符串中引用的候选因子名（英文 key 或中文 label）。
+
+    规则可引用 scorePct、因子英文 key（如 roe）、别名 vol（→volatility），
+    或中文 label。这里只负责识别「引用了哪些因子」，供人造模型裁剪因子清单用。
+    """
+    used: set[str] = set()
+    if not rule_text or not rule_text.strip():
+        return used
+    if "volatility" in candidates and re.search(r"\bvol\b", rule_text):
+        used.add("volatility")
+    for fn in candidates:
+        if re.search(r"\b" + re.escape(fn) + r"\b", rule_text):
+            used.add(fn)
+            continue
+        label = ((FACTORS.get(fn) or SNAPSHOT_FACTORS.get(fn)) or {}).get("label", "")
+        if label and label in rule_text:
+            used.add(fn)
+    return used
+
+
+def _manual_used_features(weights: dict, feature_names: list[str],
+                          rule: str = "", bull_rule: str = "", bear_rule: str = "") -> list[str]:
+    """人造模型真实因子清单 = 非零权重因子 ∪ 规则引用因子（而非写死全集）。
+
+    P0/P1：避免「含快照全集」误触发回测前视压缩——人造模型回测应只按
+    用户实际使用的因子判断是否需要快照前视。
+    """
+    used = {k for k, v in weights.items() if k in feature_names and v != 0}
+    for rt in (rule or "", bull_rule or "", bear_rule or ""):
+        used |= _rule_factor_names(rt, feature_names)
+    return [k for k in feature_names if k in used]
+
+
 def manual_feature_options() -> list[dict]:
     """可选手工构建模型的因子（技术因子 + 快照因子，与 build_dataset 同构，可直接推理）。"""
     options = []
@@ -2419,23 +2474,54 @@ class _ManualModel:
         return np.abs(np.array(self.weights))
 
 
+def _crop_manual_model_bundle(model, stored_feature_names: list[str]):
+    """P0：人造模型回测前按「非零权重因子 ∪ 规则引用因子」裁剪特征清单。
+
+    旧版人造模型落盘时把 feature_names 写死成全因子全集（含全部快照因子），
+    回测会误判「含快照因子」而把起点压缩到最近 60 个交易日。此处按模型真实
+    使用的因子重新裁剪（含权重与规则），与新建模型的清单口径一致。
+    """
+    weights = getattr(model, "weights", None)
+    if weights is None:
+        return list(stored_feature_names), model
+    wmap = {k: float(w) for k, w in zip(stored_feature_names, weights)}
+    used = _manual_used_features(
+        wmap, stored_feature_names,
+        getattr(model, "rule", "") or "",
+        getattr(model, "bull_rule", "") or "",
+        getattr(model, "bear_rule", "") or "",
+    )
+    if list(used) == list(stored_feature_names):
+        return list(stored_feature_names), model
+    cropped = _ManualModel(
+        used, {k: wmap[k] for k in used},
+        float(getattr(model, "threshold", 0.0) or 0.0),
+        getattr(model, "rule", "") or "",
+        getattr(model, "bull_rule", "") or "",
+        getattr(model, "bear_rule", "") or "",
+    )
+    return list(used), cropped
+
+
 def create_manual_model(name: str, weights: dict, threshold: float | None = None,
                         rule: str = "", bull_rule: str = "", bear_rule: str = "",
                         direction: str = "long_short", allow_short: bool = True) -> dict:
     """创建并落盘一个人造/手动模型（不依赖任何自动训练）。
 
-    feature_names 为全部候选因子（技术 + 快照），落盘结构与自动训练产物完全同构，
-    之后即可用于打分、回测、盯盘调度。未指定权重的因子默认权重为 0。返回模型元数据。
+    feature_names 只记录用户实际使用的因子（非零权重 ∪ 规则引用），落盘结构与自动训练产物
+    完全同构，之后即可用于打分、回测、盯盘调度。未指定权重的因子默认权重为 0。返回模型元数据。
     bull_rule/bear_rule 为离散买卖信号规则（scorePct + 因子名表达式），回测时替代分位分组。
     direction ∈ {long_short, long_only, short_only}，allowShort 控制是否产出空头候选。
     """
     direction = (direction or "long_short").lower()
     if direction not in ("long_short", "long_only", "short_only"):
         raise ValueError(f"未知交易方向: {direction}")
-    feature_names = MANUAL_FEATURES
-    valid = {k: v for k, v in (weights or {}).items() if k in feature_names}
+    valid = {k: v for k, v in (weights or {}).items() if k in MANUAL_FEATURES and v != 0}
     if not valid:
         raise ValueError("请至少为一个有效因子设置权重")
+    # P1：因子清单只记录用户实际使用的因子（非零权重 ∪ 规则引用），而非全因子全集；
+    # 避免「含快照全集」误触发回测前视压缩（长区间被压缩到最近 60 个交易日）。
+    feature_names = _manual_used_features(valid, MANUAL_FEATURES, rule, bull_rule, bear_rule)
     if bull_rule:
         _, err = compile_signal_rule(bull_rule, feature_names)
         if err:

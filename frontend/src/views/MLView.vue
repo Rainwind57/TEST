@@ -210,6 +210,7 @@ async function runEvaluate() {
   try {
     const { jobId } = await api.post('/jobs', { kind: 'ml-evaluate', config: evalConfig() })
     result.value = await pollJob(jobId)
+    if (result.value?.ignoredFactorNote) toast(result.value.ignoredFactorNote)
     toast(`评估完成，OOS IC=${(result.value.oosIc || 0).toFixed(3)}`)
   } catch (e) { toast(e.message) }
   finally { loading.value = false }
@@ -221,10 +222,11 @@ async function runTrain() {
   try {
     const { jobId } = await api.post('/jobs', { kind: 'ml-train', config: evalConfig() })
     const res = await pollJob(jobId, (p, m) => trainMsg.value = m || `进度 ${p || 0}%`)
-    result.value = { ...res.evaluation, dataStart: res.dataStart, dataEnd: res.dataEnd, effectiveHistDays: res.effectiveHistDays }
+    result.value = { ...res.evaluation, dataStart: res.dataStart, dataEnd: res.dataEnd, effectiveHistDays: res.effectiveHistDays, ignoredFactors: res.ignoredFactors, ignoredFactorNote: res.ignoredFactorNote }
     await loadModels()
     // 写入跨页共享 store，主回测页 onMounted 消费并自动选中该模型（打通 ML→主回测闭环）
     research.setCurrentModel(res.model)
+    if (res.ignoredFactorNote) toast(res.ignoredFactorNote)
     toast(`训练完成，模型 ${res.model.id} 已落盘`)
   } catch (e) { toast(e.message) }
   finally { training.value = false; trainMsg.value = '' }
@@ -294,6 +296,7 @@ async function runMLBacktest(m) {
       return
     }
     if (btResult.value?.snapshotStartNote) toast(btResult.value.snapshotStartNote)
+    if (btResult.value?.snapshotMissingNote) toast(btResult.value.snapshotMissingNote)
     if (btResult.value?.inSampleWarning) toast(btResult.value.inSampleWarning)
     toast(`ML 回测完成，调仓 ${btResult.value.rebalanceCount} 次`)
   } catch (e) { toast(e.message) }
@@ -395,6 +398,7 @@ async function exportMLBacktest(fmt) {
       survivorshipBiasWarning: btResult.value.survivorshipBiasWarning || '',
       snapshotWarning: btResult.value.snapshotWarning || '',
       snapshotStartNote: btResult.value.snapshotStartNote || '',
+      snapshotMissingNote: btResult.value.snapshotMissingNote || '',
       inSampleWarning: btResult.value.inSampleWarning || '',
       histWarning: btResult.value.histWarning || '',
       icIr: btResult.value.icIr ?? null,
@@ -626,6 +630,7 @@ onUnmounted(() => { pollActive = false })
         📅 实际数据区间：<strong>{{ result.dataStart || '-' }} ~ {{ result.dataEnd || '-' }}</strong>
         <span v-if="result.effectiveHistDays"> · 生效历史长度 {{ result.effectiveHistDays }} 日</span>
       </div>
+      <div v-if="result.ignoredFactorNote" class="hint" style="padding:6px 0;color:#e6a817">⚠️ {{ result.ignoredFactorNote }}</div>
       <div class="kpi-row">
         <div class="kpi"><div class="n">{{ fmt(result.oosIc) }}</div><div class="l">OOS IC</div></div>
         <div class="kpi"><div class="n">{{ fmt(result.oosRankIc) }}</div><div class="l">OOS RankIC</div></div>

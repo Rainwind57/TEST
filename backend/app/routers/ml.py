@@ -50,6 +50,12 @@ async def evaluate(body: EvalBody, uid: int = Depends(require_user_id)):
     result["dataStart"] = dataset.get("data_start")
     result["dataEnd"] = dataset.get("data_end")
     result["effectiveHistDays"] = dataset.get("effective_hist_days")
+    if dataset.get("ignoredFactors"):
+        result["ignoredFactors"] = dataset["ignoredFactors"]
+        result["ignoredFactorNote"] = (
+            f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
+            f"{', '.join(dataset['ignoredFactors'])}"
+        )
     return result
 
 @router.post("/train")
@@ -79,6 +85,12 @@ async def train(body: EvalBody, uid: int = Depends(require_user_id)):
     result["dataStart"] = dataset.get("data_start")
     result["dataEnd"] = dataset.get("data_end")
     result["effectiveHistDays"] = dataset.get("effective_hist_days")
+    if dataset.get("ignoredFactors"):
+        result["ignoredFactors"] = dataset["ignoredFactors"]
+        result["ignoredFactorNote"] = (
+            f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
+            f"{', '.join(dataset['ignoredFactors'])}"
+        )
     return result
 
 
@@ -130,6 +142,12 @@ async def optimize(body: OptimizeMlBody, uid: int = Depends(require_user_id)):
         raise HTTPException(422, str(e))
     if dataset.get("snapshotWarning"):
         result["snapshotWarning"] = dataset["snapshotWarning"]
+    if dataset.get("ignoredFactors"):
+        result["ignoredFactors"] = dataset["ignoredFactors"]
+        result["ignoredFactorNote"] = (
+            f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
+            f"{', '.join(dataset['ignoredFactors'])}"
+        )
     return result
 
 

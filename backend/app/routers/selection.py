@@ -390,7 +390,11 @@ class BacktestBody(BaseModel):
 
 
 @router.post("/backtest")
-async def run_backtest(body: BacktestBody, uid: int = Depends(require_user_id)):
+async def backtest_route(body: BacktestBody, uid: int = Depends(require_user_id)):
+    return await run_backtest(body, uid=uid)
+
+
+async def run_backtest(body: BacktestBody, uid: int = 0):
     # 模型策略：指定 modelId 时走 ML 信号分层回测，响应结构与技术因子回测一致，
     # 前端图表零成本复用（打通”主回测页导入模型”，旧版 modelId 无门可入）。
     # hist 钳制：下限 60 防过小，上限 5000（约 20 年）防异常值；
@@ -888,7 +892,11 @@ class FactorRegressionBody(BaseModel):
 
 
 @router.post("/factor-regression")
-async def run_factor_regression(body: FactorRegressionBody, uid: int = Depends(require_user_id)):
+async def factor_regression_route(body: FactorRegressionBody, uid: int = Depends(require_user_id)):
+    return await run_factor_regression(body, uid=uid)
+
+
+async def run_factor_regression(body: FactorRegressionBody, uid: int = 0):
     """多因子横截面回归（Fama-MacBeth 风格）：每个再平衡日用截面因子暴露对未来收益做多元回归，
     得到各因子的时序收益率，据此评估因子长期是否显著有效（均值/t 统计量/胜率）。"""
     keys = list(dict.fromkeys(k for k in body.factors if k in FACTORS))

@@ -33,6 +33,7 @@ class ExportBody(BaseModel):
     survivorshipBiasWarning: str = ""
     snapshotWarning: str = ""
     snapshotStartNote: str = ""
+    snapshotMissingNote: str = ""
     inSampleWarning: str = ""
     histWarning: str = ""
     icIr: float | None = None
@@ -65,6 +66,7 @@ def _payload_from_body(body: ExportBody) -> dict:
         "survivorshipBiasWarning": body.survivorshipBiasWarning,
         "snapshotWarning": body.snapshotWarning,
         "snapshotStartNote": body.snapshotStartNote,
+        "snapshotMissingNote": body.snapshotMissingNote,
         "inSampleWarning": body.inSampleWarning,
         "histWarning": body.histWarning,
         "icIr": body.icIr,

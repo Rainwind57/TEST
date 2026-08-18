@@ -101,6 +101,12 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             result["dataStart"] = dataset.get("data_start")
             result["dataEnd"] = dataset.get("data_end")
             result["effectiveHistDays"] = dataset.get("effective_hist_days")
+            if dataset.get("ignoredFactors"):
+                result["ignoredFactors"] = dataset["ignoredFactors"]
+                result["ignoredFactorNote"] = (
+                    f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
+                    f"{', '.join(dataset['ignoredFactors'])}"
+                )
             return result
         jobs.submit(jid, _run())
     elif kind == "ml-train":
@@ -120,6 +126,12 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
             result["dataStart"] = dataset.get("data_start")
             result["dataEnd"] = dataset.get("data_end")
             result["effectiveHistDays"] = dataset.get("effective_hist_days")
+            if dataset.get("ignoredFactors"):
+                result["ignoredFactors"] = dataset["ignoredFactors"]
+                result["ignoredFactorNote"] = (
+                    f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
+                    f"{', '.join(dataset['ignoredFactors'])}"
+                )
             return result
         jobs.submit(jid, _run())
     elif kind == "ml-optimize":
@@ -134,6 +146,12 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
                 jobs.get_executor(), ml.optimize_model, dataset, cfg.modelType, cfg.nSplits, cfg.gap, cfg.nTrials)
             if dataset.get("snapshotWarning"):
                 result["snapshotWarning"] = dataset["snapshotWarning"]
+            if dataset.get("ignoredFactors"):
+                result["ignoredFactors"] = dataset["ignoredFactors"]
+                result["ignoredFactorNote"] = (
+                    f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
+                    f"{', '.join(dataset['ignoredFactors'])}"
+                )
             return result
         jobs.submit(jid, _run())
     else:  # ml-backtest
