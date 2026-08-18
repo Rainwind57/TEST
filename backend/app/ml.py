@@ -36,9 +36,20 @@ os.makedirs(ML_DIR, exist_ok=True)
 
 TRADING_DAYS = 252
 
+
+def _ensure_artifact_exists(path: str) -> None:
+    """落盘后校验模型产物真实存在，防止被清理逻辑删除后静默成功（P1 模型包丢失）。"""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(
+            f"模型产物落盘失败：{os.path.basename(path)} 缺失或为空。"
+            f"请检查 ml_models/ 目录是否被清理任务/重启脚本删除。"
+        )
+
 # 内置技术因子的最长回看窗口：dist_52w_high/low 完整窗口 240 日（momentum120 次之，120 日）。
 # ML 训练/评估默认 hist 必须覆盖它，否则「开箱即用」必报有效样本不足。
 _MAX_FACTOR_LOOKBACK = 240
+# 时间段自动抬升 hist 的天花板：超过则明确报错而非硬跑（P2 计算量上限）
+_MAX_HIST_CEILING = 4000
 # ML 训练/评估/寻优的默认历史长度：1024 覆盖全部内置长周期因子（新浪封顶 1023 可及）
 ML_DEFAULT_HIST = 1024
 
@@ -107,6 +118,59 @@ async def _kline_window_retry(code: str, end_date: str, days: int,
     if last_error:
         logger.warning("K线窗口拉取失败 code=%s end=%s days=%s error=%s", code, end_date, days, last_error)
     return []
+
+
+def _classify_kline_error(e) -> str:
+    """把拉取异常归类为 timeout / rate_limit / other（P0 抓取失败可见化）。"""
+    s = str(e).lower()
+    if any(k in s for k in ("timeout", "timed out", "timedout", "connect", "connection",
+                            "10060", "10061", "refused", "eof", "reset")):
+        return "timeout"
+    if any(k in s for k in ("429", "rate", "limit", "too many", "502", "503", "限流", "throttl")):
+        return "rate_limit"
+    return "other"
+
+
+async def _kline_retry_classified(kline_fn, code: str, days: int, attempts: int = 3,
+                                  delay: float = 0.5) -> tuple[list[dict], str | None]:
+    """K线拉取带指数退避重试，返回 (kline, fail_reason)。空结果也重试。"""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            kl = await kline_fn(code, days)
+            if kl:
+                return kl, None
+            if attempt == attempts - 1:
+                return [], "no_data"
+        except Exception as e:
+            last_error = e
+            if "Expecting value" in str(e) or "JSON" in str(type(e).__name__):
+                return [], "rate_limit"
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay * (2 ** attempt))
+    reason = _classify_kline_error(last_error) if last_error else "no_data"
+    if reason != "no_data":
+        logger.warning("K线拉取失败 code=%s days=%s reason=%s error=%s", code, days, reason, last_error)
+    return [], reason
+
+
+async def _kline_window_retry_classified(code: str, end_date: str, days: int,
+                                         attempts: int = 3, delay: float = 0.5) -> tuple[list[dict], str | None]:
+    """K线窗口拉取（终止于 end_date）带指数退避重试，返回 (kline, fail_reason)。"""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            kl = await adapters.fetch_kline_window(code, end_date, days)
+            if kl:
+                return kl, None
+        except Exception as e:
+            last_error = e
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay * (2 ** attempt))
+    reason = _classify_kline_error(last_error) if last_error else "no_data"
+    if reason != "no_data":
+        logger.warning("K线窗口拉取失败 code=%s end=%s days=%s reason=%s error=%s", code, end_date, days, reason, last_error)
+    return [], reason
 
 # 需要额外拉取的快照因子（行情快照 row 不自带，须调财务/资金流接口）
 _FINANCE_KEYS = {"roe", "net_margin", "revenue_yoy", "profit_yoy",
@@ -216,6 +280,11 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         else:
             days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         if days_to_cover > hist:
+            if days_to_cover > _MAX_HIST_CEILING:
+                raise ValueError(
+                    f"时间段跨度过大：需覆盖 {days_to_cover} 天（超过上限 {_MAX_HIST_CEILING} 天）。"
+                    f"请缩短时间段、放宽调仓周期或降低候选池规模后重试。"
+                )
             logger.info("hist=%d 不足以覆盖时间段 %s~%s，自动抬升至 %d", hist, start_date or "最早", end_date or "今天", days_to_cover)
             hist = days_to_cover
     codes = [row["code"] for row in pool]
@@ -234,18 +303,28 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     labels = []
     meta_codes = []
     meta_dates = []
-    stat = {"total": total, "kline_ok": 0, "kline_fail": 0, "kline_short": 0, "factor_missing": 0}
+    stat = {"total": total, "kline_ok": 0, "kline_fail": 0, "kline_short": 0, "factor_missing": 0,
+            "kline_fail_timeout": 0, "kline_fail_rate_limit": 0, "kline_fail_no_data": 0}
     for idx, code in enumerate(codes):
         if progress_cb:
             progress_cb(idx + 1, total)
         try:
             if end_date and asset_class != "future":
-                kline = await _kline_window_retry(code, end_date, hist)
+                kline, fail_reason = await _kline_window_retry_classified(code, end_date, hist)
             else:
-                kline = await kline_fn(code, hist)
+                kline, fail_reason = await _kline_retry_classified(kline_fn, code, hist)
         except Exception as e:
+            fail_reason = _classify_kline_error(e)
+            kline = []
+        if not kline:
             stat["kline_fail"] += 1
-            logger.warning("ML数据集拉取K线失败 code=%s: %s", code, e)
+            if fail_reason == "timeout":
+                stat["kline_fail_timeout"] += 1
+            elif fail_reason == "rate_limit":
+                stat["kline_fail_rate_limit"] += 1
+            elif fail_reason == "no_data":
+                stat["kline_fail_no_data"] += 1
+            logger.warning("ML数据集拉取K线失败 code=%s reason=%s", code, fail_reason)
             continue
         if len(kline) < 60 + n:
             stat["kline_short"] += 1
@@ -292,7 +371,8 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
             f"请增大候选池规模(poolSize)、加长历史(hist)或放宽板块范围后再试。"
         )
         raise ValueError(
-            f"有效样本不足，无法构建数据集：候选池 {stat['total']} 只，K线拉取失败 {stat['kline_fail']} 只，"
+            f"有效样本不足，无法构建数据集：候选池 {stat['total']} 只，K线拉取失败 {stat['kline_fail']} 只"
+            f"（其中超时 {stat['kline_fail_timeout']} 只、限流 {stat['kline_fail_rate_limit']} 只、无数据 {stat['kline_fail_no_data']} 只），"
             f"历史不足 {60 + n} 日被剔除 {stat['kline_short']} 只，因子缺失切片 {stat['factor_missing']} 个。"
             f"{period_hint}"
         )
@@ -582,6 +662,7 @@ def train_final_model(dataset: dict, model_type: str = "gbdt", params: dict | No
         "model_type": model_type,
         "preprocess": pparams,
     }, path)
+    _ensure_artifact_exists(path)
 
     meta = {
         "id": mid, "path": path, "modelType": model_type,
@@ -601,6 +682,8 @@ def train_final_model(dataset: dict, model_type: str = "gbdt", params: dict | No
             json.dump(meta, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+    # 写 JSON 后再次校验 .joblib 仍在（防写入期间被清理），缺失则明确报错而非静默成功
+    _ensure_artifact_exists(path)
     return meta
 
 
@@ -1232,6 +1315,11 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
         else:
             days_to_cover = 60 + n + _MAX_FACTOR_LOOKBACK
         if days_to_cover > hist:
+            if days_to_cover > _MAX_HIST_CEILING:
+                raise ValueError(
+                    f"回测时间段跨度过大：需覆盖 {days_to_cover} 天（超过上限 {_MAX_HIST_CEILING} 天）。"
+                    f"请缩短时间段、放宽调仓周期或降低候选池规模后重试。"
+                )
             logger.info("hist=%d 不足以覆盖回测时间段 %s~%s，自动抬升至 %d", hist, start_date or "最早", end_date or "今天", days_to_cover)
             hist = days_to_cover
     hist_clamped = hist != user_hist
@@ -1416,232 +1504,238 @@ async def backtest_model(mid: str, board: str = "all", pool_size: int = 150, gro
     if progress_cb:
         progress_cb(0, (total_dates // step) + 1)
     rebalance_idx = 0
-    for t in range(60, len(ref_dates) - n, step):
-        date_t = ref_dates[t]
-        # 验证区间过滤（分时段验证：调仓日只落在 [start_date, end_date] 内）
-        if start_date and date_t < start_date:
-            continue
-        if end_date and date_t > end_date:
-            continue
-        cross_feats, cross_codes, cross_rets, ic_rets = [], [], [], []
-        for code in series:
-            i = date_maps[code].get(date_t)
-            if i is None or i < 20 or i + n >= len(code_cache[code]["kline"]):
+
+    def _run_loop():
+        nonlocal prev_long, prev_short, cum, cum_top, cum_bottom, last_cross, rebalance_idx
+        for t in range(60, len(ref_dates) - n, step):
+            date_t = ref_dates[t]
+            # 验证区间过滤（分时段验证：调仓日只落在 [start_date, end_date] 内）
+            if start_date and date_t < start_date:
                 continue
-            cc = code_cache[code]
-            fvals = []
-            ok = True
-            for k in tech_keys:
-                v = series_at(cc["smap"][k], i)
-                if v is None:
-                    ok = False
-                    break
-                fvals.append(v)
-            if not ok or cc["closes"][i] == 0:
+            if end_date and date_t > end_date:
                 continue
-            # 快照特征：仅在允许日期区间内生效
-            if snap_keys:
-                if snapshot_cutoff_date and date_t < snapshot_cutoff_date:
-                    continue  # 快照因子为当前值，回溯到历史截面即前视，跳过
-                sv = snapshot_vals.get(code)
-                if not sv:
-                    # 缺失时用 0.0 填充（与 enrich 侧对齐，财务 API 偶发故障不丢票）
-                    sv = [0.0] * len(snap_keys)
-                fvals.extend(sv)
-            # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（期货无涨跌停，跳过）
-            closes = cc["closes"]
-            if asset_class == "future":
-                limit = None
-            else:
-                limit = _price_limit_ratio(code, is_st.get(code, False))
-            # 涨跌停约束：t 日涨停封板买不进，剔除该样本；t+n 跌停/停牌不再剔除（保留真实收益分布）
-            if limit is not None:
-                if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
+            cross_feats, cross_codes, cross_rets, ic_rets = [], [], [], []
+            for code in series:
+                i = date_maps[code].get(date_t)
+                if i is None or i < 20 or i + n >= len(code_cache[code]["kline"]):
                     continue
-            # T+1 入场：IC 用信号日收盘→未来收盘（衡量预测力）；P&L 用次日开盘→未来收盘（可实盘）
-            ic_ret = float(closes[i + n] / closes[i] - 1)
-            opens = cc.get("opens", closes)
-            t1_entry = float(opens[i + 1]) if i + 1 < len(opens) else float(closes[i])
-            t1_ret = float(closes[i + n] / t1_entry - 1) if t1_entry > 0 else ic_ret
-            cross_codes.append(code)
-            cross_feats.append(fvals)
-            cross_rets.append(t1_ret)
-            ic_rets.append(ic_ret)
-        if len(cross_codes) < groups * 2:
-            continue
+                cc = code_cache[code]
+                fvals = []
+                ok = True
+                for k in tech_keys:
+                    v = series_at(cc["smap"][k], i)
+                    if v is None:
+                        ok = False
+                        break
+                    fvals.append(v)
+                if not ok or cc["closes"][i] == 0:
+                    continue
+                # 快照特征：仅在允许日期区间内生效
+                if snap_keys:
+                    if snapshot_cutoff_date and date_t < snapshot_cutoff_date:
+                        continue  # 快照因子为当前值，回溯到历史截面即前视，跳过
+                    sv = snapshot_vals.get(code)
+                    if not sv:
+                        # 缺失时用 0.0 填充（与 enrich 侧对齐，财务 API 偶发故障不丢票）
+                        sv = [0.0] * len(snap_keys)
+                    fvals.extend(sv)
+                # 涨跌停约束：t 日涨停封板买不进；t+n 日跌停卖不出（期货无涨跌停，跳过）
+                closes = cc["closes"]
+                if asset_class == "future":
+                    limit = None
+                else:
+                    limit = _price_limit_ratio(code, is_st.get(code, False))
+                # 涨跌停约束：t 日涨停封板买不进，剔除该样本；t+n 跌停/停牌不再剔除（保留真实收益分布）
+                if limit is not None:
+                    if i >= 1 and closes[i - 1] != 0 and closes[i] / closes[i - 1] - 1.0 >= limit - 1e-4:
+                        continue
+                # T+1 入场：IC 用信号日收盘→未来收盘（衡量预测力）；P&L 用次日开盘→未来收盘（可实盘）
+                ic_ret = float(closes[i + n] / closes[i] - 1)
+                opens = cc.get("opens", closes)
+                t1_entry = float(opens[i + 1]) if i + 1 < len(opens) else float(closes[i])
+                t1_ret = float(closes[i + n] / t1_entry - 1) if t1_entry > 0 else ic_ret
+                cross_codes.append(code)
+                cross_feats.append(fvals)
+                cross_rets.append(t1_ret)
+                ic_rets.append(ic_ret)
+            if len(cross_codes) < groups * 2:
+                continue
 
-        Xp = _apply_preprocess(np.array(cross_feats, dtype=np.float64), params)
-        if adjust:
-            Xp = _apply_feature_weights(Xp, feature_names, adjust.get("featureWeights") or {})
-        preds = model.predict(Xp).tolist()
+            Xp = _apply_preprocess(np.array(cross_feats, dtype=np.float64), params)
+            if adjust:
+                Xp = _apply_feature_weights(Xp, feature_names, adjust.get("featureWeights") or {})
+            preds = model.predict(Xp).tolist()
 
-        # 人造模型规则过滤：仅保留满足规则的截面样本（与 score_latest 对齐）
-        model_rule = getattr(model, 'rule', '')
-        if model_rule:
-            keep_idx = _apply_rule_filter(
-                [{}] * len(cross_codes),
-                np.array(cross_feats, dtype=np.float64),
-                feature_names, model_rule)
-            if len(keep_idx) < len(cross_codes):
-                cross_codes = [cross_codes[i] for i in keep_idx]
-                cross_feats = [cross_feats[i] for i in keep_idx]
-                cross_rets = [cross_rets[i] for i in keep_idx]
-                ic_rets = [ic_rets[i] for i in keep_idx]
-                preds = [preds[i] for i in keep_idx]
-        if len(cross_codes) < groups * 2:
-            continue
+            # 人造模型规则过滤：仅保留满足规则的截面样本（与 score_latest 对齐）
+            model_rule = getattr(model, 'rule', '')
+            if model_rule:
+                keep_idx = _apply_rule_filter(
+                    [{}] * len(cross_codes),
+                    np.array(cross_feats, dtype=np.float64),
+                    feature_names, model_rule)
+                if len(keep_idx) < len(cross_codes):
+                    cross_codes = [cross_codes[i] for i in keep_idx]
+                    cross_feats = [cross_feats[i] for i in keep_idx]
+                    cross_rets = [cross_rets[i] for i in keep_idx]
+                    ic_rets = [ic_rets[i] for i in keep_idx]
+                    preds = [preds[i] for i in keep_idx]
+            if len(cross_codes) < groups * 2:
+                continue
 
-        ic = _pearson(preds, ic_rets)
-        rank_ic = _spearman(preds, ic_rets)
-        ic_series.append({"date": date_t, "ic": ic, "rankIc": rank_ic, "sample": len(cross_codes)})
+            ic = _pearson(preds, ic_rets)
+            rank_ic = _spearman(preds, ic_rets)
+            ic_series.append({"date": date_t, "ic": ic, "rankIc": rank_ic, "sample": len(cross_codes)})
 
-        # M8 归因：保存最后一个调仓日截面（特征原始值 + 预测分），循环结束后构建特征分位归因
-        last_cross = {"date": date_t, "codes": list(cross_codes),
-                      "feats": [list(f) for f in cross_feats], "preds": list(preds)}
+            # M8 归因：保存最后一个调仓日截面（特征原始值 + 预测分），循环结束后构建特征分位归因
+            last_cross = {"date": date_t, "codes": list(cross_codes),
+                          "feats": [list(f) for f in cross_feats], "preds": list(preds)}
 
-        if use_signal_rules:
-            # 规则模式：bullRule→多头，bearRule→空头，其余中性。scorePct 为当日截面分位。
-            n_cross = len(cross_codes)
-            order_idx = sorted(range(n_cross), key=lambda k: preds[k])
-            pct_of = [0.0] * n_cross
-            for rank, k in enumerate(order_idx):
-                pct_of[k] = (rank + 1) / (n_cross + 1)
-            cur_long: set[str] = set()
-            cur_short: set[str] = set()
-            long_rets: list[float] = []
-            short_rets: list[float] = []
-            for k in range(n_cross):
-                f = cross_feats[k]
-                p = pct_of[k]
-                if bull_fn and bull_fn(f, p):
-                    cur_long.add(cross_codes[k])
-                    long_rets.append(cross_rets[k])
-                    bucket_returns[-1].append(cross_rets[k])
-                elif bear_fn and bear_fn(f, p):  # 互斥：已判多头不再判空
-                    cur_short.add(cross_codes[k])
-                    short_rets.append(cross_rets[k])
-                    bucket_returns[0].append(cross_rets[k])
-            top_ret = mean(long_rets) if long_rets else 0.0
-            bottom_ret = mean(short_rets) if short_rets else 0.0
-        else:
-            sorted_preds = sorted(preds)
-            day_buckets = [[] for _ in range(groups)]
-            day_bucket_codes = [[] for _ in range(groups)]
-            for code, fv, fret in zip(cross_codes, preds, cross_rets):
-                b = bucket_index(fv, sorted_preds, groups)
-                day_buckets[b].append(fret)
-                day_bucket_codes[b].append(code)
-                bucket_returns[b].append(fret)
-            top_ret = mean(day_buckets[-1]) if day_buckets[-1] else 0.0
-            bottom_ret = mean(day_buckets[0]) if day_buckets[0] else 0.0
-            cur_long = set(day_bucket_codes[-1]) if day_buckets[-1] else set()
-            cur_short = set(day_bucket_codes[0]) if day_buckets[0] else set()
+            if use_signal_rules:
+                # 规则模式：bullRule→多头，bearRule→空头，其余中性。scorePct 为当日截面分位。
+                n_cross = len(cross_codes)
+                order_idx = sorted(range(n_cross), key=lambda k: preds[k])
+                pct_of = [0.0] * n_cross
+                for rank, k in enumerate(order_idx):
+                    pct_of[k] = (rank + 1) / (n_cross + 1)
+                cur_long: set[str] = set()
+                cur_short: set[str] = set()
+                long_rets: list[float] = []
+                short_rets: list[float] = []
+                for k in range(n_cross):
+                    f = cross_feats[k]
+                    p = pct_of[k]
+                    if bull_fn and bull_fn(f, p):
+                        cur_long.add(cross_codes[k])
+                        long_rets.append(cross_rets[k])
+                        bucket_returns[-1].append(cross_rets[k])
+                    elif bear_fn and bear_fn(f, p):  # 互斥：已判多头不再判空
+                        cur_short.add(cross_codes[k])
+                        short_rets.append(cross_rets[k])
+                        bucket_returns[0].append(cross_rets[k])
+                top_ret = mean(long_rets) if long_rets else 0.0
+                bottom_ret = mean(short_rets) if short_rets else 0.0
+            else:
+                sorted_preds = sorted(preds)
+                day_buckets = [[] for _ in range(groups)]
+                day_bucket_codes = [[] for _ in range(groups)]
+                for code, fv, fret in zip(cross_codes, preds, cross_rets):
+                    b = bucket_index(fv, sorted_preds, groups)
+                    day_buckets[b].append(fret)
+                    day_bucket_codes[b].append(code)
+                    bucket_returns[b].append(fret)
+                top_ret = mean(day_buckets[-1]) if day_buckets[-1] else 0.0
+                bottom_ret = mean(day_buckets[0]) if day_buckets[0] else 0.0
+                cur_long = set(day_bucket_codes[-1]) if day_buckets[-1] else set()
+                cur_short = set(day_bucket_codes[0]) if day_buckets[0] else set()
 
-        # B3 分组净值：逐期记录每组平均收益 → 净值曲线
-        day_bucket_ret = [0.0] * groups
-        if use_signal_rules:
-            day_bucket_ret[0] = bottom_ret
-            day_bucket_ret[-1] = top_ret
-        else:
-            for b in range(groups):
-                day_bucket_ret[b] = mean(day_buckets[b]) if day_buckets[b] else 0.0
-        for g in range(groups):
-            bucket_ret_series[g].append(day_bucket_ret[g])
-            bucket_equity[g].append(bucket_equity[g][-1] * (1.0 + day_bucket_ret[g]))
-        bucket_dates.append(date_t)
+            # B3 分组净值：逐期记录每组平均收益 → 净值曲线
+            day_bucket_ret = [0.0] * groups
+            if use_signal_rules:
+                day_bucket_ret[0] = bottom_ret
+                day_bucket_ret[-1] = top_ret
+            else:
+                for b in range(groups):
+                    day_bucket_ret[b] = mean(day_buckets[b]) if day_buckets[b] else 0.0
+            for g in range(groups):
+                bucket_ret_series[g].append(day_bucket_ret[g])
+                bucket_equity[g].append(bucket_equity[g][-1] * (1.0 + day_bucket_ret[g]))
+            bucket_dates.append(date_t)
 
-        # A1 方向裁剪：long_only 仅保留多头、short_only 仅保留空头
-        if direction == "long_only":
-            cur_short = set()
-        elif direction == "short_only":
-            cur_long = set()
+            # A1 方向裁剪：long_only 仅保留多头、short_only 仅保留空头
+            if direction == "long_only":
+                cur_short = set()
+            elif direction == "short_only":
+                cur_long = set()
 
-        # 边缘保底：至少一侧有持仓仍记录（避免仓位图断裂）
-        if cur_long or cur_short:
-            long_added = sorted(cur_long - prev_long)
-            long_removed = sorted(prev_long - cur_long)
-            short_added = sorted(cur_short - prev_short)
-            short_removed = sorted(prev_short - cur_short)
-            turnover = len(long_added) + len(long_removed) + len(short_added) + len(short_removed)
-            position_ledger.append({
-                "date": date_t,
-                "long": sorted(cur_long),
-                "short": sorted(cur_short),
-                "longReturn": top_ret,
-                "shortReturn": bottom_ret,
-                # 后端直算的持仓数/换手（报告图直接使用，避免前端每次重算）
-                "longCount": len(cur_long),
-                "shortCount": len(cur_short),
-                # 净持仓比例 =（多头数−空头数）/（多头数+空头数），∈[-1,1]，反映多空暴露方向
-                "netRatio": round(
-                    (len(cur_long) - len(cur_short)) / max(len(cur_long) + len(cur_short), 1), 4),
-                "turnover": turnover,
-                # 调仓明细：本期相对上期的买入/卖出（供报告「调仓信号」渲染）
-                "longAdded": long_added,
-                "longRemoved": long_removed,
-                "shortAdded": short_added,
-                "shortRemoved": short_removed,
-            })
-            prev_long = cur_long
-            prev_short = cur_short
-
-            # 逐日离散信号（多/空/平/调仓）：由调仓明细展开，供报告「离散买卖信号」
-            for c in long_added:
-                discrete_signals.append({"date": date_t, "code": c, "signal": "多", "detail": "开多"})
-            for c in short_added:
-                discrete_signals.append({"date": date_t, "code": c, "signal": "空", "detail": "开空"})
-            for c in long_removed:
-                discrete_signals.append({"date": date_t, "code": c, "signal": "平", "detail": "平多"})
-            for c in short_removed:
-                discrete_signals.append({"date": date_t, "code": c, "signal": "平", "detail": "平空"})
-            if long_added or long_removed or short_added or short_removed:
-                discrete_signals.append({
-                    "date": date_t, "code": None, "signal": "调仓",
-                    "detail": f"多头{len(cur_long)}只 / 空头{len(cur_short)}只",
+            # 边缘保底：至少一侧有持仓仍记录（避免仓位图断裂）
+            if cur_long or cur_short:
+                long_added = sorted(cur_long - prev_long)
+                long_removed = sorted(prev_long - cur_long)
+                short_added = sorted(cur_short - prev_short)
+                short_removed = sorted(prev_short - cur_short)
+                turnover = len(long_added) + len(long_removed) + len(short_added) + len(short_removed)
+                position_ledger.append({
+                    "date": date_t,
+                    "long": sorted(cur_long),
+                    "short": sorted(cur_short),
+                    "longReturn": top_ret,
+                    "shortReturn": bottom_ret,
+                    # 后端直算的持仓数/换手（报告图直接使用，避免前端每次重算）
+                    "longCount": len(cur_long),
+                    "shortCount": len(cur_short),
+                    # 净持仓比例 =（多头数−空头数）/（多头数+空头数），∈[-1,1]，反映多空暴露方向
+                    "netRatio": round(
+                        (len(cur_long) - len(cur_short)) / max(len(cur_long) + len(cur_short), 1), 4),
+                    "turnover": turnover,
+                    # 调仓明细：本期相对上期的买入/卖出（供报告「调仓信号」渲染）
+                    "longAdded": long_added,
+                    "longRemoved": long_removed,
+                    "shortAdded": short_added,
+                    "shortRemoved": short_removed,
                 })
+                prev_long = cur_long
+                prev_short = cur_short
 
-        # B5 个股累计贡献：多头 +收益，空头 -收益（按方向裁剪后的持仓）
-        code_ret = dict(zip(cross_codes, cross_rets))
-        for c in cur_long:
-            stock_contribution[c] += code_ret.get(c, 0.0)
-        for c in cur_short:
-            stock_contribution[c] -= code_ret.get(c, 0.0)
+                # 逐日离散信号（多/空/平/调仓）：由调仓明细展开，供报告「离散买卖信号」
+                for c in long_added:
+                    discrete_signals.append({"date": date_t, "code": c, "signal": "多", "detail": "开多"})
+                for c in short_added:
+                    discrete_signals.append({"date": date_t, "code": c, "signal": "空", "detail": "开空"})
+                for c in long_removed:
+                    discrete_signals.append({"date": date_t, "code": c, "signal": "平", "detail": "平多"})
+                for c in short_removed:
+                    discrete_signals.append({"date": date_t, "code": c, "signal": "平", "detail": "平空"})
+                if long_added or long_removed or short_added or short_removed:
+                    discrete_signals.append({
+                        "date": date_t, "code": None, "signal": "调仓",
+                        "detail": f"多头{len(cur_long)}只 / 空头{len(cur_short)}只",
+                    })
 
-        # 方向收益：long_short 双份成本；单腿只扣一份
-        net_top = top_ret - cost_rate
-        net_bottom = -(bottom_ret) - cost_rate  # 空头腿收益正向化
-        if direction == "long_only":
-            ls_ret = top_ret
-            net_ls = net_top
-            leg_ok = bool(cur_long)
-        elif direction == "short_only":
-            ls_ret = -(bottom_ret)
-            net_ls = net_bottom
-            leg_ok = bool(cur_short)
-        else:  # long_short
-            ls_ret = top_ret - bottom_ret
-            net_ls = ls_ret - 2.0 * cost_rate
-            leg_ok = bool(cur_long) and bool(cur_short)
-        if leg_ok:
-            cum *= (1.0 + net_ls)
-            if direction != "short_only":
-                cum_top *= (1.0 + net_top)
-                top_group_returns.append(net_top)
-            if direction != "long_only":
-                cum_bottom *= (1.0 + net_bottom)
-            long_short_points.append({
-                "date": date_t, "longShort": net_ls, "cum": cum - 1.0,
-                "topCum": cum_top - 1.0, "bottomCum": cum_bottom - 1.0, "gross": ls_ret,
-            })
-            if bench_series and bench_date_idx:
-                bi = bench_date_idx.get(date_t)
-                if bi is not None and bi + n < len(bench_series):
-                    bc = [row["close"] for row in bench_series]
-                    bench_by_date[date_t] = bc[bi + n] / bc[bi] - 1
+            # B5 个股累计贡献：多头 +收益，空头 -收益（按方向裁剪后的持仓）
+            code_ret = dict(zip(cross_codes, cross_rets))
+            for c in cur_long:
+                stock_contribution[c] += code_ret.get(c, 0.0)
+            for c in cur_short:
+                stock_contribution[c] -= code_ret.get(c, 0.0)
 
-        rebalance_idx += 1
-        if progress_cb and rebalance_idx % 10 == 0:
-            progress_cb(rebalance_idx, (total_dates // step) + 1)
+            # 方向收益：long_short 双份成本；单腿只扣一份
+            net_top = top_ret - cost_rate
+            net_bottom = -(bottom_ret) - cost_rate  # 空头腿收益正向化
+            if direction == "long_only":
+                ls_ret = top_ret
+                net_ls = net_top
+                leg_ok = bool(cur_long)
+            elif direction == "short_only":
+                ls_ret = -(bottom_ret)
+                net_ls = net_bottom
+                leg_ok = bool(cur_short)
+            else:  # long_short
+                ls_ret = top_ret - bottom_ret
+                net_ls = ls_ret - 2.0 * cost_rate
+                leg_ok = bool(cur_long) and bool(cur_short)
+            if leg_ok:
+                cum *= (1.0 + net_ls)
+                if direction != "short_only":
+                    cum_top *= (1.0 + net_top)
+                    top_group_returns.append(net_top)
+                if direction != "long_only":
+                    cum_bottom *= (1.0 + net_bottom)
+                long_short_points.append({
+                    "date": date_t, "longShort": net_ls, "cum": cum - 1.0,
+                    "topCum": cum_top - 1.0, "bottomCum": cum_bottom - 1.0, "gross": ls_ret,
+                })
+                if bench_series and bench_date_idx:
+                    bi = bench_date_idx.get(date_t)
+                    if bi is not None and bi + n < len(bench_series):
+                        bc = [row["close"] for row in bench_series]
+                        bench_by_date[date_t] = bc[bi + n] / bc[bi] - 1
+
+            rebalance_idx += 1
+            if progress_cb and rebalance_idx % 10 == 0:
+                progress_cb(rebalance_idx, (total_dates // step) + 1)
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_loop)
 
     if not ic_series:
         actual_start = ref_dates[0] if ref_dates else None
@@ -2004,6 +2098,7 @@ def import_model_file(filename: str, data: bytes) -> dict:
             "mean": 0.0, "std": 1.0,
         },
     }, path)
+    _ensure_artifact_exists(path)
     meta = {
         "id": mid, "path": path, "modelType": bundle.get("model_type", "gbdt"),
         "featureNames": list(feature_names),
@@ -2363,6 +2458,7 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
             "mean": 0.0, "std": 1.0,
         },
     }, path)
+    _ensure_artifact_exists(path)
     meta = {
         "id": mid, "path": path, "modelType": "manual",
         "name": (name or mid).strip(), "featureNames": feature_names,
@@ -2380,6 +2476,7 @@ def create_manual_model(name: str, weights: dict, threshold: float | None = None
             json.dump(meta, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+    _ensure_artifact_exists(path)
     return meta
 
 
@@ -2401,6 +2498,7 @@ def clone_model_with_adjust(mid: str, feature_weights: dict | None = None,
     # 完整复制原模型 bundle
     bundle = joblib.load(src_path)
     joblib.dump(bundle, new_path)
+    _ensure_artifact_exists(new_path)
     # 写入新侧车 JSON：包含调参权重
     fw = {k: float(v) for k, v in (feature_weights or {}).items()
           if k in (bundle.get("feature_names") or [])}

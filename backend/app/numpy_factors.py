@@ -2,6 +2,12 @@
 
 与 factors.py 的逐点函数保持数值一致，但一次计算整条 K 线序列，
 避免回测热点循环里逐股票、逐截面重复调用。仅用 numpy，无 pandas 依赖。
+
+2026-08-18 向量化改造：所有滚动窗口因子（volatility/rsi/kdj/wr/cci/boll/
+amplitude/volume_ratio/obv/high_low_pos/dist_52w/skew/kurt/down_vol/max_drawdown/
+ma_align/ema_slope/donchian/vol_corr/vol_change）由 Python 逐点 for 循环改为
+`sliding_window_view` 批量滑动窗口，消除 O(hist) 行循环热点；仅 KDJ 的 EMA 平滑
+与 _ema 保留不可避免的顺序递推（与 factors.py 逐点版数值一致，atol=1e-9）。
 """
 import numpy as np
 
@@ -56,8 +62,10 @@ def volatility_series(close: np.ndarray, n: int) -> np.ndarray:
     if len(close) <= n:
         return out
     rets = _daily_returns(close)
-    for i in range(n, len(close)):
-        out[i] = np.std(rets[i - n: i], ddof=0)
+    win = _win(rets, n)
+    if win is None:
+        return out
+    out[n:] = np.std(win, axis=1, ddof=0)
     return out
 
 
@@ -69,14 +77,12 @@ def rsi_series(close: np.ndarray, n: int) -> np.ndarray:
     diff = np.diff(close)
     gain = np.where(diff >= 0, diff, 0.0)
     loss = np.where(diff < 0, -diff, 0.0)
-    for i in range(n, len(close)):
-        avg_gain = np.mean(gain[i - n: i])
-        avg_loss = np.mean(loss[i - n: i])
-        if avg_loss == 0:
-            out[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            out[i] = 100.0 - 100.0 / (1.0 + rs)
+    avg_gain = _win(gain, n).mean(axis=1)
+    avg_loss = _win(loss, n).mean(axis=1)
+    seg = np.full_like(avg_gain, 100.0)
+    nz = avg_loss != 0
+    seg[nz] = 100.0 - 100.0 / (1.0 + avg_gain[nz] / avg_loss[nz])
+    out[n:] = seg
     return out
 
 
@@ -109,7 +115,11 @@ def macd_series(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int =
 
 
 def kdj_k_series(kline_arr: dict, n: int = 9, smooth: int = 3) -> np.ndarray:
-    """KDJ-K 值序列，前 n-1 项为 NaN。"""
+    """KDJ-K 值序列，前 n-1 项为 NaN。
+
+    RSV 用滑动窗口 max/min 向量化；K 值为 RSV 的 EMA 平滑（smooth 期，种子 50），
+    顺序递推保留（与 factors.py factor_kdj_k 逐点版数值一致）。
+    """
     close = kline_arr["close"]
     high = kline_arr["high"]
     low = kline_arr["low"]
@@ -117,16 +127,15 @@ def kdj_k_series(kline_arr: dict, n: int = 9, smooth: int = 3) -> np.ndarray:
     out = np.full(m, np.nan)
     if m < n:
         return out
+    hh = _win(high, n).max(axis=1)
+    ll = _win(low, n).min(axis=1)
+    den = hh - ll
+    rsv = np.where(den == 0, 50.0, (close[n - 1:] - ll) / den * 100.0)
+    alpha = 1.0 / smooth
     k_val = 50.0
-    for idx in range(n - 1, m):
-        hh = np.max(high[idx - n + 1: idx + 1])
-        ll = np.min(low[idx - n + 1: idx + 1])
-        if hh == ll:
-            rsv = 50.0
-        else:
-            rsv = (close[idx] - ll) / (hh - ll) * 100.0
-        k_val = (smooth - 1) / smooth * k_val + rsv / smooth
-        out[idx] = k_val
+    for j in range(len(rsv)):
+        k_val = (1.0 - alpha) * k_val + alpha * rsv[j]
+        out[n - 1 + j] = k_val
     return out
 
 
@@ -139,13 +148,11 @@ def wr_series(kline_arr: dict, n: int = 14) -> np.ndarray:
     out = np.full(m, np.nan)
     if m < n:
         return out
-    for i in range(n - 1, m):
-        hh = np.max(high[i - n + 1: i + 1])
-        ll = np.min(low[i - n + 1: i + 1])
-        if hh == ll:
-            out[i] = np.nan
-        else:
-            out[i] = (hh - close[i]) / (hh - ll) * 100.0
+    hh = _win(high, n).max(axis=1)
+    ll = _win(low, n).min(axis=1)
+    den = hh - ll
+    seg = close[n - 1:]
+    out[n - 1:] = np.where(den == 0, np.nan, (hh - seg) / den * 100.0)
     return out
 
 
@@ -159,14 +166,11 @@ def cci_series(kline_arr: dict, n: int = 14) -> np.ndarray:
     if m < n:
         return out
     tp = (high + low + close) / 3.0
-    for i in range(n - 1, m):
-        window = tp[i - n + 1: i + 1]
-        ma_tp = np.mean(window)
-        md = np.mean(np.abs(window - ma_tp))
-        if md == 0:
-            out[i] = 0.0
-        else:
-            out[i] = (tp[i] - ma_tp) / (0.015 * md)
+    wt = _win(tp, n)
+    ma = wt.mean(axis=1)
+    md = np.mean(np.abs(wt - ma[:, None]), axis=1)
+    seg_tp = tp[n - 1:]
+    out[n - 1:] = np.where(md == 0, 0.0, (seg_tp - ma) / (0.015 * md))
     return out
 
 
@@ -177,16 +181,14 @@ def boll_pct_series(kline_arr: dict, n: int = 20, k: float = 2.0) -> np.ndarray:
     out = np.full(m, np.nan)
     if m < n:
         return out
-    for i in range(n - 1, m):
-        window = close[i - n + 1: i + 1]
-        mu = np.mean(window)
-        sd = np.std(window, ddof=0)
-        upper = mu + k * sd
-        lower = mu - k * sd
-        if upper == lower:
-            out[i] = 0.5
-        else:
-            out[i] = (close[i] - lower) / (upper - lower)
+    w = _win(close, n)
+    mu = w.mean(axis=1)
+    sd = w.std(axis=1, ddof=0)
+    upper = mu + k * sd
+    lower = mu - k * sd
+    den = upper - lower
+    seg = close[n - 1:]
+    out[n - 1:] = np.where(den == 0, 0.5, (seg - lower) / den)
     return out
 
 
@@ -199,14 +201,13 @@ def amplitude_series(kline_arr: dict, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    for i in range(n, m):
-        prev = close[i - n: i]
-        hl = high[i - n + 1: i + 1] - low[i - n + 1: i + 1]
-        amps = np.where(prev == 0, np.nan, hl / prev)
-        if np.all(np.isnan(amps)):
-            out[i] = np.nan
-        else:
-            out[i] = np.nanmean(amps)
+    hl = high - low
+    # out[i]：prev=close[i-n:i]、hl=high[i-n+1:i+1]（各 n 个），逐元素 hl/prev
+    amps = np.where(_win(close, n)[:-1] == 0, np.nan, _win(hl, n)[1:] / _win(close, n)[:-1])
+    all_nan = np.all(np.isnan(amps), axis=1)
+    with np.errstate(invalid="ignore", all="ignore"):
+        mean_amps = np.nanmean(amps, axis=1)
+    out[n:] = np.where(all_nan, np.nan, mean_amps)
     return out
 
 
@@ -217,9 +218,10 @@ def volume_ratio_series(kline_arr: dict, n: int = 5) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    for i in range(n, m):
-        base = np.mean(vol[i - n: i])
-        out[i] = np.nan if base == 0 else vol[i] / base
+    # out[i] 的分母为 vol[i-n:i] 均值，即滚动均值序列的 i-1 位
+    base = _rolling_mean(vol, n)[n - 1: m - 1]
+    v = vol[n:]
+    out[n:] = np.where(base == 0, np.nan, v / base)
     return out
 
 
@@ -231,12 +233,13 @@ def obv_trend_series(kline_arr: dict, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    for i in range(n, m):
-        diff = np.diff(close[i - n: i + 1])
-        signs = np.where(diff > 0, 1.0, np.where(diff < 0, -1.0, 0.0))
-        signed = np.sum(signs * vol[i - n + 1: i + 1])
-        vol_sum = np.sum(vol[i - n + 1: i + 1])
-        out[i] = np.nan if vol_sum == 0 else signed / vol_sum
+    wc = _win(close, n + 1)   # close[i-n:i+1]
+    wv = _win(vol, n)[1:]     # vol[i-n+1:i+1]
+    diff = wc[:, 1:] - wc[:, :-1]
+    signs = np.where(diff > 0, 1.0, np.where(diff < 0, -1.0, 0.0))
+    signed = np.sum(signs * wv, axis=1)
+    vol_sum = np.sum(wv, axis=1)
+    out[n:] = np.where(vol_sum == 0, np.nan, signed / vol_sum)
     return out
 
 
@@ -249,45 +252,55 @@ def high_low_pos_series(kline_arr: dict, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m < n:
         return out
-    for i in range(n - 1, m):
-        hh = np.max(high[i - n + 1: i + 1])
-        ll = np.min(low[i - n + 1: i + 1])
-        if hh == ll:
-            out[i] = 0.5
-        else:
-            out[i] = (close[i] - ll) / (hh - ll)
+    hh = _win(high, n).max(axis=1)
+    ll = _win(low, n).min(axis=1)
+    den = hh - ll
+    seg = close[n - 1:]
+    out[n - 1:] = np.where(den == 0, 0.5, (seg - ll) / den)
     return out
 
 
 def dist_high_series(close: np.ndarray, n: int = 240) -> np.ndarray:
-    """距 N 日新高回撤序列。"""
+    """距 N 日新高回撤序列（窗口随短历史收缩，前 20 项为 NaN）。"""
     m = len(close)
     out = np.full(m, np.nan)
-    for i in range(m):
-        w = min(n, i + 1)
-        if w < 20:
-            continue
-        hh = np.max(close[i - w + 1: i + 1])
-        if hh == 0:
-            out[i] = np.nan
-        else:
-            out[i] = close[i] / hh - 1.0
+    if m < 20:
+        return out
+    # 扩展窗口区：i ∈ [20, n-2]，w=i+1（从头累计）
+    exp_end = min(n - 2, m - 1)
+    if exp_end >= 20:
+        exp_max = np.maximum.accumulate(close)
+        idx = np.arange(20, exp_end + 1)
+        hh = exp_max[idx]
+        out[idx] = np.where(hh == 0, np.nan, close[idx] / hh - 1.0)
+    # 滑动窗口区：i ∈ [max(n-1, 20), m-1]，w=n
+    slide_start = max(n - 1, 20)
+    if m >= n and slide_start <= m - 1:
+        win = _win(close, n)
+        hh = win.max(axis=1)
+        k_start = slide_start - (n - 1)
+        out[slide_start:] = np.where(hh[k_start:] == 0, np.nan, close[slide_start:] / hh[k_start:] - 1.0)
     return out
 
 
 def dist_low_series(close: np.ndarray, n: int = 240) -> np.ndarray:
-    """距 N 日低点涨幅序列（窗口随短历史收缩）。"""
+    """距 N 日低点涨幅序列（窗口随短历史收缩，前 20 项为 NaN）。"""
     m = len(close)
     out = np.full(m, np.nan)
-    for i in range(m):
-        w = min(n, i + 1)
-        if w < 20:
-            continue
-        ll = np.min(close[i - w + 1: i + 1])
-        if ll == 0:
-            out[i] = np.nan
-        else:
-            out[i] = close[i] / ll - 1.0
+    if m < 20:
+        return out
+    exp_end = min(n - 2, m - 1)
+    if exp_end >= 20:
+        exp_min = np.minimum.accumulate(close)
+        idx = np.arange(20, exp_end + 1)
+        ll = exp_min[idx]
+        out[idx] = np.where(ll == 0, np.nan, close[idx] / ll - 1.0)
+    slide_start = max(n - 1, 20)
+    if m >= n and slide_start <= m - 1:
+        win = _win(close, n)
+        ll = win.min(axis=1)
+        k_start = slide_start - (n - 1)
+        out[slide_start:] = np.where(ll[k_start:] == 0, np.nan, close[slide_start:] / ll[k_start:] - 1.0)
     return out
 
 
@@ -297,15 +310,12 @@ def skew_series(close: np.ndarray, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    rets = _daily_returns(close)
-    for i in range(n, m):
-        w = rets[i - n: i]
-        s = np.std(w, ddof=0)
-        if s == 0:
-            out[i] = 0.0
-            continue
-        mu = np.mean(w)
-        out[i] = np.mean((w - mu) ** 3) / s ** 3
+    w = _win(_daily_returns(close), n)
+    mu = w.mean(axis=1)
+    s = w.std(axis=1, ddof=0)
+    diff = w - mu[:, None]
+    num = np.mean(diff ** 3, axis=1)
+    out[n:] = np.where(s == 0, 0.0, num / (s ** 3))
     return out
 
 
@@ -315,15 +325,12 @@ def kurt_series(close: np.ndarray, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    rets = _daily_returns(close)
-    for i in range(n, m):
-        w = rets[i - n: i]
-        s = np.std(w, ddof=0)
-        if s == 0:
-            out[i] = 0.0
-            continue
-        mu = np.mean(w)
-        out[i] = np.mean((w - mu) ** 4) / s ** 4 - 3.0
+    w = _win(_daily_returns(close), n)
+    mu = w.mean(axis=1)
+    s = w.std(axis=1, ddof=0)
+    diff = w - mu[:, None]
+    num = np.mean(diff ** 4, axis=1)
+    out[n:] = np.where(s == 0, 0.0, num / (s ** 4) - 3.0)
     return out
 
 
@@ -333,11 +340,15 @@ def down_vol_series(close: np.ndarray, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    rets = _daily_returns(close)
-    for i in range(n, m):
-        neg = rets[i - n: i]
-        neg = neg[neg < 0]
-        out[i] = np.std(neg, ddof=0) if len(neg) else 0.0
+    w = _win(_daily_returns(close), n)
+    neg = np.where(w < 0, w, np.nan)
+    cnt = (w < 0).sum(axis=1)
+    sd = np.zeros(len(cnt))
+    valid = cnt > 0
+    if valid.any():
+        with np.errstate(invalid="ignore", all="ignore"):
+            sd[valid] = np.nanstd(neg[valid], axis=1, ddof=0)
+    out[n:] = np.where(cnt == 0, 0.0, sd)
     return out
 
 
@@ -347,17 +358,10 @@ def max_drawdown_series(close: np.ndarray, n: int = 60) -> np.ndarray:
     out = np.full(m, np.nan)
     if m < n:
         return out
-    for i in range(n - 1, m):
-        window = close[i - n + 1: i + 1]
-        peak, mdd = window[0], 0.0
-        for c in window:
-            if c > peak:
-                peak = c
-            if peak != 0:
-                dd = c / peak - 1.0
-                if dd < mdd:
-                    mdd = dd
-        out[i] = mdd
+    w = _win(close, n)
+    runmax = np.maximum.accumulate(w, axis=1)
+    dd = np.where(runmax != 0, w / runmax - 1.0, 0.0)
+    out[n - 1:] = dd.min(axis=1)
     return out
 
 
@@ -370,11 +374,8 @@ def ma_align_series(close: np.ndarray, n1: int = 5, n2: int = 20, n3: int = 60) 
     ma5 = _rolling_mean(close, n1)
     ma20 = _rolling_mean(close, n2)
     ma60 = _rolling_mean(close, n3)
-    for i in range(n3 - 1, m):
-        a20, a60 = ma20[i], ma60[i]
-        if a20 == 0 or a60 == 0:
-            continue
-        out[i] = (ma5[i] - a20) / a20 * (a20 - a60) / a60
+    mask = (ma20 != 0) & (ma60 != 0)
+    out[mask] = (ma5[mask] - ma20[mask]) / ma20[mask] * (ma20[mask] - ma60[mask]) / ma60[mask]
     return out
 
 
@@ -385,11 +386,10 @@ def ema_slope_series(close: np.ndarray, n: int = 20) -> np.ndarray:
     if m <= n:
         return out
     e = _ema(close, n)
-    for i in range(1, m):
-        prev, cur = e[i - 1], e[i]
-        if np.isnan(prev) or np.isnan(cur) or prev == 0:
-            continue
-        out[i] = cur / prev - 1.0
+    prev = e[:-1]
+    cur = e[1:]
+    mask = ~np.isnan(prev) & ~np.isnan(cur) & (prev != 0)
+    out[1:] = np.where(mask, cur / prev - 1.0, np.nan)
     return out
 
 
@@ -399,9 +399,9 @@ def donchian_break_series(close: np.ndarray, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m < n:
         return out
-    for i in range(n - 1, m):
-        hh = np.max(close[i - n + 1: i + 1])
-        out[i] = np.nan if hh == 0 else close[i] / hh - 1.0
+    hh = _win(close, n).max(axis=1)
+    seg = close[n - 1:]
+    out[n - 1:] = np.where(hh == 0, np.nan, seg / hh - 1.0)
     return out
 
 
@@ -413,14 +413,15 @@ def vol_corr_series(kline_arr: dict, n: int = 20) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    for i in range(n, m):
-        x = close[i - n: i]
-        y = vol[i - n: i]
-        sx, sy = np.std(x, ddof=0), np.std(y, ddof=0)
-        if sx == 0 or sy == 0:
-            out[i] = 0.0
-        else:
-            out[i] = np.corrcoef(x, y)[0, 1]
+    wc = _win(close, n)[:-1]
+    wv = _win(vol, n)[:-1]
+    xm = wc.mean(axis=1)
+    ym = wv.mean(axis=1)
+    xc = wc - xm[:, None]
+    yc = wv - ym[:, None]
+    num = (xc * yc).sum(axis=1)
+    den = np.sqrt((xc ** 2).sum(axis=1) * (yc ** 2).sum(axis=1))
+    out[n:] = np.where(den == 0, 0.0, num / den)
     return out
 
 
@@ -431,9 +432,9 @@ def vol_change_series(kline_arr: dict, n: int = 5) -> np.ndarray:
     out = np.full(m, np.nan)
     if m <= n:
         return out
-    for i in range(n, m):
-        base = np.mean(vol[i - n: i])
-        out[i] = np.nan if base == 0 else vol[i] / base - 1.0
+    base = _rolling_mean(vol, n)[n - 1: m - 1]
+    v = vol[n:]
+    out[n:] = np.where(base == 0, np.nan, v / base - 1.0)
     return out
 
 
@@ -503,6 +504,13 @@ def series_at(arr: np.ndarray, i: int):
 
 
 # ---------------- numpy 辅助函数 ----------------
+
+def _win(arr: np.ndarray, n: int):
+    """长度为 n 的滑动窗口视图；长度不足返回 None。"""
+    if len(arr) < n:
+        return None
+    return np.lib.stride_tricks.sliding_window_view(arr, n)
+
 
 def _rolling_mean(arr: np.ndarray, n: int) -> np.ndarray:
     out = np.full_like(arr, np.nan)

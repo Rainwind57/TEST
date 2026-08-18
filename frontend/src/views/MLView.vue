@@ -85,6 +85,7 @@ const threshold = ref(null)
 const lastAdjustId = ref('')
 const adjustNote = ref('')
 const adjustHasSavedWeights = ref(false)
+const adjustModelType = ref('')   // 当前调参模型类型（manual=线性，gbdt/lightgbm=树）
 const cloneSaving = ref(false)
 const monitorModelId = ref('')
 
@@ -106,14 +107,17 @@ async function openAdjust(m) {
     for (const k of Object.keys(featureWeights)) delete featureWeights[k]
     for (const k of Object.keys(adjGroupOpen)) delete adjGroupOpen[k]
     threshold.value = adjustMeta.value.threshold ?? null
+    const modelType = adjustMeta.value.modelType || 'gbdt'
+    adjustModelType.value = modelType
+    const isLinear = modelType === 'manual'
     const existingWeights = adjustMeta.value.featureWeights || {}
-    // 有已保存权重时优先回显；无权重时用中性默认值 1.0（对树模型=特征不缩放），并标注「未调参/默认」
+    // 有已保存权重时优先回显；无权重时用中性默认值（树模型=1.0 等权；线性模型=0 不参与）
     adjustHasSavedWeights.value = Object.keys(existingWeights).length > 0
     const importanceMap = {}
     ;(adjustMeta.value.featureImportance || []).forEach(f => { importanceMap[f.feature] = f.importance })
     const featureNames = adjustMeta.value.featureNames || []
     for (const f of featureNames) {
-      featureWeights[f] = existingWeights[f] ?? 1.0
+      featureWeights[f] = existingWeights[f] ?? (isLinear ? 0 : 1.0)
     }
     // 默认展开有非零权重的分组
     const groupHasNonZero = {}
@@ -431,6 +435,32 @@ const groupedFeatures = computed(() => {
   return groups
 })
 
+// 任务1：技术/快照因子拆分 + 训练实际生效因子数提示（P2/P3）
+const techFactorKeys = computed(() => manualFeatures.value.filter(f => f.group === 'technical').map(f => f.key))
+const snapshotFactorKeys = computed(() => manualFeatures.value.filter(f => f.group !== 'technical').map(f => f.key))
+const isSnapshotGroup = g => g !== 'technical'
+const effectiveTrainFactors = computed(() => {
+  if (!selectedFactors.value.length) {
+    const tech = techFactorKeys.value.length
+    const snap = useSnapshot.value ? snapshotFactorKeys.value.length : 0
+    return { count: tech + snap, note: useSnapshot.value ? `${tech} 技术 + ${snap} 快照` : `${tech} 技术因子（未选=全部）` }
+  }
+  const sel = new Set(selectedFactors.value)
+  const tech = techFactorKeys.value.filter(k => sel.has(k)).length
+  const snapSel = snapshotFactorKeys.value.filter(k => sel.has(k)).length
+  const snap = useSnapshot.value ? snapSel : 0
+  let note = `${tech} 技术`
+  if (snapSel && !useSnapshot.value) note += `（${snapSel} 个快照因子需勾选开关）`
+  if (snap) note += ` + ${snap} 快照`
+  return { count: tech + snap, note }
+})
+
+// 任务3：提交前成本预估（预计样本量），让用户对"时间长度"成本有直观感知（P2 前端透明化）
+const estimatedSamples = computed(() => {
+  const h = Math.max(0, Number(hist.value || 0) - 60 - Number(n.value || 0))
+  return h * Math.max(0, Number(poolSize.value || 0))
+})
+
 // 任务2：调参因子增强（含 importance、group、label）
 const adjustFeaturesEnriched = computed(() => {
   if (!adjustMeta.value) return []
@@ -563,11 +593,15 @@ onUnmounted(() => { pollActive = false })
             <button class="btn-ghost sm" @click="selectAllFactors">全选</button>
             <button class="btn-ghost sm" @click="deselectAllFactors">取消全选</button>
           </div>
+          <div class="factor-tip">
+            技术因子 {{ techFactorKeys.length }} 个 + 快照因子 {{ snapshotFactorKeys.length }} 个；
+            快照因子（quant/fundamental/moneyflow）需勾选下方「含全部快照因子」开关后才会参与训练。
+          </div>
           <div class="factor-groups">
-            <div v-for="(features, group) in groupedFeatures" :key="group" class="factor-group">
-              <div class="factor-group-title">{{ group }} ({{ features.length }})</div>
+            <div v-for="(features, group) in groupedFeatures" :key="group" class="factor-group" :class="{ 'factor-group-off': isSnapshotGroup(group) && !useSnapshot }">
+              <div class="factor-group-title">{{ group }} ({{ features.length }})<span v-if="isSnapshotGroup(group) && !useSnapshot" class="factor-off-tag">快照，开关未勾不生效</span></div>
               <div class="factor-grid">
-                <label v-for="f in features" :key="f.key" class="factor-checkbox">
+                <label v-for="f in features" :key="f.key" class="factor-checkbox" :title="isSnapshotGroup(group) && !useSnapshot ? '快照因子：需勾选「含全部快照因子」开关才参与训练' : ''">
                   <input type="checkbox" :value="f.key" v-model="selectedFactors" />
                   <span>{{ f.label }}</span>
                 </label>
@@ -579,6 +613,8 @@ onUnmounted(() => { pollActive = false })
       <div class="panel-toolbar" style="margin-top:10px">
         <button class="btn-ghost" :disabled="loading || histInsufficient" :title="histInsufficient ? '历史长度不足，请增大历史长度或缩短时间段' : ''" @click="runEvaluate">{{ loading ? '评估中…' : '评估(CV)' }}</button>
         <button class="btn-primary" :disabled="training || histInsufficient" :title="histInsufficient ? '历史长度不足，请增大历史长度或缩短时间段' : ''" @click="runTrain">{{ training ? '训练中…' : '训练并落盘' }}</button>
+        <span class="hint" style="margin-left:8px">将使用 <strong>{{ effectiveTrainFactors.count }}</strong> 个因子训练（{{ effectiveTrainFactors.note }}）</span>
+        <span class="hint" style="margin-left:8px">预计样本量 ≈ {{ hist }} 天 × {{ poolSize }} 只 ≈ <strong>{{ estimatedSamples }}</strong> 条</span>
         <label style="margin-left:12px;font-size:13px;color:var(--text-mute)"><input type="checkbox" v-model="useSnapshot" /> 含全部快照因子（PE/PB/ROE/北向等，前视，探索用）</label>
         <span v-if="trainMsg" class="hint" style="margin-left:8px">{{ trainMsg }}</span>
       </div>
@@ -723,7 +759,12 @@ onUnmounted(() => { pollActive = false })
           <span class="hint">调整特征权重或预测阈值，保存后打分/回测即时生效</span>
         </div>
         <div v-if="!adjustHasSavedWeights" class="adj-note" style="margin:8px 0 0">
-          该模型无已保存的调参权重，当前初始值为中性默认值 1.0（未调参/默认）。对树模型，权重=1 表示特征不缩放。
+          <template v-if="adjustModelType === 'manual'">
+            该模型为人工加权线性模型，未设置权重的因子已按默认 0（不参与）预填，权重即为最终系数。
+          </template>
+          <template v-else>
+            该模型无已保存的调参权重，当前初始值为中性默认值 1.0（未调参/默认）。对树模型，权重=1 表示特征不缩放。
+          </template>
         </div>
         <div class="adj-threshold">
           <label>预测阈值偏移</label>
@@ -747,7 +788,9 @@ onUnmounted(() => { pollActive = false })
                 <span class="adj-imp" v-if="f.importance" :title="'importance: ' + f.importance.toFixed(4)">
                   {{ f.importance.toFixed(3) }}
                 </span>
-                <input class="adj-weight" v-model="featureWeights[f.key]" type="number" step="0.1" min="0" />
+                <input class="adj-weight" v-model="featureWeights[f.key]" type="number" step="0.1"
+                       :min="adjustModelType === 'manual' ? undefined : 0"
+                       :title="adjustModelType === 'manual' ? '人工线性模型系数：可为负（负=反向），未设置因子默认 0' : '默认 1.0 = 等权，请按需调整'" />
               </div>
             </div>
           </div>
@@ -880,8 +923,11 @@ onUnmounted(() => { pollActive = false })
 .factor-select-box .arrow.open { transform: rotate(180deg); }
 .factor-panel { border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin-top: 8px; background: var(--bg-2); }
 .factor-actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.factor-tip { font-size: 12px; color: var(--text-mute); margin-bottom: 10px; line-height: 1.5; }
 .factor-groups { max-height: 360px; overflow: auto; }
 .factor-group { margin-bottom: 10px; }
+.factor-group-off { opacity: 0.6; }
+.factor-off-tag { display: inline-block; margin-left: 8px; font-size: 10px; font-weight: 500; color: #e6a817; }
 .factor-group-title { font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
 .factor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 4px; }
 /* 模型可回测状态标记 */
