@@ -135,11 +135,16 @@ def _parse_tencent(raw: str) -> dict:
     dt = a[30] if len(a) > 30 else ""
     date = f"{dt[0:4]}-{dt[4:6]}-{dt[6:8]}" if len(dt) >= 8 else ""
     tm = f"{dt[8:10]}:{dt[10:12]}:{dt[12:14]}" if len(dt) >= 14 else ""
-    # 价格/量额字段缺失用 0（有业务意义：停牌/异常）；pe/pb/turnover/市值缺失用 None（与真实 0 区分）
+    # 价格字段：显式区分「解析失败(None, 非数字/空)」与「真 0」，避免 or 0.0 把 "0.00"/空吞成 0 导致误判当前价；量额仍用 or 0 兜底
+    price = f(3)
+    pre_close = f(4)
+    open_ = f(5)
     return {
         "name": a[1] if len(a) > 1 else "",
         "code": a[2] if len(a) > 2 else "",
-        "price": f(3) or 0.0, "preClose": f(4) or 0.0, "open": f(5) or 0.0,
+        "price": 0.0 if price is None else price,
+        "preClose": 0.0 if pre_close is None else pre_close,
+        "open": 0.0 if open_ is None else open_,
         "volume": (f(6) or 0) * 100,
         "bid": f(9), "ask": f(19),
         "high": f(33), "low": f(34),
@@ -185,9 +190,15 @@ def _parse_sina(raw: str) -> dict:
         except (IndexError, ValueError):
             return default
 
-    # 新浪行情无 pe/pb/turnover/市值字段（需走快照接口）；价格缺失用 0，其余 None
+    # 新浪行情无 pe/pb/turnover/市值字段（需走快照接口）；价格同样显式区分解析失败与真 0
+    open_ = f(1)
+    pre_close = f(2)
+    price = f(3)
     return {
-        "name": a[0] if a else "", "open": f(1) or 0.0, "preClose": f(2) or 0.0, "price": f(3) or 0.0,
+        "name": a[0] if a else "",
+        "open": 0.0 if open_ is None else open_,
+        "preClose": 0.0 if pre_close is None else pre_close,
+        "price": 0.0 if price is None else price,
         "high": f(4), "low": f(5), "bid": f(6), "ask": f(7),
         "volume": f(8) or 0, "amount": f(9) or 0,
         "date": a[30] if len(a) > 30 else "", "time": a[31] if len(a) > 31 else "",
@@ -221,10 +232,12 @@ def _parse_eastmoney(item: dict) -> dict:
         except (TypeError, ValueError):
             return None
 
+    price = p("f43")
+    pre_close = p("f60")
     return {
         "name": item.get("f14", ""), "code": str(item.get("f12", "")),
-        "price": p("f43") or 0.0, "high": p("f44"), "low": p("f45"),
-        "open": p("f46"), "preClose": p("f60") or 0.0,
+        "price": 0.0 if price is None else price, "high": p("f44"), "low": p("f45"),
+        "open": p("f46"), "preClose": 0.0 if pre_close is None else pre_close,
         "volume": float(item.get("f47", 0) or 0) * 100,
         "amount": float(item.get("f48", 0) or 0),
         "bid": None, "ask": None, "date": "", "time": "",

@@ -188,7 +188,11 @@ async def run_select(body: SelectBody, uid: int = 0):
     uf_specs = [s for s in body.factors if s.key.startswith("uf:")]
     unknown = [s.key for s in body.factors if s.key not in builtin_keys and not s.key.startswith("uf:")]
     if unknown:
-        raise HTTPException(400, f"未知因子: {unknown}")
+        logger.warning(
+            "规则选股忽略未知因子键: %s（合法键请用 pe/pb/roe 等，勿用 pe_ttm/volume_rate 等习惯名）",
+            unknown,
+        )
+        body.factors = [s for s in body.factors if s.key not in unknown]
 
     uf_defs = {}
     for s in uf_specs:
