@@ -292,13 +292,24 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
     # 因子选择：selected_factors 非空时只保留用户勾选的因子；
     # 未知键（不在技术/快照因子清单内）显式回显，避免静默丢弃
     ignored_factors: list[str] = []
+    snapshot_ignored_keys: list[str] = []
     if selected_factors:
         valid_keys = set(FACTORS) | set(SNAPSHOT_FACTORS)
         sel = set(selected_factors)
         ignored_factors = list(dict.fromkeys(
             k for k in selected_factors if k not in valid_keys))
+        if ignored_factors:
+            logger.warning(
+                "ML因子选择忽略未知因子键: %s（合法键请用 pe/pb/roe 等，勿用 pe_ttm/volume_rate 等习惯名）",
+                ignored_factors,
+            )
         sem_factor_keys = [k for k in sem_factor_keys if k in sel]
         snapshot_keys = [k for k in snapshot_keys if k in sel]
+        # 快照因子总开关未勾选：勾选的快照因子键被静默忽略 → 回显告警
+        picked_snapshot = [k for k in selected_factors
+                           if k in SNAPSHOT_FACTORS and SNAPSHOT_FACTORS[k].get("format") != "categorical"]
+        if picked_snapshot and not use_snapshot:
+            snapshot_ignored_keys = picked_snapshot
     if snapshot_keys:
         await _enrich_pool_extra(pool, snapshot_keys)
     row_by_code = {r["code"]: r for r in pool}
@@ -432,6 +443,7 @@ async def build_dataset(board: str = "all", pool_size: int = 100, n: int = 5,
         "dates": meta_dates,
         "feature_names": sem_factor_keys + snapshot_keys,
         "ignoredFactors": ignored_factors,
+        "snapshotIgnoredKeys": snapshot_ignored_keys,
         "n": n,
         "snapshotWarning": snapshot_warning,
         # P0 数据区间回显：前端结果页展示实际生效的数据起止日与历史长度

@@ -211,6 +211,7 @@ async function runEvaluate() {
     const { jobId } = await api.post('/jobs', { kind: 'ml-evaluate', config: evalConfig() })
     result.value = await pollJob(jobId)
     if (result.value?.ignoredFactorNote) toast(result.value.ignoredFactorNote)
+    if (result.value?.snapshotIgnoredNote) toast(result.value.snapshotIgnoredNote)
     toast(`评估完成，OOS IC=${(result.value.oosIc || 0).toFixed(3)}`)
   } catch (e) { toast(e.message) }
   finally { loading.value = false }
@@ -227,6 +228,7 @@ async function runTrain() {
     // 写入跨页共享 store，主回测页 onMounted 消费并自动选中该模型（打通 ML→主回测闭环）
     research.setCurrentModel(res.model)
     if (res.ignoredFactorNote) toast(res.ignoredFactorNote)
+    if (res.snapshotIgnoredNote) toast(res.snapshotIgnoredNote)
     toast(`训练完成，模型 ${res.model.id} 已落盘`)
   } catch (e) { toast(e.message) }
   finally { training.value = false; trainMsg.value = '' }
@@ -606,7 +608,7 @@ onUnmounted(() => { pollActive = false })
               <div class="factor-group-title">{{ group }} ({{ features.length }})<span v-if="isSnapshotGroup(group) && !useSnapshot" class="factor-off-tag">快照，开关未勾不生效</span></div>
               <div class="factor-grid">
                 <label v-for="f in features" :key="f.key" class="factor-checkbox" :title="isSnapshotGroup(group) && !useSnapshot ? '快照因子：需勾选「含全部快照因子」开关才参与训练' : ''">
-                  <input type="checkbox" :value="f.key" v-model="selectedFactors" />
+                  <input type="checkbox" :value="f.key" v-model="selectedFactors" :disabled="isSnapshotGroup(group) && !useSnapshot" />
                   <span>{{ f.label }}</span>
                 </label>
               </div>

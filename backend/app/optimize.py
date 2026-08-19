@@ -9,6 +9,7 @@ IS（早期段）做参数搜索、OOS（晚期段）做样本外验证，最终
 """
 import asyncio
 import datetime
+import threading
 
 from . import adapters, db
 from .routers import selection as sel
@@ -80,6 +81,29 @@ def optimize_backtest(base_config: dict, n_trials: int = 30, progress_cb=None,
     base_config: 基础配置（board/factor/cost 等固定项）。
     返回 {best_params, is_metrics, oos_metrics, splitDate, trials}。
     """
+    # 内部自建 event loop + run_until_complete：若当前线程已有 running loop
+    # （如探针直接在 async 函数里同步调用），先改走独立线程执行，避免
+    # "Cannot run the event loop while another loop is running"。
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        holder: dict = {}
+        def _proxy():
+            holder["result"] = _optimize_backtest_sync(
+                base_config, n_trials, progress_cb, cancel_event)
+        t = threading.Thread(target=_proxy, daemon=True)
+        t.start()
+        t.join()
+        return holder.get("result", {})
+
+    return _optimize_backtest_sync(base_config, n_trials, progress_cb, cancel_event)
+
+
+def _optimize_backtest_sync(base_config: dict, n_trials: int = 30,
+                            progress_cb=None, cancel_event=None) -> dict:
+    """实际执行寻优（须在无 running loop 的线程中调用）。"""
     try:
         import optuna
     except ImportError:

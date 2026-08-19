@@ -710,6 +710,7 @@ async def run_backtest(body: BacktestBody, uid: int = 0):
     mean_rank_ic = mean([p["rankIc"] for p in ic_series])
 
     result = {
+        "ok": True,
         "factorLabel": FACTORS[body.factor]["label"], "groups": groups, "n": n,
         "meanIc": ic_stats["meanIc"], "meanRankIc": mean_rank_ic,
         "icWinRate": ic_stats["icWinRate"], "icIr": ic_stats["icIr"],

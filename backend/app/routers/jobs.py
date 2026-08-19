@@ -107,6 +107,12 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
                     f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
                     f"{', '.join(dataset['ignoredFactors'])}"
                 )
+            if dataset.get("snapshotIgnoredKeys"):
+                result["snapshotIgnoredKeys"] = dataset["snapshotIgnoredKeys"]
+                result["snapshotIgnoredNote"] = (
+                    f"已勾选 {len(dataset['snapshotIgnoredKeys'])} 个快照因子"
+                    f"（{', '.join(dataset['snapshotIgnoredKeys'])}），但「含全部快照因子」开关未开启，这些因子未参与训练。"
+                )
             return result
         jobs.submit(jid, _run())
     elif kind == "ml-train":
@@ -132,6 +138,12 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
                     f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
                     f"{', '.join(dataset['ignoredFactors'])}"
                 )
+            if dataset.get("snapshotIgnoredKeys"):
+                result["snapshotIgnoredKeys"] = dataset["snapshotIgnoredKeys"]
+                result["snapshotIgnoredNote"] = (
+                    f"已勾选 {len(dataset['snapshotIgnoredKeys'])} 个快照因子"
+                    f"（{', '.join(dataset['snapshotIgnoredKeys'])}），但「含全部快照因子」开关未开启，这些因子未参与训练。"
+                )
             return result
         jobs.submit(jid, _run())
     elif kind == "ml-optimize":
@@ -151,6 +163,12 @@ def _submit_ml_job(kind: str, config: dict, uid: int) -> dict:
                 result["ignoredFactorNote"] = (
                     f"已忽略 {len(dataset['ignoredFactors'])} 个未知因子（不在技术/快照因子清单内）: "
                     f"{', '.join(dataset['ignoredFactors'])}"
+                )
+            if dataset.get("snapshotIgnoredKeys"):
+                result["snapshotIgnoredKeys"] = dataset["snapshotIgnoredKeys"]
+                result["snapshotIgnoredNote"] = (
+                    f"已勾选 {len(dataset['snapshotIgnoredKeys'])} 个快照因子"
+                    f"（{', '.join(dataset['snapshotIgnoredKeys'])}），但「含全部快照因子」开关未开启，这些因子未参与训练。"
                 )
             return result
         jobs.submit(jid, _run())

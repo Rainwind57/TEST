@@ -1031,11 +1031,11 @@ async def fetch_north_flow_trend(days: int = 30) -> list[dict]:
 
 async def fetch_finance_summary(code: str) -> dict:
     """主要财务指标摘要（东方财富个股财务接口）：ROE/毛利率/净利率/资产负债率/ROA 等。"""
-    market = "1" if code.startswith("sh") else "0"
+    suffix = code[:2].upper()  # sh->SH, sz->SZ, bj->BJ
     pure = code[2:]
     url = (f"https://datacenter.eastmoney.com/securities/api/data/get"
            f"?type=RPT_F10_FINANCE_MAINFINADATA&sty=APP_F10_MAINFINADATA"
-           f"&filter=(SECUCODE%3D%22{pure}.{market.upper()}%22)"
+           f"&filter=(SECUCODE%3D%22{pure}.{suffix}%22)"
            f"&p=1&ps=4&sr=-1&st=REPORT_DATE")
     resp = await _http_get(url, 10)
     body = resp.json()
@@ -1046,49 +1046,69 @@ async def fetch_finance_summary(code: str) -> dict:
         return {}
     r = rows[0]
     f = lambda k: r.get(k)
-    # ROA = 归母净利润 / 总资产（东财接口含 TOTAL_ASSETS / PARENT_NETPROFIT，旧版未拉）
-    total_assets = f("TOTAL_ASSETS")
-    net_profit = f("PARENT_NETPROFIT")
-    roa = None
-    if total_assets and net_profit and total_assets != 0:
-        try:
-            roa = float(net_profit) / float(total_assets) * 100
-        except (TypeError, ValueError):
-            roa = None
+    # ROA = 总资产净利率（东财接口字段 ZZCJLL，旧版误用 TOTAL_ASSETS/PARENT_NETPROFIT 拼合）
+    roa = f("ZZCJLL")
     return {
         "reportDate": f("REPORT_DATE"),
-        "roe": f("WEIGHTAVG_ROE"),
+        "roe": f("ROEJQ"),
         "roa": roa,
-        "grossMargin": f("GROSS_PROFIT_RATIO"),
-        "netMargin": f("NET_PROFIT_RATIO"),
-        "debtRatio": f("DEBT_ASSET_RATIO"),
-        "revenueYoY": f("TOTAL_OPERATE_INCOME_YOY"),
-        "profitYoY": f("PARENT_NETPROFIT_YOY"),
-        "eps": f("BASIC_EPS"),
+        "grossMargin": f("XSMLL"),
+        "netMargin": f("XSJLL"),
+        "debtRatio": f("ZCFZL"),
+        "revenueYoY": f("TOTALOPERATEREVETZ"),
+        "profitYoY": f("PARENTNETPROFITTZ"),
+        "eps": f("EPSJB"),
         "bps": f("BPS"),
     }
 
 
 async def fetch_north_holding(code: str) -> dict:
-    """个股北向持股（东方财富沪深港通持股明细）：持股比例/持股数/市值。
+    """个股北向持股（东方财富沪深港通持股统计）：持股比例/持股数/市值。
 
-    旧版只有市场级 fetch_north_flow_trend 却无个股北向因子，此处补齐个股级数据源。
+    主数据源：datacenter.eastmoney.com 的 RPT_MUTUAL_HOLDSTOCKNORTH_STA 报表
+    （个股持股统计口径，字段 HOLD_SHARES_RATIO / HOLD_SHARES / HOLD_MARKET_CAP）。
+    主接口失败/空时回退 datacenter-web 的 RPT_MUTUAL_HOLDSTOCKS_DETAILS 明细报表
+    （字段 HOLD_SHARES_RATIO / HOLD_SHARES / HOLD_MARKET_VALUE）；
+    两源均失败则兜底返回 {}（上层按缺失处理，不阻断主流程）。
     """
     pure = code[2:]
-    url = (f"https://datacenter-web.eastmoney.com/api/data/v1/get"
-           f"?reportName=RPT_MUTUAL_HOLDSTOCKS_DETAILS&columns=ALL"
+    url = (f"https://datacenter.eastmoney.com/securities/api/data/get"
+           f"?type=RPT_MUTUAL_HOLDSTOCKNORTH_STA&sty=ALL"
            f"&filter=(SECURITY_CODE%3D%22{pure}%22)"
-           f"&pageSize=1&sortColumns=REPORT_DATE&sortTypes=-1")
+           f"&p=1&ps=1&sr=-1&st=TRADE_DATE&source=HSF10&client=PC")
     try:
         resp = await _http_get(url, 10)
-        records = (resp.json() or {}).get("result", {}).get("data") or []
+        body = resp.json()
+        if isinstance(body, dict) and body.get("success"):
+            records = (body.get("result") or {}).get("data") or []
+            if records:
+                r = records[0]
+                return {
+                    "holdRatio": r.get("HOLD_SHARES_RATIO"),  # 持股比例(%)
+                    "holdShares": r.get("HOLD_SHARES"),        # 持股数(股)
+                    "holdMarketValue": r.get("HOLD_MARKET_CAP"),  # 持股市值(元)
+                    "reportDate": r.get("TRADE_DATE"),
+                }
+    except Exception:
+        pass
+    # 回退：旧明细报表（字段名 HOLD_MARKET_VALUE 与此处 CAP 不同）
+    fallback = (f"https://datacenter-web.eastmoney.com/api/data/v1/get"
+                f"?reportName=RPT_MUTUAL_HOLDSTOCKS_DETAILS&columns=ALL"
+                f"&filter=(SECURITY_CODE%3D%22{pure}%22)"
+                f"&pageSize=1&sortColumns=REPORT_DATE&sortTypes=-1")
+    try:
+        resp = await _http_get(fallback, 10)
+        body = resp.json()
+        if not isinstance(body, dict) or not body.get("success"):
+            return {}
+        records = (body.get("result") or {}).get("data") or []
         if not records:
             return {}
         r = records[0]
         return {
-            "holdRatio": r.get("HOLD_SHARES_RATIO"),     # 持股比例(%)
-            "holdShares": r.get("HOLD_SHARES"),           # 持股数(股)
-            "holdMarketValue": r.get("HOLD_MARKET_VALUE"),# 持股市值(元)
+            "holdRatio": r.get("HOLD_SHARES_RATIO"),
+            "holdShares": r.get("HOLD_SHARES"),
+            "holdMarketValue": r.get("HOLD_MARKET_VALUE"),
             "reportDate": r.get("REPORT_DATE"),
         }
     except Exception:

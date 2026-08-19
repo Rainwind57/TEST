@@ -725,7 +725,15 @@ def annualized_return(period_returns: list[float], periods_per_year: float = TRA
     years = len(period_returns) / periods_per_year
     if years <= 0:
         return 0.0
-    return cum ** (1.0 / years) - 1.0
+    # 累计净值为负（多空组合杠杆亏损超 100%）时，负底数的分数次幂会产生复数，
+    # 导致 JSON 序列化失败/返回 None。此处改为返回约化收益 = (cum-1)/years，保证有限实数。
+    if cum <= 0.0:
+        return (cum - 1.0) / years
+    # 用对数避免超大累计（长窗口 3000 日复利）溢出为 inf
+    try:
+        return math.exp(math.log(cum) / years) - 1.0
+    except (OverflowError, ValueError):
+        return cum ** (1.0 / years) - 1.0
 
 
 def annualized_volatility(period_returns: list[float], periods_per_year: float = TRADING_DAYS) -> float:

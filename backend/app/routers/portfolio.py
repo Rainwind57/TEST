@@ -92,8 +92,10 @@ async def place_order(body: OrderBody, uid: int = Depends(require_user_id)):
     except Exception as e:
         raise HTTPException(502, f"行情获取失败: {e}")
     q = quotes.get(code)
-    if not q or not q.get("price"):
-        raise HTTPException(422, "暂无行情数据，请稍后重试")
+    if not q:
+        raise HTTPException(422, f"未获取到 {code} 的行情报价（代码可能无效、已退市或行情源未覆盖），请确认代码后重试")
+    if not q.get("price"):
+        raise HTTPException(422, f"{code} 当前价格为 0（可能停牌或开盘前），无法成交，请稍后重试")
 
     price = q["price"]
     amount = price * body.qty
